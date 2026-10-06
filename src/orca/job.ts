@@ -92,7 +92,11 @@ export function pickIdDeep(source: JsonObject, keys: readonly string[], depth = 
 
 const ID_KEYS = ["taskId", "task_id", "id"] as const;
 const DISPATCH_ID_KEYS = ["dispatchId", "dispatch_id", "id"] as const;
-const AGENT_KEYS = ["agent", "agentType", "agentId", "agentIdentity", "agent_type"] as const;
+const AGENT_KEYS = ["provider", "agentType", "agent_type", "agent", "agentId", "agentIdentity"] as const;
+const TITLE_KEYS = ["task_title", "taskTitle", "title", "display_name", "displayName"] as const;
+const CREATED_KEYS = ["created_at", "createdAt"] as const;
+const COMPLETED_KEYS = ["completed_at", "completedAt", "finished_at", "finishedAt"] as const;
+const UPDATED_KEYS = ["updated_at", "updatedAt", "last_heartbeat_at", "created_at"] as const;
 
 /** orca の task-list 生の status → Job API の state。未知は unknown(生の値は rawStatus に残す)。 */
 export function mapTaskState(rawStatus: string | undefined): JobState {
@@ -125,7 +129,7 @@ export function mapTaskState(rawStatus: string | undefined): JobState {
   }
 }
 
-/** worker の生の状態 → 正規化 status。 */
+/** worker の生の状態(projection.outcome / workerState / dispatchStatus)→ 正規化 status。 */
 export function mapWorkerStatus(raw: string | undefined): string {
   switch (raw?.toLowerCase()) {
     case "succeeded":
@@ -135,9 +139,12 @@ export function mapWorkerStatus(raw: string | undefined): string {
     case "failed":
     case "errored":
       return "failed";
+    case "in_progress":
+    case "in-progress":
     case "running":
     case "active":
     case "working":
+    case "dispatched":
       return "running";
     case "unsupervised":
       // `dispatch` が採用したターミナルでエージェントが動いている状態
@@ -145,10 +152,15 @@ export function mapWorkerStatus(raw: string | undefined): string {
     case "released":
     case "retained":
     case "reclaimable":
+    case "settled":
       return "settled";
     case "pending":
     case "queued":
+    case "not_started":
       return "queued";
+    case "blocked":
+    case "waiting":
+      return "blocked";
     default:
       return raw ?? "unknown";
   }
@@ -176,21 +188,41 @@ export function extractGates(payload: JsonObject): JsonObject[] {
   return Array.isArray(raw) ? raw.filter(isJsonObject) : [];
 }
 
-/** worker を Job API 用の 1 行に正規化する(テスト対象)。 */
+/**
+ * worker 行(projection / stage / liveness 込み)を Job API 用の 1 行に正規化する(テスト対象)。
+ * 実ペイロード: { dispatchId, taskId, workerState, dispatchStatus, agentTerminalHandle,
+ *   terminalState, projection: { provider, outcome, stage: { activity }, liveness: { verdict },
+ *   attention: { requiresAction } } }
+ */
 export function toWorkerRow(worker: JsonObject): JsonObject {
-  const dispatchId = pickString(worker, DISPATCH_ID_KEYS) ?? null;
-  const rawStatus = pickString(worker, ["status", "workerStatus", "state", "worker_state"]);
-  const terminalState = pickString(worker, ["terminalState", "terminal_state", "resourceState"]);
+  const projection = isJsonObject(worker["projection"]) ? (worker["projection"] as JsonObject) : {};
+  const stage = isJsonObject(projection["stage"]) ? (projection["stage"] as JsonObject) : {};
+  const liveness = isJsonObject(projection["liveness"]) ? (projection["liveness"] as JsonObject) : {};
+  const attention = isJsonObject(projection["attention"]) ? (projection["attention"] as JsonObject) : {};
+
+  const rawStatus =
+    pickString(worker, ["workerState", "worker_state", "workerStatus", "status", "state"]) ??
+    pickString(projection, ["outcome"]);
+  const outcome = pickString(projection, ["outcome"]);
   const row: JsonObject = {
-    agent: pickString(worker, AGENT_KEYS) ?? null,
-    status: mapWorkerStatus(rawStatus),
+    agent: pickString(worker, AGENT_KEYS) ?? pickString(projection, AGENT_KEYS) ?? null,
+    status: mapWorkerStatus(outcome ?? rawStatus),
     rawStatus: rawStatus ?? null,
-    dispatchId,
-    terminalState: terminalState ?? null,
+    outcome: outcome ?? null,
+    dispatchId: pickString(worker, DISPATCH_ID_KEYS) ?? null,
+    taskId: pickString(worker, ["taskId", "task_id"]) ?? null,
+    terminalState: pickString(worker, ["terminalState", "terminal_state", "resourceState"]) ?? null,
+    terminalHandle:
+      pickString(worker, ["agentTerminalHandle", "agent_terminal_handle", "terminalHandle", "handle"]) ??
+      null,
     worktreeId: pickString(worker, ["worktreeId", "worktree_id"]) ?? null,
-    terminalHandle: pickString(worker, ["terminalHandle", "terminal_handle", "handle"]) ?? null,
+    activity: pickString(stage, ["activity"]) ?? null,
+    liveness: pickString(liveness, ["verdict"]) ?? null,
   };
-  const updatedAt = worker["updatedAt"] ?? worker["lastOutputAt"];
+  if (typeof attention["requiresAction"] === "boolean") {
+    row["requiresAttention"] = attention["requiresAction"];
+  }
+  const updatedAt = worker["updatedAt"] ?? worker["lastOutputAt"] ?? worker["updated_at"];
   if (updatedAt !== undefined) {
     row["updatedAt"] = updatedAt;
   }
@@ -429,47 +461,125 @@ async function firstTerminalHandle(client: OrcaClient, worktreeSelector: string)
   return handle;
 }
 
+/**
+ * worker 行にエージェント名が無いとき(context-only dispatch では projection.provider が null)
+ * terminal list の agentIdentity から補強する。観測の強化なので失敗しても poll は壊さない。
+ */
+async function enrichAgentNames(client: OrcaClient, workers: JsonObject[]): Promise<void> {
+  const missing = workers.filter(
+    (worker) => worker["agent"] === null && typeof worker["terminalHandle"] === "string",
+  );
+  if (missing.length === 0) {
+    return;
+  }
+  try {
+    const listed = unwrapResult(await client.terminalList({ limit: 100 }));
+    const terminals = Array.isArray(listed["terminals"]) ? listed["terminals"].filter(isJsonObject) : [];
+    const byHandle = new Map<string, string>();
+    for (const terminal of terminals) {
+      const handle = pickString(terminal, ["handle", "terminalHandle", "terminal_handle"]);
+      const agent = pickString(terminal, ["agentIdentity", "agentType", "agent"]);
+      if (handle !== undefined && agent !== undefined) {
+        byHandle.set(handle, agent);
+      }
+    }
+    for (const worker of missing) {
+      const agent = byHandle.get(worker["terminalHandle"] as string);
+      if (agent !== undefined) {
+        worker["agent"] = agent;
+      }
+    }
+  } catch {
+    // 補強は省略する(agent は null のまま)
+  }
+}
+
 /** poll: 現在の state / phase / workers を正規化して返す。 */
 export async function getTaskStatus(client: OrcaClient, input: TaskStatusInput): Promise<JsonObject> {
   const list = await client.taskList({ run: input.run, brief: false });
   const task = findTaskById(list, input.taskId);
   const rawStatus = pickString(task, ["status", "state", "taskStatus"]);
   const state = mapTaskState(rawStatus);
+  const runId = pickString(task, ["run_id", "runId"]) ?? input.run ?? null;
 
+  // dispatch id は dispatch-show と task 行(dispatch_id)の両方から拾う
   const dispatchesPayload = await client.dispatchShow(input.taskId);
-  const dispatches = extractDispatches(dispatchesPayload);
   const dispatchIds = new Set(
-    dispatches.map((dispatch) => pickString(dispatch, DISPATCH_ID_KEYS)).filter(
-      (value): value is string => value !== undefined,
-    ),
+    extractDispatches(dispatchesPayload)
+      .map((dispatch) => pickString(dispatch, DISPATCH_ID_KEYS))
+      .filter((value): value is string => value !== undefined),
   );
+  const taskDispatchId = pickString(task, DISPATCH_ID_KEYS);
+  if (taskDispatchId !== undefined) {
+    dispatchIds.add(taskDispatchId);
+  }
 
-  const workersPayload = await client.workerList({ run: input.run, limit: 100 });
+  const workersPayload = await client.workerList({ run: input.run ?? runId ?? undefined, limit: 100 });
   const allWorkers = extractWorkers(workersPayload).map(toWorkerRow);
-  // dispatch が特定できているときは、その dispatch に紐づく worker だけを見せる
+  // 対象タスクに紐づく worker だけを見せる(taskId / dispatchId のどちらか一致)
   const workers = allWorkers.filter(
-    (worker) => typeof worker["dispatchId"] === "string" && dispatchIds.has(worker["dispatchId"] as string),
+    (worker) =>
+      worker["taskId"] === input.taskId ||
+      (typeof worker["dispatchId"] === "string" && dispatchIds.has(worker["dispatchId"] as string)),
   );
 
-  const gatesPayload = await client.gateList({ task: input.taskId, run: input.run });
+  const gatesPayload = await client.gateList({ task: input.taskId, run: input.run ?? runId ?? undefined });
   const gates = extractGates(gatesPayload).map((gate) => ({
     id: pickString(gate, ["gateId", "gate_id", "id"]) ?? null,
     status: pickString(gate, ["status", "state"]) ?? null,
   }));
 
+  await enrichAgentNames(client, workers);
   const phase = estimatePhase(state, workers, gates);
   return {
     taskId: input.taskId,
     state,
     phase,
     rawStatus: rawStatus ?? null,
-    title: pickString(task, ["title", "taskTitle", "displayName"]) ?? null,
+    runId,
+    title: pickString(task, TITLE_KEYS) ?? null,
     specPreview: preview(task["spec"], 200),
+    assigneeHandle: pickString(task, ["assignee_handle", "assigneeHandle"]) ?? null,
     workers,
     gates,
     dispatchIds: [...dispatchIds],
-    updatedAt: task["updatedAt"] ?? task["updated_at"] ?? null,
+    createdAt: task["created_at"] ?? task["createdAt"] ?? null,
+    completedAt: task["completed_at"] ?? task["completedAt"] ?? null,
     nextAction: nextActionHint(state, phase),
+  };
+}
+
+/** worker-read の出力し尾部をテキストに落とす(実ペイロードは terminal.tail / transcript.tail)。 */
+function extractOutputText(read: JsonObject): {
+  text: string | null;
+  source: string | null;
+  terminalStatus: string | null;
+  nextCursor: string | null;
+} {
+  const transcript = isJsonObject(read["transcript"]) ? (read["transcript"] as JsonObject) : undefined;
+  const terminal = isJsonObject(read["terminal"]) ? (read["terminal"] as JsonObject) : undefined;
+  const status = isJsonObject(read["status"]) ? (read["status"] as JsonObject) : undefined;
+  const pane = transcript ?? terminal;
+  const lines = pane?.["tail"] ?? pane?.["lines"] ?? read["lines"];
+
+  let text: string | null = null;
+  if (Array.isArray(lines)) {
+    text = lines.filter((line): line is string => typeof line === "string").join("\n");
+  } else if (typeof read["text"] === "string") {
+    text = read["text"];
+  } else if (typeof read["output"] === "string") {
+    text = read["output"];
+  }
+
+  return {
+    text,
+    source: str(read["source"]) ?? null,
+    terminalStatus:
+      (terminal !== undefined ? str(terminal["status"]) : undefined) ??
+      (status !== undefined ? str(status["terminal"]) : undefined) ??
+      null,
+    nextCursor:
+      (terminal !== undefined ? str(terminal["nextCursor"]) : undefined) ?? str(read["cursor"]) ?? null,
   };
 }
 
@@ -479,23 +589,33 @@ export async function getTaskResult(client: OrcaClient, input: TaskResultInput):
   const task = findTaskById(list, input.taskId);
   const rawStatus = pickString(task, ["status", "state", "taskStatus"]);
   const state = mapTaskState(rawStatus);
+  const runId = pickString(task, ["run_id", "runId"]) ?? input.run ?? null;
 
   const dispatchesPayload = await client.dispatchShow(input.taskId);
-  const dispatchIds = extractDispatches(dispatchesPayload)
-    .map((dispatch) => pickString(dispatch, DISPATCH_ID_KEYS))
-    .filter((value): value is string => value !== undefined);
+  const dispatchIds = new Set(
+    extractDispatches(dispatchesPayload)
+      .map((dispatch) => pickString(dispatch, DISPATCH_ID_KEYS))
+      .filter((value): value is string => value !== undefined),
+  );
+  const taskDispatchId = pickString(task, DISPATCH_ID_KEYS);
+  if (taskDispatchId !== undefined) {
+    dispatchIds.add(taskDispatchId);
+  }
 
   const limit = input.outputLimit ?? 40;
   const outputs: JsonObject[] = [];
-  for (const dispatchId of dispatchIds.slice(0, 3)) {
+  for (const dispatchId of [...dispatchIds].slice(0, 3)) {
     try {
       const read = unwrapResult(await client.workerRead({ dispatch: dispatchId, limit }));
+      const extracted = extractOutputText(read);
       outputs.push({
         dispatchId,
         agent: pickString(read, AGENT_KEYS) ?? null,
-        source: read["source"] ?? null,
-        text: preview(read["text"] ?? read["output"] ?? read["transcript"], 4000),
+        source: extracted.source,
+        terminalStatus: extracted.terminalStatus,
+        text: preview(extracted.text, 4000),
         cursor: read["cursor"] ?? null,
+        nextCursor: extracted.nextCursor,
       });
     } catch (error) {
       outputs.push({
@@ -509,9 +629,11 @@ export async function getTaskResult(client: OrcaClient, input: TaskResultInput):
     taskId: input.taskId,
     state,
     rawStatus: rawStatus ?? null,
+    runId,
     result: task["result"] ?? null,
     resultPreview: preview(task["result"], 2000),
     outputs,
-    finishedAt: task["completedAt"] ?? task["finishedAt"] ?? task["updatedAt"] ?? null,
+    createdAt: task["created_at"] ?? task["createdAt"] ?? null,
+    finishedAt: task["completed_at"] ?? task["completedAt"] ?? null,
   };
 }

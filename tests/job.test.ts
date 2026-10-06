@@ -39,7 +39,45 @@ describe("mapWorkerStatus", () => {
 });
 
 describe("toWorkerRow", () => {
-  it("キー名の揺れを吸収して agent / status / dispatchId に正規化する", () => {
+  it("実ペイロード(projection 込み)から正規化する", () => {
+    const row = toWorkerRow({
+      dispatchId: "ctx_42e6925ec35f",
+      taskId: "task_3208dcf22c18",
+      runId: "run_a781f51d4c91",
+      workerState: "unsupervised",
+      dispatchStatus: "dispatched",
+      agentTerminalHandle: "term_76d5cb08",
+      terminalState: "retained",
+      projection: {
+        provider: "codex",
+        outcome: "in_progress",
+        stage: { worker: "unsupervised", dispatch: "dispatched", activity: "unknown" },
+        liveness: { verdict: "unverifiable", reason: "missing_status" },
+        attention: { requiresAction: true, categories: ["unverifiable"] },
+      },
+    });
+    expect(row).toMatchObject({
+      agent: "codex",
+      status: "running",
+      rawStatus: "unsupervised",
+      outcome: "in_progress",
+      dispatchId: "ctx_42e6925ec35f",
+      taskId: "task_3208dcf22c18",
+      terminalState: "retained",
+      terminalHandle: "term_76d5cb08",
+      liveness: "unverifiable",
+      requiresAttention: true,
+    });
+  });
+
+  it("projection.outcome が workerState より優先される", () => {
+    expect(
+      toWorkerRow({ workerState: "unsupervised", projection: { outcome: "succeeded" } }).status,
+    ).toBe("completed");
+    expect(toWorkerRow({}).status).toBe("unknown");
+  });
+
+  it("キー名の揺れを吸収する(旧形状)", () => {
     expect(
       toWorkerRow({ agentType: "codex", workerStatus: "Succeeded", dispatch_id: "d1", terminal_state: "active" }),
     ).toMatchObject({ agent: "codex", status: "completed", dispatchId: "d1", terminalState: "active" });
@@ -241,58 +279,85 @@ describe("delegateTask(submit)", () => {
 });
 
 describe("getTaskStatus(poll)", () => {
+  // 実ペイロード(task-list / worker-list)を採った fixture
   const taskList = {
     ok: true,
     result: {
+      runId: "run_a781f51d4c91",
+      legacyReadOnly: false,
       tasks: [
         {
-          taskId: "task_abc123",
+          id: "task_3208dcf22c18",
+          run_id: "run_a781f51d4c91",
+          task_title: "smoke job",
+          display_name: "smoke job",
+          spec: "Reply with exactly OK. Do not modify any files.",
           status: "dispatched",
-          title: "README 更新",
-          spec: "README を更新して",
-          updatedAt: 1791280000000,
+          result: null,
+          created_at: "2026-10-06 10:15:59",
+          completed_at: null,
+          assignee_handle: "term_76d5cb08",
+          dispatch_id: "ctx_42e6925ec35f",
         },
       ],
+      count: 1,
     },
-  };
-  const dispatchShow = {
-    ok: true,
-    result: { dispatches: [{ dispatchId: "disp_1" }, { dispatchId: "disp_2" }] },
   };
   const workerList = {
     ok: true,
     result: {
       workers: [
-        { dispatchId: "disp_1", agentType: "codex", status: "succeeded", terminalState: "active" },
-        { dispatchId: "disp_2", agentType: "claude", status: "running", terminalState: "active" },
-        { dispatchId: "disp_other", agentType: "dsh", status: "running" },
+        {
+          dispatchId: "ctx_42e6925ec35f",
+          taskId: "task_3208dcf22c18",
+          workerState: "unsupervised",
+          dispatchStatus: "dispatched",
+          agentTerminalHandle: "term_76d5cb08",
+          terminalState: "retained",
+          projection: { provider: "codex", outcome: "in_progress", stage: { activity: "working" } },
+        },
+        {
+          dispatchId: "ctx_other",
+          taskId: "task_other",
+          workerState: "supervised",
+          projection: { outcome: "in_progress" },
+        },
       ],
+      counts: { retained: 1 },
     },
   };
 
   it("state / phase / workers を正規化して返す(ユーザー想定の応答形状)", async () => {
-    const { client } = createFakeClient({ taskList, dispatchShow, workerList });
-    const view = await getTaskStatus(client, { taskId: "task_abc123" });
+    const { client } = createFakeClient({
+      taskList,
+      dispatchShow: { ok: true, result: { dispatch: { id: "ctx_42e6925ec35f", task_id: "task_3208dcf22c18" } } },
+      workerList,
+    });
+    const view = await getTaskStatus(client, { taskId: "task_3208dcf22c18" });
 
     expect(view).toMatchObject({
-      taskId: "task_abc123",
+      taskId: "task_3208dcf22c18",
       state: "running",
       phase: "implementation",
       rawStatus: "dispatched",
-      title: "README 更新",
+      runId: "run_a781f51d4c91",
+      title: "smoke job",
+      assigneeHandle: "term_76d5cb08",
     });
     expect(view["workers"]).toEqual([
-      expect.objectContaining({ agent: "codex", status: "completed", dispatchId: "disp_1" }),
-      expect.objectContaining({ agent: "claude", status: "running", dispatchId: "disp_2" }),
+      expect.objectContaining({
+        agent: "codex",
+        status: "running",
+        dispatchId: "ctx_42e6925ec35f",
+        terminalHandle: "term_76d5cb08",
+      }),
     ]);
     expect(view["nextAction"]).toContain("orca_get_task_status");
   });
 
   it("pending gate があれば phase は decision_gate", async () => {
     const { client } = createFakeClient({
-      taskList: { ok: true, result: { tasks: [{ taskId: "task_abc123", status: "blocked" }] } },
-      dispatchShow,
-      workerList,
+      taskList: { ok: true, result: { tasks: [{ id: "task_abc123", status: "blocked" }] } },
       gateList: { ok: true, result: { gates: [{ id: "g1", status: "pending" }] } },
     });
     const view = await getTaskStatus(client, { taskId: "task_abc123" });
@@ -310,6 +375,29 @@ describe("getTaskStatus(poll)", () => {
     expect(view["nextAction"]).toContain("orca_get_task_result");
   });
 
+  it("context-only dispatch では agent が null なので terminal list の agentIdentity で補強する", async () => {
+    const { client } = createFakeClient({
+      taskList,
+      workerList: {
+        ok: true,
+        result: {
+          workers: [
+            {
+              dispatchId: "ctx_42e6925ec35f",
+              taskId: "task_3208dcf22c18",
+              workerState: "unsupervised",
+              agentTerminalHandle: "term_76d5cb08",
+              projection: { outcome: "in_progress" },
+            },
+          ],
+        },
+      },
+      terminals: [{ handle: "term_76d5cb08", agentIdentity: "codex", connected: true }],
+    });
+    const view = await getTaskStatus(client, { taskId: "task_3208dcf22c18" });
+    expect((view["workers"] as JsonObject[])[0]?.["agent"]).toBe("codex");
+  });
+
   it("未知の taskId は JobError(task_not_found)", async () => {
     const { client } = createFakeClient({ taskList });
     await expect(getTaskStatus(client, { taskId: "nope" })).rejects.toThrowError(JobError);
@@ -317,29 +405,79 @@ describe("getTaskStatus(poll)", () => {
 });
 
 describe("getTaskResult(result)", () => {
-  it("task の result と worker 出力のし尾部を返す(読み取りのみ)", async () => {
+  it("実ペイロード(terminal.tail)から出力し尾部をテキストに落とす", async () => {
     const { client, calls } = createFakeClient({
       taskList: {
         ok: true,
-        result: { tasks: [{ taskId: "task_abc123", status: "completed", result: "README を更新しました" }] },
+        result: {
+          tasks: [
+            {
+              id: "task_3208dcf22c18",
+              status: "completed",
+              result: "OK",
+              dispatch_id: "ctx_42e6925ec35f",
+              completed_at: "2026-10-06 10:16:20",
+            },
+          ],
+        },
       },
-      dispatchShow: { ok: true, result: { dispatch: { dispatchId: "disp_1" } } },
+      dispatchShow: { ok: true, result: { dispatch: { id: "ctx_42e6925ec35f" } } },
       workerRead: {
         ok: true,
-        result: { text: "x".repeat(5000), source: "transcript", cursor: "c2" },
+        result: {
+          dispatchId: "ctx_42e6925ec35f",
+          source: "terminal",
+          terminal: {
+            handle: "term_76d5cb08",
+            status: "running",
+            tail: ["› Reply with exactly OK.", "• OK", "  Worked for 8s • 19:16"],
+            nextCursor: "2",
+          },
+          status: { worker: "unsupervised", terminal: "running", liveness: "live" },
+          cursor: "owr1_xxx",
+        },
       },
     });
-    const view = await getTaskResult(client, { taskId: "task_abc123" });
+    const view = await getTaskResult(client, { taskId: "task_3208dcf22c18" });
 
     expect(view).toMatchObject({
-      taskId: "task_abc123",
+      taskId: "task_3208dcf22c18",
       state: "completed",
-      result: "README を更新しました",
+      result: "OK",
+      finishedAt: "2026-10-06 10:16:20",
     });
     const outputs = view["outputs"] as JsonObject[];
-    expect(outputs[0]).toMatchObject({ dispatchId: "disp_1", source: "transcript", cursor: "c2" });
-    expect((outputs[0]?.["text"] as string | undefined)?.length).toBeLessThanOrEqual(4001);
+    expect(outputs[0]).toMatchObject({
+      dispatchId: "ctx_42e6925ec35f",
+      source: "terminal",
+      terminalStatus: "running",
+      nextCursor: "2",
+      cursor: "owr1_xxx",
+    });
+    expect(String(outputs[0]?.["text"])).toContain("• OK");
     expect(calls.some((call) => call.startsWith("workerRead:"))).toBe(true);
+  });
+
+  it("transcript があるときは transcript.tail を使い、長い出力は 4000 字で切る", async () => {
+    const { client } = createFakeClient({
+      taskList: {
+        ok: true,
+        result: { tasks: [{ id: "t1", status: "completed", dispatch_id: "d1" }] },
+      },
+      workerRead: {
+        ok: true,
+        result: {
+          source: "transcript",
+          transcript: { tail: Array.from({ length: 200 }, (_, i) => `line ${i}`) },
+        },
+      },
+    });
+    const view = await getTaskResult(client, { taskId: "t1" });
+    const outputs = view["outputs"] as JsonObject[];
+    const text = String(outputs[0]?.["text"] ?? "");
+    expect(text).toContain("line 0");
+    expect(text.length).toBeLessThanOrEqual(4001);
+    expect(outputs[0]?.["terminalStatus"]).toBeNull();
   });
 
   it("worker-read 失敗は outputs に理由として記録し、応答は壊さない", async () => {
