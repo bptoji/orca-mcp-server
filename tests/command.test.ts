@@ -1,0 +1,125 @@
+import { describe, expect, it } from "vitest";
+import {
+  buildArgs,
+  parseJsonOutput,
+  resolveOrcaBin,
+  runOrca,
+  type RunOptions,
+} from "../src/orca/command.js";
+
+describe("buildArgs", () => {
+  it("既定で --json が末尾に付く", () => {
+    expect(buildArgs(["status"])).toEqual(["status", "--json"]);
+  });
+
+  it("サブコマンド配列はそのまま先頭に並ぶ", () => {
+    expect(buildArgs(["orchestration", "task-list", "--brief"])).toEqual([
+      "orchestration",
+      "task-list",
+      "--brief",
+      "--json",
+    ]);
+  });
+
+  it("json: false では --json を付与しない", () => {
+    expect(buildArgs(["status"], { json: false })).toEqual(["status"]);
+  });
+
+  it("呼び出し側の配列を書き換えない", () => {
+    const subcommand = ["status"];
+    buildArgs(subcommand);
+    expect(subcommand).toEqual(["status"]);
+  });
+});
+
+describe("resolveOrcaBin", () => {
+  it("ORCA_BIN があればそれを優先する", () => {
+    expect(resolveOrcaBin({ ORCA_BIN: "C:\\tools\\orca.exe" })).toBe("C:\\tools\\orca.exe");
+  });
+
+  it("空・空白の ORCA_BIN では orca にフォールバックする", () => {
+    expect(resolveOrcaBin({ ORCA_BIN: "   " })).toBe("orca");
+    expect(resolveOrcaBin({})).toBe("orca");
+  });
+});
+
+describe("parseJsonOutput", () => {
+  it("JSON をパースする", () => {
+    expect(parseJsonOutput('{"ok":true}\n')).toEqual({ ok: true, data: { ok: true } });
+  });
+
+  it("空文字は ok: true / data: undefined", () => {
+    expect(parseJsonOutput("")).toEqual({ ok: true, data: undefined });
+  });
+
+  it("不正 JSON は ok: false", () => {
+    const parsed = parseJsonOutput("not json");
+    expect(parsed.ok).toBe(false);
+  });
+});
+
+/**
+ * runOrca の実挙動テスト。本物の orca は起動せず、
+ * ORCA_BIN に node 自身を指定して「偽 orca」にする(hermetic)。
+ */
+const fakeEnv = { ORCA_BIN: process.execPath };
+
+function fakeRun(script: string, extraArgs: string[] = [], options: RunOptions = {}) {
+  return runOrca(["-e", script, ...extraArgs], { env: fakeEnv, ...options });
+}
+
+describe("runOrca (execFile ベース)", () => {
+  it("正常終了 + JSON 出力 → ok: true / data", async () => {
+    const result = await fakeRun("process.stdout.write(JSON.stringify({ hello: 'world' }))");
+    expect(result.ok).toBe(true);
+    expect(result.data).toEqual({ hello: "world" });
+    expect(result.exitCode).toBe(0);
+    expect(result.error).toBeUndefined();
+  });
+
+  it("JSON 出力なしの正常終了 → ok: true / data: undefined", async () => {
+    const result = await fakeRun("process.stdout.write('')");
+    expect(result.ok).toBe(true);
+    expect(result.data).toBeUndefined();
+  });
+
+  it("非ゼロ終了 → ok: false / non_zero_exit(例外は投げない)", async () => {
+    const result = await fakeRun("process.stderr.write('boom'); process.exit(3)");
+    expect(result.ok).toBe(false);
+    expect(result.error?.code).toBe("non_zero_exit");
+    expect(result.error?.message).toContain("boom");
+    expect(result.exitCode).toBe(3);
+  });
+
+  it("バイナリ不在 → ok: false / spawn_failed", async () => {
+    const result = await runOrca(["status", "--json"], {
+      env: { ORCA_BIN: "this-binary-does-not-exist-xyz" },
+    });
+    expect(result.ok).toBe(false);
+    expect(result.error?.code).toBe("spawn_failed");
+    expect(result.exitCode).toBe(-1);
+  });
+
+  it("タイムアウト → ok: false / timeout", async () => {
+    const result = await fakeRun("setTimeout(() => {}, 10_000)", [], { timeoutMs: 300 });
+    expect(result.ok).toBe(false);
+    expect(result.error?.code).toBe("timeout");
+  });
+
+  it("--json なのに JSON でない出力 → ok: false / invalid_json", async () => {
+    const result = await fakeRun("process.stdout.write('orca says hi')");
+    expect(result.ok).toBe(false);
+    expect(result.error?.code).toBe("invalid_json");
+  });
+
+  it("shell メタ文字を含む引数は 1 つの argv としてそのまま渡る(injection 防止)", async () => {
+    const evil = "a b && echo pwned; $(calc) | tail";
+    const result = await fakeRun(
+      "process.stdout.write(JSON.stringify(process.argv.slice(1)))",
+      [evil],
+    );
+    expect(result.ok).toBe(true);
+    // node -e ではスクリプトは argv に入らず、悪意ある文字列が単一要素として届く
+    expect(result.data).toEqual([evil]);
+  });
+});

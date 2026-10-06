@@ -1,0 +1,45 @@
+{
+  "name": "orca-mcp",
+  "version": "1.0.0",
+  "description": "Orca CLI をラップする MCP サーバー(status / delegate / task-status / message)",
+  "main": "dist/index.js",
+  "type": "module",
+  "bin": {
+    "orca-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "keywords": [
+    "mcp",
+    "modelcontextprotocol",
+    "orca",
+    "orchestration"
+  ],
+  "author": "",
+  "license": "ISC",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/server": "^2.3.1",
+    "tsx": "^4.23.15",
+    "zod": "^4.6.5"
+  },
+  "allowScripts": {
+    "esbuild@0.28.2": true
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.4",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.3"
+  }
+}
