@@ -26,12 +26,29 @@ export interface OrcaCommandFailure {
   message: string;
 }
 
+/**
+ * orca CLI 自身の JSON エンベロープが運ぶ意味論的な失敗(`ok:false` + `error`)。
+ * 終了コードの分類(OrcaErrorCode)とは別軸で、CLI が「なぜ出来なかったか」を返す。
+ * 例: `run_required` / `worktree_not_found` など。
+ */
+export interface OrcaEnvelopeError {
+  code: string;
+  message: string;
+  /** CLI が返す追加情報(nextSteps など)。そのまま応答に載せる。 */
+  data?: unknown;
+}
+
 export interface OrcaCommandResult<T = unknown> {
   ok: boolean;
   /** ok: true かつ stdout が JSON のときの解析結果。 */
   data?: T;
   /** ok: false のときの失敗情報。 */
   error?: OrcaCommandFailure;
+  /**
+   * stdout の JSON が `ok:false` エンベロープのときの CLI 側エラー。
+   * 終了コードが 0 でも 1 でも入り得る(transport の成否とは別に判定する)。
+   */
+  orcaError?: OrcaEnvelopeError;
   /** 実行に使われた完全な argv(診断用)。 */
   args: string[];
   /** 子プロセスの終了コード。起動失敗時は -1。 */
@@ -62,6 +79,8 @@ export class OrcaCommandError extends Error {
   readonly exitCode: number;
   readonly stdout: string;
   readonly stderr: string;
+  /** CLI 側エラーが運ぶ追加情報(nextSteps など)。 */
+  readonly data?: unknown;
 
   constructor(failure: OrcaCommandFailure, result: OrcaCommandResult) {
     super(`orca ${result.args.join(" ")} 失敗 [${failure.code}]: ${failure.message}`);
@@ -71,6 +90,7 @@ export class OrcaCommandError extends Error {
     this.exitCode = result.exitCode;
     this.stdout = result.stdout;
     this.stderr = result.stderr;
+    this.data = (failure as OrcaEnvelopeError).data;
   }
 }
 
@@ -102,6 +122,34 @@ export function parseJsonOutput<T = unknown>(
   } catch {
     return { ok: false, message: "stdout を JSON として解析できませんでした" };
   }
+}
+
+/**
+ * stdout の JSON が orca CLI の `ok:false` エンベロープのとき、CLI 側エラーを取り出す。
+ * 該当しなければ undefined(テスト対象)。
+ */
+export function extractEnvelopeError(data: unknown): OrcaEnvelopeError | undefined {
+  if (data === null || typeof data !== "object" || Array.isArray(data)) {
+    return undefined;
+  }
+  const envelope = data as Record<string, unknown>;
+  if (envelope["ok"] !== false) {
+    return undefined;
+  }
+  const raw = envelope["error"];
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    return undefined;
+  }
+  const cliError = raw as Record<string, unknown>;
+  const code =
+    typeof cliError["code"] === "string" && cliError["code"].length > 0
+      ? cliError["code"]
+      : "cli_error";
+  const message =
+    typeof cliError["message"] === "string" && cliError["message"].length > 0
+      ? cliError["message"]
+      : "orca CLI が ok:false を返しました";
+  return { code, message, data: cliError["data"] };
 }
 
 /**
@@ -180,6 +228,11 @@ export function runOrca<T = unknown>(
           }
           // 3) 非ゼロ終了: execFile は終了コードを number の code に入れる
           if (typeof error.code === "number") {
+            // stdout に ok:false エンベロープがあれば CLI 側の理由を優先して載せる
+            const parsedFailure = parseJsonOutput(base.stdout);
+            const cliError = parsedFailure.ok
+              ? extractEnvelopeError(parsedFailure.data)
+              : undefined;
             resolve({
               ...base,
               ok: false,
@@ -187,10 +240,13 @@ export function runOrca<T = unknown>(
               error: {
                 code: "non_zero_exit",
                 message:
-                  stderr.trim().length > 0
-                    ? `終了コード ${error.code}: ${stderr.trim()}`
-                    : `終了コード ${error.code}`,
+                  cliError !== undefined
+                    ? `終了コード ${error.code}: [${cliError.code}] ${cliError.message}`
+                    : stderr.trim().length > 0
+                      ? `終了コード ${error.code}: ${stderr.trim()}`
+                      : `終了コード ${error.code}`,
               },
+              ...(cliError !== undefined ? { orcaError: cliError } : {}),
             });
             return;
           }
@@ -214,7 +270,15 @@ export function runOrca<T = unknown>(
           });
           return;
         }
-        resolve({ ...base, ok: true, exitCode: 0, data: parsed.data });
+        // 終了コード 0 でも ok:false エンベロープがあり得る(transport は成功 / CLI は失敗)
+        const cliError = extractEnvelopeError(parsed.data);
+        resolve({
+          ...base,
+          ok: true,
+          exitCode: 0,
+          data: parsed.data,
+          ...(cliError !== undefined ? { orcaError: cliError } : {}),
+        });
       },
     );
   });

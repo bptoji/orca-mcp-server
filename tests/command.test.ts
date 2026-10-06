@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   buildArgs,
+  extractEnvelopeError,
   parseJsonOutput,
   resolveOrcaBin,
   runOrca,
@@ -121,5 +122,62 @@ describe("runOrca (execFile ベース)", () => {
     expect(result.ok).toBe(true);
     // node -e ではスクリプトは argv に入らず、悪意ある文字列が単一要素として届く
     expect(result.data).toEqual([evil]);
+  });
+
+  it("非ゼロ終了 + ok:false エンベロープ → non_zero_exit に CLI 側の code を添える", async () => {
+    const script =
+      "process.stdout.write(JSON.stringify({ok:false,error:{code:'run_required',message:'No Run is bound.',data:{nextSteps:['run-create']}}})); process.exit(1)";
+    const result = await fakeRun(script);
+    expect(result.ok).toBe(false);
+    expect(result.exitCode).toBe(1);
+    expect(result.error?.code).toBe("non_zero_exit");
+    expect(result.error?.message).toContain("run_required");
+    expect(result.orcaError?.code).toBe("run_required");
+    expect(result.orcaError?.data).toEqual({ nextSteps: ["run-create"] });
+  });
+
+  it("終了コード 0 + ok:false エンベロープ → ok: true のまま orcaError に理由を載せる", async () => {
+    const script =
+      "process.stdout.write(JSON.stringify({ok:false,error:{code:'worktree_not_found',message:'nope'}}))";
+    const result = await fakeRun(script);
+    expect(result.ok).toBe(true);
+    expect(result.exitCode).toBe(0);
+    expect(result.data).toMatchObject({ ok: false });
+    expect(result.orcaError?.code).toBe("worktree_not_found");
+  });
+
+  it("ok:true 応答では orcaError を付けない", async () => {
+    const result = await fakeRun("process.stdout.write(JSON.stringify({ok:true,result:{}}))");
+    expect(result.orcaError).toBeUndefined();
+  });
+});
+
+describe("extractEnvelopeError", () => {
+  it("ok:false + error から code / message / data を取り出す", () => {
+    const cliError = extractEnvelopeError({
+      ok: false,
+      error: { code: "run_required", message: "No Run is bound.", data: { effectsApplied: false } },
+    });
+    expect(cliError).toEqual({
+      code: "run_required",
+      message: "No Run is bound.",
+      data: { effectsApplied: false },
+    });
+  });
+
+  it("ok:true / 非オブジェクト / error 欠損では undefined", () => {
+    expect(extractEnvelopeError({ ok: true, result: {} })).toBeUndefined();
+    expect(extractEnvelopeError(null)).toBeUndefined();
+    expect(extractEnvelopeError("boom")).toBeUndefined();
+    expect(extractEnvelopeError([1, 2])).toBeUndefined();
+    expect(extractEnvelopeError({ ok: false })).toBeUndefined();
+  });
+
+  it("code / message が無ければ安定した既定値に落とす", () => {
+    expect(extractEnvelopeError({ ok: false, error: {} })).toEqual({
+      code: "cli_error",
+      message: "orca CLI が ok:false を返しました",
+      data: undefined,
+    });
   });
 });

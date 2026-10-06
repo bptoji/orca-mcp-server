@@ -25,26 +25,40 @@ src/
     client.ts       # OrcaClient: コマンド単位の型付きメソッド。runner 注入可能(テストでモック)
     schemas.ts      # 各ツールの zod inputSchema
   tools/
-    status.ts       # orca_status      … status / worktree ps
-    delegate.ts     # orca_delegate    … task-create + dispatch
-    task-status.ts  # orca_task_status … task-list(+ id 指定なら dispatch-show)
-    message.ts      # orca_message     … send / check / reply / inbox
+    result.ts       # 共通の CallToolResult ヘルパー(textResult / errorResult / resultOf)
+    status.ts       # orca_status          … status
+    worktrees.ts    # orca_list_worktrees  … worktree list / orca_get_worktree … worktree show
+    agents.ts       # orca_list_agents     … worktree ps の agents[] を平坦化
+    task-status.ts  # orca_get_task_status … task-list(+ id 指定なら dispatch-show)
+    delegate.ts     # orca_delegate        … task-create + dispatch(未登録の足場)
+    message.ts      # orca_message         … send / check / reply / inbox(未登録の足場)
 tests/              # vitest。子プロセスを実際に起動しない(モック runner / スタブ client)
 ```
 
-## 登録ツール(フェーズ 1)
+## 登録ツール(フェーズ 2: 読み取りのみ)
 
-**稼働中は `orca_status` のみ登録する。** 内部で `orca status --json` を 1 回呼ぶだけで、
-エージェントの起動・変更を一切行わない観測専用ツール。`delegate` / `task-status` / `message` は
-ファイルの足場が置いてあり、`createServer()` での登録は次のフェーズまで行わない。
+**稼働中は読み取り(read-only)ツールだけを登録する。** すべて内部で orca CLI を 1 回呼ぶだけ
+の観測専用で、エージェントの起動・送信・停止・タスク変更は行わない。エージェントを起動する
+`delegate` / `message` はファイルの足場が置いてあり、`createServer()` での登録は次のフェーズまで行わない。
 登録を外したツールのファイルは削除しない(テストは生かす)。
 
-| ツール | 状態 | 内容 |
+| ツール | 状態 | 内部コマンド |
 | --- | --- | --- |
-| `orca_status` | 登録済 | `orca status --json` を呼ぶだけ(read-only) |
+| `orca_status` | 登録済 | `orca status --json` |
+| `orca_list_worktrees` | 登録済 | `orca worktree list --json` |
+| `orca_get_worktree` | 登録済 | `orca worktree show --worktree <selector> --json` |
+| `orca_list_agents` | 登録済 | `orca worktree ps --json`(agents[] を平坦化) |
+| `orca_get_task_status` | 登録済 | `orca orchestration task-list --json`(+ id なら `dispatch-show`) |
 | `orca_delegate` | 未登録(足場) | task-create + dispatch |
-| `orca_task_status` | 未登録(足場) | task-list / dispatch-show |
 | `orca_message` | 未登録(足場) | send / check / reply / inbox |
+
+読み取りツールの決まり:
+
+- `annotations` は `{ readOnlyHint: true, openWorldHint: false }` 固定。
+- 大きな欄は既定で省略する(`orca_list_agents` は `prompt` を 200 文字で切り詰め、
+  `lastAssistantMessage` は `full: true` のときだけ)。
+- 1 ハンドラーで orca を複数回呼ぶのは「同じコマンドの continuation」だけ
+  (`task-list` → `dispatch-show`)。新しいコマンドを勝手に足さない。
 
 ## 決まりごと
 
@@ -60,7 +74,8 @@ tests/              # vitest。子プロセスを実際に起動しない(モッ
   interface OrcaCommandResult<T> {
     ok: boolean;
     data?: T;                      // stdout の JSON 解析結果
-    error?: { code: string; message: string };
+    error?: { code: string; message: string };        // transport 側の失敗
+    orcaError?: { code: string; message: string; data?: unknown }; // CLI が返す ok:false
     args: string[]; exitCode: number; stdout: string; stderr: string;
   }
   const result = await runOrca(["status", "--json"]);
@@ -69,8 +84,14 @@ tests/              # vitest。子プロセスを実際に起動しない(モッ
 
 - 失敗コードは `spawn_failed / timeout / max_buffer_exceeded / non_zero_exit / invalid_json` の
   安定した識別子のみ。新しい失敗の形を足すときは型にも追記する。
+- **transport と CLI の意味は別軸で持つ。** `error` は終了コード等の分類、`orcaError` は
+  stdout の `ok:false` エンベロープが運ぶ CLI 側の理由(`run_required` など)。
+  終了コード 0 でも `ok:false` は入り得る(`ok: true` のまま `orcaError` だけ載せる)。
 - 例外化はクライアント層(`OrcaClient.call`)だけが行う。ツール層は
-  `OrcaCommandError.code` を応答に載せて返す。
+  `OrcaCommandError.code` を応答に載せて返す。このとき **`orcaError` があれば transport の
+  code より優先する**(モデルに `non_zero_exit` より `run_required` を伝える)。
+- 失敗はプロトコル例外にせず `isError: true` の CallToolResult で返す
+  (`src/tools/result.ts` の `resultOf` を使う)。
 
 ### 一般
 

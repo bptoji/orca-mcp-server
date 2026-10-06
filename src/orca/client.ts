@@ -10,6 +10,15 @@ import {
 /** orca CLI の JSON 出力の共通形状(キーはコマンドごとに異なる)。 */
 export type JsonObject = Record<string, unknown>;
 
+export interface WorktreeListInput {
+  repo?: string;
+  limit?: number;
+}
+
+export interface WorktreeShowInput {
+  worktree: string;
+}
+
 export interface TaskCreateInput {
   spec: string;
   title?: string;
@@ -25,6 +34,7 @@ export interface TaskListInput {
   ready?: boolean;
   brief?: boolean;
   run?: string;
+  from?: string;
 }
 
 export interface TaskUpdateInput {
@@ -41,6 +51,11 @@ export interface DispatchInput {
   from?: string;
   run?: string;
   inject?: boolean;
+}
+
+export interface DispatchShowInput {
+  preamble?: boolean;
+  from?: string;
 }
 
 export interface SendInput {
@@ -136,11 +151,18 @@ export class OrcaClient {
       ...options,
     });
     if (!result.ok) {
-      const failure = result.error ?? {
+      // CLI 自身が ok:false を返しているときは、transport の code(non_zero_exit など)より
+      // CLI 側の理由(run_required など)を優先して呼び出し側に渡す。
+      const failure = result.orcaError ?? result.error ?? {
         code: "spawn_failed",
         message: result.stderr.trim() || result.stdout.trim() || "出力なし",
       };
       throw new OrcaCommandError(failure, result);
+    }
+    // 終了コード 0 で ok:false が返ることがある(CLI 側の理由が本体)。それを例外化して
+    // ツール層に code / data(nextSteps など)まで渡す。
+    if (result.orcaError !== undefined) {
+      throw new OrcaCommandError(result.orcaError, result);
     }
     return asJsonObject(result.data);
   }
@@ -150,7 +172,20 @@ export class OrcaClient {
     return this.call(["status"]);
   }
 
-  /** `orca worktree ps` — ワークツリー横断のオーケストレーション要約。 */
+  /** `orca worktree list` — Orca 管理ワークツリーの一覧。 */
+  worktreeList(input: WorktreeListInput = {}): Promise<JsonObject> {
+    const args = ["worktree", "list"];
+    if (input.repo !== undefined) args.push("--repo", input.repo);
+    if (input.limit !== undefined) args.push("--limit", String(input.limit));
+    return this.call(args);
+  }
+
+  /** `orca worktree show` — 1 件のワークツリー詳細(セレクタ指定)。 */
+  worktreeShow(input: WorktreeShowInput): Promise<JsonObject> {
+    return this.call(["worktree", "show", "--worktree", input.worktree]);
+  }
+
+  /** `orca worktree ps` — ワークツリー横断のオーケストレーション要約(agents を含む)。 */
   worktreePs(limit?: number): Promise<JsonObject> {
     const args = ["worktree", "ps"];
     if (limit !== undefined) {
@@ -180,6 +215,7 @@ export class OrcaClient {
     if (input.ready === true) args.push("--ready");
     if (input.brief === true) args.push("--brief");
     if (input.run !== undefined) args.push("--run", input.run);
+    if (input.from !== undefined) args.push("--from", input.from);
     return this.call(args);
   }
 
@@ -202,8 +238,11 @@ export class OrcaClient {
   }
 
   /** `orca orchestration dispatch-show` — タスクの dispatch 状況。 */
-  dispatchShow(task: string): Promise<JsonObject> {
-    return this.call(["orchestration", "dispatch-show", "--task", task]);
+  dispatchShow(task: string, input: DispatchShowInput = {}): Promise<JsonObject> {
+    const args = ["orchestration", "dispatch-show", "--task", task];
+    if (input.preamble === true) args.push("--preamble");
+    if (input.from !== undefined) args.push("--from", input.from);
+    return this.call(args);
   }
 
   /** `orca orchestration send` — エージェント間メッセージ送信。 */

@@ -2,21 +2,9 @@ import type { McpServer } from "@modelcontextprotocol/server";
 import type { CallToolResult } from "@modelcontextprotocol/server";
 import { extractTaskId, type JsonObject, type OrcaClient } from "../orca/client.js";
 import { delegateInputSchema } from "../orca/schemas.js";
+import { errorResult, textResult } from "./result.js";
 
 export const DELEGATE_TOOL_NAME = "orca_delegate";
-
-function textResult(payload: unknown): CallToolResult {
-  return {
-    content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
-  };
-}
-
-function errorResult(message: string, detail?: unknown): CallToolResult {
-  return {
-    content: [{ type: "text", text: JSON.stringify({ error: message, detail }, null, 2) }],
-    isError: true,
-  };
-}
 
 /**
  * orca_delegate: タスクを作成(task-create)し、指定ターミナルへ dispatch する。
@@ -33,29 +21,45 @@ export function registerDelegateTool(server: McpServer, client: OrcaClient): voi
       annotations: { destructiveHint: true, openWorldHint: false },
     },
     async (input): Promise<CallToolResult> => {
-      const task: JsonObject = await client.taskCreate({
-        spec: input.spec,
-        title: input.title,
-        deps: input.deps,
-        parent: input.parent,
-        run: input.run,
-        from: input.from,
-      });
+      try {
+        const task: JsonObject = await client.taskCreate({
+          spec: input.spec,
+          title: input.title,
+          deps: input.deps,
+          parent: input.parent,
+          run: input.run,
+          from: input.from,
+        });
 
-      const taskId = extractTaskId(task);
-      if (taskId === undefined) {
-        return errorResult("task-create の応答からタスク ID を取得できませんでした", task);
+        const taskId = extractTaskId(task);
+        if (taskId === undefined) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  { ok: false, code: "task_id_missing", detail: task },
+                  null,
+                  2,
+                ),
+              },
+            ],
+            isError: true,
+          };
+        }
+
+        const dispatch = await client.dispatch({
+          task: taskId,
+          to: input.to,
+          from: input.from,
+          run: input.run,
+          inject: input.inject,
+        });
+
+        return textResult({ taskId, task, dispatch });
+      } catch (error) {
+        return errorResult(error);
       }
-
-      const dispatch = await client.dispatch({
-        task: taskId,
-        to: input.to,
-        from: input.from,
-        run: input.run,
-        inject: input.inject,
-      });
-
-      return textResult({ taskId, task, dispatch });
     },
   );
 }

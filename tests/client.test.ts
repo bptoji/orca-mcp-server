@@ -90,6 +90,67 @@ describe("OrcaClient の引数組み立て", () => {
     await client.worktreePs(5);
     expect(calls[0]).toEqual(["worktree", "ps", "--limit", "5", "--json"]);
   });
+
+  it("worktree list は repo / limit をフラグで渡す", async () => {
+    const { runner, calls } = createMockRunner();
+    const client = new OrcaClient(runner);
+    await client.worktreeList({ repo: "name:orca-mcp", limit: 10 });
+    expect(calls[0]).toEqual([
+      "worktree",
+      "list",
+      "--repo",
+      "name:orca-mcp",
+      "--limit",
+      "10",
+      "--json",
+    ]);
+    await client.worktreeList({});
+    expect(calls[1]).toEqual(["worktree", "list", "--json"]);
+  });
+
+  it("worktree show は --worktree にセレクタをそのまま渡す", async () => {
+    const { runner, calls } = createMockRunner();
+    const client = new OrcaClient(runner);
+    await client.worktreeShow({ worktree: "branch:main" });
+    expect(calls[0]).toEqual(["worktree", "show", "--worktree", "branch:main", "--json"]);
+  });
+
+  it("task-list は --from を含めて渡す", async () => {
+    const { runner, calls } = createMockRunner();
+    const client = new OrcaClient(runner);
+    await client.taskList({ status: "ready", ready: true, brief: true, run: "r1", from: "term_1" });
+    expect(calls[0]).toEqual([
+      "orchestration",
+      "task-list",
+      "--status",
+      "ready",
+      "--ready",
+      "--brief",
+      "--run",
+      "r1",
+      "--from",
+      "term_1",
+      "--json",
+    ]);
+  });
+
+  it("dispatch-show は --preamble / --from を任意で付与する", async () => {
+    const { runner, calls } = createMockRunner();
+    const client = new OrcaClient(runner);
+    await client.dispatchShow("t1");
+    expect(calls[0]).toEqual(["orchestration", "dispatch-show", "--task", "t1", "--json"]);
+    await client.dispatchShow("t1", { preamble: true, from: "term_1" });
+    expect(calls[1]).toEqual([
+      "orchestration",
+      "dispatch-show",
+      "--task",
+      "t1",
+      "--preamble",
+      "--from",
+      "term_1",
+      "--json",
+    ]);
+  });
 });
 
 describe("OrcaClient のエラー処理", () => {
@@ -99,6 +160,53 @@ describe("OrcaClient のエラー処理", () => {
     const error = await client.status().catch((e: unknown) => e);
     expect(error).toBeInstanceOf(OrcaCommandError);
     expect((error as OrcaCommandError).code).toBe("non_zero_exit");
+  });
+
+  it("非ゼロ終了 + ok:false エンベロープなら CLI 側の code を優先する", async () => {
+    const envelope = {
+      ok: false,
+      error: { code: "run_required", message: "No Run is bound.", data: { effectsApplied: false } },
+    };
+    const runner: CommandRunner = async (args) => ({
+      args,
+      ok: false,
+      exitCode: 1,
+      stdout: JSON.stringify(envelope),
+      stderr: "",
+      error: { code: "non_zero_exit", message: "終了コード 1" },
+      orcaError: { code: "run_required", message: "No Run is bound.", data: { effectsApplied: false } },
+    });
+    const client = new OrcaClient(runner);
+    const error = (await client.taskList().catch((e: unknown) => e)) as OrcaCommandError;
+    expect(error.code).toBe("run_required");
+    expect(error.exitCode).toBe(1);
+    expect(error.data).toEqual({ effectsApplied: false });
+  });
+
+  it("終了コード 0 でも ok:false エンベロープなら CLI 側の code / data を投げる", async () => {
+    const envelope = {
+      id: "x1",
+      ok: false,
+      error: {
+        code: "run_required",
+        message: "No Run is bound.",
+        data: { nextSteps: ["run: skills get orchestration --full"] },
+      },
+    };
+    const runner: CommandRunner = async (args) => ({
+      args,
+      ok: true,
+      exitCode: 0,
+      stdout: JSON.stringify(envelope),
+      stderr: "",
+      data: envelope,
+      orcaError: { code: "run_required", message: "No Run is bound.", data: envelope.error.data },
+    });
+    const client = new OrcaClient(runner);
+    const error = (await client.taskList().catch((e: unknown) => e)) as OrcaCommandError;
+    expect(error).toBeInstanceOf(OrcaCommandError);
+    expect(error.code).toBe("run_required");
+    expect(error.data).toEqual({ nextSteps: ["run: skills get orchestration --full"] });
   });
 });
 
