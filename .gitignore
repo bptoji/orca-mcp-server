@@ -1,8 +1,48 @@
+# --- 依存・ビルド成果物 ---
 node_modules/
 dist/
 *.tsbuildinfo
+
+# --- テスト・カバレッジ ---
 coverage/
+.vitest/
+.cache/
+.eslintcache
+
+# --- 一時ファイル(スモークテスト・スクラッチ) ---
 .tmp/
 .tmp-*
+*.tmp
+scratch/
+
+# --- ログ ---
+*.log
+npm-debug.log*
+pnpm-debug.log*
+yarn-error.log*
+
+# --- 環境設定(ローカル固有の設定をコミットしない) ---
+.env
+.env.*
+!.env.example
+*.local
+
+# --- エディタ ---
+.vscode/
+.idea/
+*.swp
+*~
+
+# --- OS / ファイルシステム ---
 .DS_Store
 Thumbs.db
+ehthumbs.db
+desktop.ini
+$RECYCLE.BIN/
+
+# --- git 作業残骸 ---
+*.orig
+*.rej
+
+# --- 常にコミットするもの(念のため解除) ---
+!package-lock.json
