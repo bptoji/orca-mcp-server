@@ -5,6 +5,7 @@ import { McpServer } from "@modelcontextprotocol/server";
 import { serveStdio } from "@modelcontextprotocol/server/stdio";
 import { OrcaClient } from "./orca/client.js";
 import { registerJobTools } from "./tools/job.js";
+import { registerInterveneTools } from "./tools/intervene.js";
 import { registerStatusTool } from "./tools/status.js";
 import { registerGetWorktreeTool, registerListWorktreesTool } from "./tools/worktrees.js";
 import { registerListAgentsTool } from "./tools/agents.js";
@@ -21,6 +22,8 @@ export function createServer(client: OrcaClient = new OrcaClient()): McpServer {
   );
   // 主軸: 非同期 Job API(submit / poll / result)。1 呼び出しでワーカーを待たせない。
   registerJobTools(server, client);
+  // 介入: 明示的に頼まれたときだけ変更する 2 個(変更系コマンドはここに集約する)。
+  registerInterveneTools(server, client);
   // 観測用 read-only(デバッグ・状況確認用)。低レベルの作成系は登録しない。
   registerStatusTool(server, client);
   registerListWorktreesTool(server, client);

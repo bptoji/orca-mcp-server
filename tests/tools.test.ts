@@ -15,6 +15,7 @@ import {
   TASK_RESULT_TOOL_NAME,
   TASK_STATUS_TOOL_NAME,
 } from "../src/tools/job.js";
+import { CANCEL_TASK_TOOL_NAME, SEND_MESSAGE_TOOL_NAME } from "../src/tools/intervene.js";
 
 // SDK 内部の登録テーブルにアクセスするための薄い型(スモークテスト用)。
 interface RegisteredToolsAccess {
@@ -51,7 +52,7 @@ function createStubClient() {
 }
 
 describe("createServer", () => {
-  it("Job API 3 個 + 観測 read-only 4 個だけが登録されている", () => {
+  it("Job API 3 + 介入 2 + 観測 read-only 4 が登録されている", () => {
     const { stub } = createStubClient();
     const server = createServer(stub);
     expect(server).toBeInstanceOf(McpServer);
@@ -63,6 +64,8 @@ describe("createServer", () => {
         DELEGATE_TASK_TOOL_NAME,
         TASK_STATUS_TOOL_NAME,
         TASK_RESULT_TOOL_NAME,
+        SEND_MESSAGE_TOOL_NAME,
+        CANCEL_TASK_TOOL_NAME,
         STATUS_TOOL_NAME,
         LIST_WORKTREES_TOOL_NAME,
         GET_WORKTREE_TOOL_NAME,
@@ -83,19 +86,32 @@ describe("createServer", () => {
       "orca_start_agent",
       "orca_send_terminal",
       "orca_terminal_send",
+      "orca_terminal_create",
+      "orca_worker_stop",
+      "orca_task_update",
     ]) {
       expect(registered).not.toContain(hidden);
     }
   });
 
-  it("Job API の submit は read-only ではないと明示している", () => {
+  it("変更系ツールの annotations: submit と cancel は destructive、send は非破壊", () => {
     const { stub } = createStubClient();
     const tools = (createServer(stub) as unknown as RegisteredToolsAccess)._registeredTools;
-    const submit = tools[DELEGATE_TASK_TOOL_NAME] as { annotations?: Record<string, boolean> };
-    expect(submit.annotations?.readOnlyHint).toBe(false);
-    expect(submit.annotations?.destructiveHint).toBe(true);
-    const poll = tools[TASK_STATUS_TOOL_NAME] as { annotations?: Record<string, boolean> };
-    expect(poll.annotations?.readOnlyHint).toBe(true);
+    const annotationsOf = (name: string) =>
+      (tools[name] as { annotations?: Record<string, boolean> }).annotations;
+    expect(annotationsOf(DELEGATE_TASK_TOOL_NAME)).toMatchObject({
+      readOnlyHint: false,
+      destructiveHint: true,
+    });
+    expect(annotationsOf(CANCEL_TASK_TOOL_NAME)).toMatchObject({
+      readOnlyHint: false,
+      destructiveHint: true,
+    });
+    expect(annotationsOf(SEND_MESSAGE_TOOL_NAME)).toMatchObject({
+      readOnlyHint: false,
+      destructiveHint: false,
+    });
+    expect(annotationsOf(TASK_STATUS_TOOL_NAME)).toMatchObject({ readOnlyHint: true });
   });
 
   it("サーバー名とバージョン", () => {

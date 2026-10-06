@@ -73,6 +73,36 @@ orca_get_task_result({ taskId: "task_abc123" })
 - dispatch だけ失敗しても **タスクは生き続ける** → `state: "queued"` + `warnings` で返す
 - CLI 側の失敗はコードごと転送する(例: `run_not_found` + `data.orchestrationRequestId`)
 
+### 介入(intervene)
+
+委譲したジョブに**明示的に頼まれたときだけ**手を出す 2 個です。poll / result / 観測ツールは変更を一切行いません。
+
+| ツール | 役割 | 内部で呼ぶもの | 破壊的? |
+| --- | --- | --- | --- |
+| `orca_send_message` | ワーカーへの指示補足・質問・エスカレーション | `orchestration send`(必要なら `run-use` でバインド切替) | いいえ |
+| `orca_cancel_task` | タスクを止めてキャンセル扱いにする | worker-stop / worker-abandon → `task-update --status failed` | はい |
+
+```
+orca_send_message({ subject: "方針変更", body: "実装は src/ のみに限定", run: "run_…",
+                    taskId: "task_abc123", type: "status" })
+  → { "ok": true, "messageId": "msg_1c7834109a5e", "runId": "run_…", "type": "status" }
+
+orca_cancel_task({ taskId: "task_abc123", reason: "方針変更" })
+  → { "taskId": "task_abc123", "state": "cancelled", "cancelled": true, "mode": "stop",
+      "workers": [ { "dispatchId": "ctx_…", "action": "stop", "resultState": "stopped" } ],
+      "warnings": [] }
+```
+
+- `type` は CLI が受け付ける種別のみ(`status / dispatch / worker_done / merge_ready / escalation /
+  handoff / decision_gate / question / heartbeat`)。`worker_done` には `outcome` が必須(無ければ `outcome_required`)
+- 宛先 `to` は `run:<id>` / `dispatch:<id>` / `@all` / `@codex` / `@worktree:<id>`、省略時は Run の受信箱
+- MCP 側は Run バインドを持たないので `run`(`orca_delegate_task` が返した `runId`)を渡す
+- **キャンセルは CLI の手順どおり**: worker を fence してから `--status failed --result cancelled`。
+  完了済み・キャンセル済みのタスクには何もしない(冪等、`cancelled: false` + warning)
+- worktree やターミナルの削除は行わない(残す。後片付けは人間側の判断)
+- worker fence に失敗しても `warnings` に記録して task のキャンセルは進める。
+  確定だけ失敗したら `cancel_incomplete`(fence 済みの worker 一覧を `detail` に載せる)
+
 ### 観測用 read-only
 
 | ツール | 内容 | 対応 orca コマンド |
@@ -82,7 +112,8 @@ orca_get_task_result({ taskId: "task_abc123" })
 | `orca_get_worktree` | 1 件のワークツリー詳細 | `orca worktree show --json` |
 | `orca_list_agents` | worktree 横断のエージェント一覧 | `orca worktree ps --json` |
 
-未登録(足場のみ): `orca_delegate`(低レベルすぎる委譲) / `orca_message`(send / check / reply / inbox)。
+未登録(足場のみ): `orca_delegate`(低レベルすぎる委譲) / `orca_message`(check / reply / inbox 込みの send)。
+送信は `orca_send_message` として公開しているので、そちらを使ってください。
 
 ### 挙動の約束
 
@@ -92,15 +123,21 @@ orca_get_task_result({ taskId: "task_abc123" })
   `orca_get_task_result` の worker 出力は 4000 文字、`specPreview` は 200 文字)
 - CLI が `ok:false` を返したときは `code` をそのまま応答に載せる(`isError: true`)。
   例: `run_required` / `run_not_found` / `worktree_not_found`(+ `data.nextSteps` など)
-- ジョブ層の失敗は別の語彙: `task_not_found` / `task_id_missing` / `run_create_failed`
+- ジョブ層の失敗は別の語彙: `task_not_found` / `task_id_missing` / `run_create_failed` /
+  `outcome_required` / `cancel_incomplete`
+- orca CLI は**呼び出し元ターミナルを 1 つの Run にバインド**する。違う Run への変更は
+  `consumer_fenced` で拒否されるため、介入ツールだけが必要に応じて `run-use` で
+  バインドを切り替えて 1 回だけ再試行する( poll / 観測ツールは切り替えない)
 
 ### 使用例(典型的な流れ)
 
 1. `orca_status` でランタイムが起動しているか確認する
 2. `orca_delegate_task({ spec })` で委譲 → `{ taskId, state: "running" }` を即受け取る
 3. `orca_get_task_status({ taskId })` を数分おきに poll する(他作業を挟んでよい)
-4. `state: "completed"` になったら `orca_get_task_result({ taskId })` で成果を受け取る
-5. 状況確認が欲しいときだけ `orca_list_worktrees` / `orca_list_agents` を使う
+4. 方針を変えたいときだけ `orca_send_message({ subject, body, run, taskId })` で指示を出す
+5. 取り消すときだけ `orca_cancel_task({ taskId, reason })` を使う(worker を止めて task を cancelled にする)
+6. `state: "completed"` になったら `orca_get_task_result({ taskId })` で成果を受け取る
+7. 状況確認が欲しいときだけ `orca_list_worktrees` / `orca_list_agents` を使う
 
 ## スクリプト
 
@@ -127,6 +164,7 @@ orca-mcp/
 │  └─ tools/
 │     ├─ result.ts      # 共通の CallToolResult ヘルパー(text / isError)
 │     ├─ job.ts         # orca_delegate_task / orca_get_task_status / orca_get_task_result
+│     ├─ intervene.ts   # orca_send_message / orca_cancel_task(変更系コマンドはここだけ)
 │     ├─ status.ts      # orca_status
 │     ├─ worktrees.ts   # orca_list_worktrees / orca_get_worktree
 │     ├─ agents.ts      # orca_list_agents(worktree ps の平坦化)

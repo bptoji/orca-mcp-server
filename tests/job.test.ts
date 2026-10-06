@@ -2,7 +2,9 @@ import { describe, expect, it } from "vitest";
 import type { JsonObject, OrcaClient } from "../src/orca/client.js";
 import {
   buildWorktreeName,
+  cancelTask,
   estimatePhase,
+  extractBoundRun,
   findTaskById,
   getTaskResult,
   getTaskStatus,
@@ -10,8 +12,10 @@ import {
   JobError,
   mapTaskState,
   mapWorkerStatus,
+  sendMessage,
   toWorkerRow,
 } from "../src/orca/job.js";
+import { OrcaCommandError } from "../src/orca/command.js";
 
 describe("mapTaskState", () => {
   it("orca の生の status を Job API の state に集約する", () => {
@@ -150,6 +154,8 @@ function createFakeClient(options: {
   workerList?: JsonObject;
   gateList?: JsonObject;
   workerRead?: JsonObject;
+  send?: JsonObject;
+  taskUpdate?: JsonObject;
 } = {}) {
   const calls: string[] = [];
   const client = {
@@ -203,6 +209,26 @@ function createFakeClient(options: {
     workerRead: async (input: JsonObject) => {
       calls.push(`workerRead:${JSON.stringify(input)}`);
       return options.workerRead ?? { ok: true, result: { text: "done", source: "transcript" } };
+    },
+    send: async (input: JsonObject) => {
+      calls.push(`send:${JSON.stringify(input)}`);
+      return options.send ?? { ok: true, result: { message: { id: "msg_1" } } };
+    },
+    taskUpdate: async (input: JsonObject) => {
+      calls.push(`taskUpdate:${JSON.stringify(input)}`);
+      return options.taskUpdate ?? { ok: true, result: { task: { id: input["id"] } } };
+    },
+    workerStop: async (dispatch: string) => {
+      calls.push(`workerStop:${dispatch}`);
+      return { ok: true, result: { dispatchId: dispatch, state: "stopped", processAction: "none" } };
+    },
+    workerAbandon: async (dispatch: string) => {
+      calls.push(`workerAbandon:${dispatch}`);
+      return { ok: true, result: { dispatchId: dispatch, state: "abandoned" } };
+    },
+    runUse: async (runId: string) => {
+      calls.push(`runUse:${runId}`);
+      return { ok: true, result: { run: { id: runId } } };
     },
   };
   return { client: client as unknown as OrcaClient, calls };
@@ -493,5 +519,190 @@ describe("getTaskResult(result)", () => {
     const outputs = view["outputs"] as JsonObject[];
     expect(String(outputs[0]?.["error"] ?? "")).toContain("worker_not_readable");
     expect(view["state"]).toBe("failed");
+  });
+});
+
+describe("sendMessage(介入)", () => {
+  it("subject と run を送って messageId を返す", async () => {
+    const { client, calls } = createFakeClient();
+    const result = await sendMessage(client, {
+      subject: "方針変更",
+      body: "実装は src/ のみに限定してください",
+      run: "run_a781f51d4c91",
+      taskId: "task_3208dcf22c18",
+      type: "status",
+    });
+    expect(result).toMatchObject({
+      ok: true,
+      messageId: "msg_1",
+      runId: "run_a781f51d4c91",
+      type: "status",
+      subject: "方針変更",
+    });
+    expect(calls[0]).toContain('"run":"run_a781f51d4c91"');
+  });
+
+  it("type=worker_done に outcome が無いと JobError(outcome_required)", async () => {
+    const { client } = createFakeClient();
+    await expect(
+      sendMessage(client, { subject: "done", type: "worker_done" }),
+    ).rejects.toThrowError(JobError);
+  });
+
+  it("worker_done + outcome は通る", async () => {
+    const { client } = createFakeClient();
+    const result = await sendMessage(client, {
+      subject: "done",
+      type: "worker_done",
+      outcome: "succeeded",
+      dispatchId: "ctx_1",
+    });
+    expect(result["type"]).toBe("worker_done");
+  });
+});
+
+describe("cancelTask(介入)", () => {
+  const runningTaskList = {
+    ok: true,
+    result: {
+      tasks: [
+        {
+          id: "task_3208dcf22c18",
+          run_id: "run_a781f51d4c91",
+          status: "dispatched",
+          dispatch_id: "ctx_42e6925ec35f",
+        },
+      ],
+    },
+  };
+
+  it("worker-stop してから task を failed/cancelled にする(CLI の手順)", async () => {
+    const { client, calls } = createFakeClient({ taskList: runningTaskList });
+    const result = await cancelTask(client, { taskId: "task_3208dcf22c18", reason: "方針変更" });
+
+    expect(result).toMatchObject({
+      taskId: "task_3208dcf22c18",
+      state: "cancelled",
+      cancelled: true,
+      runId: "run_a781f51d4c91",
+      mode: "stop",
+      reason: "方針変更",
+    });
+    expect((result["workers"] as JsonObject[])[0]).toMatchObject({
+      dispatchId: "ctx_42e6925ec35f",
+      action: "stop",
+      resultState: "stopped",
+    });
+    // 順序: 読む → fence する → task を更新する
+    const stopIndex = calls.findIndex((call) => call.startsWith("workerStop:"));
+    const updateIndex = calls.findIndex((call) => call.startsWith("taskUpdate:"));
+    expect(stopIndex).toBeGreaterThan(-1);
+    expect(updateIndex).toBeGreaterThan(stopIndex);
+    expect(calls[updateIndex]).toContain('"status":"failed"');
+    expect(calls[updateIndex]).toContain("cancelled: 方針変更");
+  });
+
+  it("mode: abandon では worker-abandon を使う", async () => {
+    const { client, calls } = createFakeClient({ taskList: runningTaskList });
+    await cancelTask(client, { taskId: "task_3208dcf22c18", mode: "abandon" });
+    expect(calls.some((call) => call.startsWith("workerAbandon:"))).toBe(true);
+    expect(calls.some((call) => call.startsWith("workerStop:"))).toBe(false);
+  });
+
+  it("完了済みタスクでは何も変更しない(冪等)", async () => {
+    const { client, calls } = createFakeClient({
+      taskList: { ok: true, result: { tasks: [{ id: "t1", status: "completed" }] } },
+    });
+    const result = await cancelTask(client, { taskId: "t1" });
+    expect(result["cancelled"]).toBe(false);
+    expect(result["state"]).toBe("completed");
+    expect(calls.some((call) => call.startsWith("workerStop:"))).toBe(false);
+    expect(calls.some((call) => call.startsWith("taskUpdate:"))).toBe(false);
+  });
+
+  it("worker-stop 失敗は warnings に記録し、task のキャンセルは進める", async () => {
+    const client = {
+      taskList: async () => runningTaskList,
+      dispatchShow: async () => ({ ok: true, result: { dispatch: null } }),
+      workerStop: async () => {
+        throw new Error("release_unknown");
+      },
+      taskUpdate: async () => ({ ok: true, result: {} }),
+    } as unknown as OrcaClient;
+
+    const result = await cancelTask(client, { taskId: "task_3208dcf22c18" });
+    expect(result["cancelled"]).toBe(true);
+    expect((result["warnings"] as string[])[0]).toContain("release_unknown");
+  });
+
+  it("task 行の id を dispatch id と取り違えない(worker-abandon を空打ちしない)", async () => {
+    const { client, calls } = createFakeClient({
+      taskList: { ok: true, result: { tasks: [{ id: "task_695cee4c872d", status: "dispatched" }] } },
+      dispatchShow: { ok: true, result: { dispatch: null } },
+    });
+    const result = await cancelTask(client, { taskId: "task_695cee4c872d" });
+    expect(calls.some((call) => call.includes("task_695cee4c872d") && call.startsWith("workerStop:"))).toBe(
+      false,
+    );
+    expect(result["workers"]).toEqual([]);
+    expect(result["cancelled"]).toBe(true);
+  });
+
+  it("consumer_fenced なら run-use でバインドを切り替えて 1 回再試行する", async () => {
+    const { client, calls } = createFakeClient({ taskList: runningTaskList });
+    let attempts = 0;
+    client.taskUpdate = (async (input: JsonObject) => {
+      attempts += 1;
+      calls.push(`taskUpdate:${JSON.stringify(input)}`);
+      if (attempts === 1) {
+        throw new OrcaCommandError(
+          {
+            code: "consumer_fenced",
+            message: "This coordinator terminal is bound to run_other, not run_a781f51d4c91.",
+          },
+          { ok: false, args: ["orchestration", "task-update"], exitCode: 1, stdout: "", stderr: "" },
+        );
+      }
+      return { ok: true, result: {} };
+    }) as unknown as typeof client.taskUpdate;
+
+    const result = await cancelTask(client, { taskId: "task_3208dcf22c18" });
+    expect(result["cancelled"]).toBe(true);
+    expect(calls.filter((call) => call.startsWith("taskUpdate:")).length).toBe(2);
+    expect(calls.some((call) => call === "runUse:run_a781f51d4c91")).toBe(true);
+  });
+
+  it("再試行も失敗したら JobError(cancel_incomplete) に fence 済みの worker を載せる", async () => {
+    const client = {
+      taskList: async () => runningTaskList,
+      dispatchShow: async () => ({ ok: true, result: { dispatch: { id: "ctx_1" } } }),
+      workerStop: async () => ({ ok: true, result: { state: "stopped" } }),
+      taskUpdate: async () => {
+        throw new OrcaCommandError(
+          { code: "consumer_fenced", message: "This coordinator terminal is bound to run_x, not run_a781f51d4c91." },
+          { ok: false, args: ["orchestration", "task-update"], exitCode: 1, stdout: "", stderr: "" },
+        );
+      },
+      runUse: async () => ({ ok: true, result: {} }),
+    } as unknown as OrcaClient;
+
+    const error = await cancelTask(client, { taskId: "task_3208dcf22c18" }).catch((e) => e);
+    expect(error).toBeInstanceOf(JobError);
+    expect((error as JobError).code).toBe("cancel_incomplete");
+    expect(JSON.stringify((error as JobError).detail)).toContain("ctx_1");
+  });
+
+  it("未知の taskId は JobError(task_not_found)", async () => {
+    const { client } = createFakeClient();
+    await expect(cancelTask(client, { taskId: "nope" })).rejects.toThrowError(JobError);
+  });
+});
+
+describe("extractBoundRun", () => {
+  it("fence メッセージからバインド中の Run ID を拾う", () => {
+    expect(
+      extractBoundRun("This coordinator terminal is bound to run_2fd476f310f3, not run_a781f51d4c91."),
+    ).toBe("run_2fd476f310f3");
+    expect(extractBoundRun("no run here")).toBeUndefined();
   });
 });

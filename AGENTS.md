@@ -28,6 +28,7 @@ src/
   tools/
     result.ts       # 共通の CallToolResult ヘルパー(textResult / errorResult / resultOf)
     job.ts          # orca_delegate_task / orca_get_task_status / orca_get_task_result
+    intervene.ts    # orca_send_message / orca_cancel_task(変更系コマンドはここに集約)
     status.ts       # orca_status          … status
     worktrees.ts    # orca_list_worktrees  … worktree list / orca_get_worktree … worktree show
     agents.ts       # orca_list_agents     … worktree ps の agents[] を平坦化
@@ -47,6 +48,8 @@ tests/              # vitest。子プロセスを実際に起動しない(モッ
 | `orca_delegate_task` | submit | run-create(未指定時) → task-create → worktree create --agent → dispatch |
 | `orca_get_task_status` | poll | task-list / dispatch-show / worker-list / gate-list |
 | `orca_get_task_result` | result | task-list / dispatch-show / worker-read |
+| `orca_send_message` | intervene(非破壊) | `orchestration send`(必要なら run-use でバインド切替) |
+| `orca_cancel_task` | intervene(破壊的) | worker-stop/abandon → `task-update --status failed` |
 | `orca_status` | 観測 | `orca status --json` |
 | `orca_list_worktrees` | 観測 | `orca worktree list --json` |
 | `orca_get_worktree` | 観測 | `orca worktree show --json` |
@@ -62,25 +65,35 @@ tests/              # vitest。子プロセスを実際に起動しない(モッ
   dispatch 失敗は `state: "queued"` + `warnings` で伝える(例外にしてタスクを消さない)。
 - 状態は正規化する(`queued/running/blocked/completed/failed/cancelled`)。CLI 生の値は
   `rawStatus` に残す。phase は worker/gate から推定し、根拠が無ければ `starting` に寄せる。
-- ジョブ層の語彙は `JobError`(`task_not_found` / `task_id_missing` / `run_create_failed`)。
-  CLI 側の語彙(`run_required` など)はそのまま転送する。
+- ジョブ層の語彙は `JobError`(`task_not_found` / `task_id_missing` / `run_create_failed` /
+  `outcome_required` / `cancel_incomplete`)。CLI 側の語彙(`run_required` など)はそのまま転送する。
 - 出力は既定で切り詰める(`specPreview` 200 字、worker 出力 4000 字、agents の prompt 200 字)。
 
 ## 登録ツール(現状)
 
-`createServer()` は上記 7 個だけを登録する。`delegate.ts` / `message.ts` は足場として
+`createServer()` は上記 9 個だけを登録する。`delegate.ts` / `message.ts` は足場として
 ファイルを残す(テストは生かす)。登録を外したツールのファイルは削除しない。
 
 読み取り・poll 系の決まり:
 
 - 観測ツールの `annotations` は `{ readOnlyHint: true, openWorldHint: false }` 固定。
-  submit(`orca_delegate_task`)だけ `readOnlyHint: false` + `destructiveHint: true`。
+  `orca_delegate_task` / `orca_cancel_task` は `readOnlyHint: false` + `destructiveHint: true`、
+  `orca_send_message` は `readOnlyHint: false` + `destructiveHint: false`。
 - 大きな欄は既定で省略する(`orca_list_agents` は `prompt` を 200 文字で切り詰め、
   `lastAssistantMessage` は `full: true` のときだけ)。
 - 1 ハンドラーで複数の orca コマンドを呼んでよいのは **poll / result の読み集め**
-  (`task-list` + `dispatch-show` + `worker-list` + `gate-list`)と submit の既定フローだけ。
-  変更系コマンド(task-update / worker-stop など)をツール内で勝手に呼ばない。
+  (`task-list` + `dispatch-show` + `worker-list` + `gate-list`)、submit の既定フロー、
+  そして **介入ツール(`orca_send_message` / `orca_cancel_task`)だけ**。
+  poll / result / 観測ツールが変更系コマンド(task-update / worker-stop / run-use)を呼ぶことは禁止。
 - poll の応答に生の JSON をそのまま入れず、正規化した上で `rawStatus` 等の生値を添える。
+
+### Run バインドと `consumer_fenced`
+
+orca CLI は **呼び出し元ターミナルを 1 つの Run にバインド**する。バインドと違う Run に
+対して `task-update` / `send` などをすると `consumer_fenced` で拒否される
+(メッセージにバインド中の Run ID が入る)。`runMutation()` がそのときだけ
+`run-use --id <run>` でバインドを切り替えて **1 回だけ**再試行する。それ以外で
+`run-use` を勝手に呼ばないこと(呼び出し元の pane の状態が変わるため)。
 
 ## 決まりごと
 

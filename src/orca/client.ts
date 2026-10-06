@@ -105,6 +105,7 @@ export interface SendInput {
   threadId?: string;
   taskId?: string;
   dispatchId?: string;
+  run?: string;
 }
 
 export interface CheckInput {
@@ -269,6 +270,16 @@ export class OrcaClient {
     return this.call(["orchestration", "worker-show", "--dispatch", dispatch]);
   }
 
+  /** `orca orchestration worker-abandon` — 不確実な worker を fence する(プロセスは触らない)。 */
+  workerAbandon(dispatch: string): Promise<JsonObject> {
+    return this.call(["orchestration", "worker-abandon", "--dispatch", dispatch]);
+  }
+
+  /** `orca orchestration worker-stop` — dispatch を fence して worker を止める。 */
+  workerStop(dispatch: string): Promise<JsonObject> {
+    return this.call(["orchestration", "worker-stop", "--dispatch", dispatch]);
+  }
+
   /** `orca orchestration worker-read` — worker の出力(読み取り)。 */
   workerRead(input: WorkerReadInput): Promise<JsonObject> {
     const args = ["orchestration", "worker-read", "--dispatch", input.dispatch];
@@ -343,6 +354,7 @@ export class OrcaClient {
   send(input: SendInput): Promise<JsonObject> {
     const args = ["orchestration", "send", "--subject", input.subject];
     if (input.to !== undefined) args.push("--to", input.to);
+    if (input.run !== undefined) args.push("--run", input.run);
     if (input.body !== undefined) args.push("--body", input.body);
     if (input.type !== undefined) args.push("--type", input.type);
     if (input.priority !== undefined) args.push("--priority", input.priority);
@@ -393,5 +405,10 @@ export class OrcaClient {
   /** `orca orchestration run-current` — バインド中の Run 表示。 */
   runCurrent(): Promise<JsonObject> {
     return this.call(["orchestration", "run-current"]);
+  }
+
+  /** `orca orchestration run-use` — 呼び出し元の Run バインドを切り替える(変更系)。 */
+  runUse(runId: string): Promise<JsonObject> {
+    return this.call(["orchestration", "run-use", "--id", runId]);
   }
 }

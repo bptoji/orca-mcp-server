@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  cancelTaskInputSchema,
   delegateInputSchema,
   delegateTaskInputSchema,
   getTaskResultInputSchema,
@@ -8,6 +9,7 @@ import {
   listAgentsInputSchema,
   listWorktreesInputSchema,
   messageInputSchema,
+  sendMessageInputSchema,
 } from "../src/orca/schemas.js";
 
 describe("delegateInputSchema", () => {
@@ -99,6 +101,40 @@ describe("listAgentsInputSchema", () => {
     const parsed = listAgentsInputSchema.parse({ worktree: "orca-mcp", state: "working" });
     expect(parsed.worktree).toBe("orca-mcp");
     expect(parsed.state).toBe("working");
+  });
+});
+
+describe("sendMessageInputSchema", () => {
+  it("subject だけ必須", () => {
+    expect(sendMessageInputSchema.safeParse({}).success).toBe(false);
+    expect(sendMessageInputSchema.safeParse({ subject: "方針変更" }).success).toBe(true);
+  });
+
+  it("type は CLI が受け付ける種別の列挙に限定する", () => {
+    expect(sendMessageInputSchema.safeParse({ subject: "a", type: "escalation" }).success).toBe(true);
+    expect(sendMessageInputSchema.safeParse({ subject: "a", type: "broadcast" }).success).toBe(false);
+  });
+
+  it("outcome は succeeded / failed のみ", () => {
+    expect(
+      sendMessageInputSchema.safeParse({ subject: "a", type: "worker_done", outcome: "succeeded" })
+        .success,
+    ).toBe(true);
+    expect(
+      sendMessageInputSchema.safeParse({ subject: "a", outcome: "maybe" }).success,
+    ).toBe(false);
+  });
+});
+
+describe("cancelTaskInputSchema", () => {
+  it("taskId が必須、mode の既定は stop", () => {
+    expect(cancelTaskInputSchema.safeParse({}).success).toBe(false);
+    expect(cancelTaskInputSchema.parse({ taskId: "t1" }).mode).toBe("stop");
+  });
+
+  it("mode は stop / abandon のみ", () => {
+    expect(cancelTaskInputSchema.safeParse({ taskId: "t1", mode: "abandon" }).success).toBe(true);
+    expect(cancelTaskInputSchema.safeParse({ taskId: "t1", mode: "nuke" }).success).toBe(false);
   });
 });
 

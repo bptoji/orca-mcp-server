@@ -114,6 +114,59 @@ export const getTaskResultInputSchema = z.object({
 });
 export type GetTaskResultInput = z.infer<typeof getTaskResultInputSchema>;
 
+export const sendMessageInputSchema = z.object({
+  subject: z.string().min(1).describe("件名(必須)。ワーカーへの指示・質問・エスカレーションを短く書く"),
+  body: z.string().optional().describe("本文"),
+  to: z
+    .string()
+    .min(1)
+    .optional()
+    .describe("宛先: run:<id> / dispatch:<id> / @all / @codex / @worktree:<id> / 旧来ハンドル。省略時は Run の受信箱"),
+  run: z
+    .string()
+    .min(1)
+    .optional()
+    .describe("対象の orchestration Run ID(orca_delegate_task が返した runId。MCP 側はバインドを持たないので実質必須)"),
+  type: z
+    .enum([
+      "status",
+      "dispatch",
+      "worker_done",
+      "merge_ready",
+      "escalation",
+      "handoff",
+      "decision_gate",
+      "question",
+      "heartbeat",
+    ])
+    .optional()
+    .describe("メッセージ種別(worker_done は outcome 必須)"),
+  outcome: z
+    .enum(["succeeded", "failed"])
+    .optional()
+    .describe("type=worker_done 時の完了報告の結末"),
+  priority: z.string().min(1).optional().describe("優先度(例: low / normal / high)"),
+  threadId: z.string().min(1).optional().describe("スレッド ID(往復の紐付け)"),
+  taskId: z.string().min(1).optional().describe("関連付けるタスク ID"),
+  dispatchId: z.string().min(1).optional().describe("関連付ける dispatch ID(試行単位の指示)"),
+});
+export type SendMessageInputSchema = z.infer<typeof sendMessageInputSchema>;
+
+export const cancelTaskInputSchema = z.object({
+  taskId: z.string().min(1).describe("キャンセルするタスク ID"),
+  run: z.string().min(1).optional().describe("対象の orchestration Run ID"),
+  reason: z
+    .string()
+    .min(1)
+    .optional()
+    .describe("キャンセル理由(task の result に 'cancelled: <reason>' として記録)"),
+  mode: z
+    .enum(["stop", "abandon"])
+    .default("stop")
+    .describe("stop: worker を fence して止める / abandon: 不確実なまま fence する(プロセスに触らない)"),
+});
+export type CancelTaskInputSchema = z.infer<typeof cancelTaskInputSchema>;
+
 export const delegateInputSchema = z.object({
   spec: z.string().min(1).describe("ワーカーに渡すタスク仕様(指示文)"),
   title: z.string().min(1).optional().describe("タスクの表示タイトル"),

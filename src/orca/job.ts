@@ -1,3 +1,4 @@
+import { OrcaCommandError } from "./command.js";
 import {
   extractTasks,
   type JsonObject,
@@ -55,6 +56,37 @@ export function unwrapResult(payload: JsonObject): JsonObject {
   return isJsonObject(payload["result"]) ? (payload["result"] as JsonObject) : payload;
 }
 
+/**
+ * Run バインドに紐づく変更系コマンドを実行する。
+ *
+ * orca CLI は呼び出し元(この MCP サーバーを起動したターミナル)を 1 つの Run に
+ * バインドする。別の Run に対して `task-update` 等を行うと `consumer_fenced` で
+ * 拒否されるため、そのときだけ `run-use` でバインドを切り替えて 1 回再試行する。
+ */
+export async function runMutation<T>(
+  client: OrcaClient,
+  runId: string | undefined,
+  mutate: () => Promise<T>,
+): Promise<T> {
+  try {
+    return await mutate();
+  } catch (error) {
+    const fenced =
+      error instanceof OrcaCommandError &&
+      (error.code === "consumer_fenced" || error.message.includes("consumer_fenced"));
+    if (!fenced || runId === undefined) {
+      throw error;
+    }
+    await client.runUse(runId);
+    return await mutate();
+  }
+}
+
+/** `consumer_fenced` のメッセージから、バインド中の Run ID を拾う(診断用)。 */
+export function extractBoundRun(message: string): string | undefined {
+  return message.match(/bound to (run_[A-Za-z0-9_-]+)/)?.[1];
+}
+
 function str(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }
@@ -92,6 +124,8 @@ export function pickIdDeep(source: JsonObject, keys: readonly string[], depth = 
 
 const ID_KEYS = ["taskId", "task_id", "id"] as const;
 const DISPATCH_ID_KEYS = ["dispatchId", "dispatch_id", "id"] as const;
+/** task 行から dispatch id を拾うときのキー(`id` は task id なので含めない) */
+const TASK_DISPATCH_KEYS = ["dispatch_id", "dispatchId"] as const;
 const AGENT_KEYS = ["provider", "agentType", "agent_type", "agent", "agentId", "agentIdentity"] as const;
 const TITLE_KEYS = ["task_title", "taskTitle", "title", "display_name", "displayName"] as const;
 const CREATED_KEYS = ["created_at", "createdAt"] as const;
@@ -367,13 +401,15 @@ export async function delegateTask(
   }
 
   // 2) task-create(ここが成功すれば Job は成立する)
-  const task = await client.taskCreate({
-    spec: input.spec,
-    title: input.title,
-    deps: input.deps,
-    parent: input.parent,
-    run: runId,
-  });
+  const task = await runMutation(client, runId, () =>
+    client.taskCreate({
+      spec: input.spec,
+      title: input.title,
+      deps: input.deps,
+      parent: input.parent,
+      run: runId,
+    }),
+  );
   const taskId = pickIdDeep(unwrapResult(task), ID_KEYS);
   if (taskId === undefined) {
     throw new JobError("task_id_missing", "task-create の応答からタスク ID を取得できませんでした", task);
@@ -509,7 +545,7 @@ export async function getTaskStatus(client: OrcaClient, input: TaskStatusInput):
       .map((dispatch) => pickString(dispatch, DISPATCH_ID_KEYS))
       .filter((value): value is string => value !== undefined),
   );
-  const taskDispatchId = pickString(task, DISPATCH_ID_KEYS);
+  const taskDispatchId = pickString(task, TASK_DISPATCH_KEYS);
   if (taskDispatchId !== undefined) {
     dispatchIds.add(taskDispatchId);
   }
@@ -583,6 +619,161 @@ function extractOutputText(read: JsonObject): {
   };
 }
 
+/** 介入: メッセージ送信(ワーカーへの指示・質問・エスカレーション)。 */
+export interface SendMessageInput {
+  subject: string;
+  body?: string;
+  to?: string;
+  run?: string;
+  type?: string;
+  priority?: string;
+  threadId?: string;
+  taskId?: string;
+  dispatchId?: string;
+  outcome?: "succeeded" | "failed";
+}
+
+const MESSAGE_TYPES = [
+  "status",
+  "dispatch",
+  "worker_done",
+  "merge_ready",
+  "escalation",
+  "handoff",
+  "decision_gate",
+  "question",
+  "heartbeat",
+] as const;
+
+export async function sendMessage(client: OrcaClient, input: SendMessageInput): Promise<JsonObject> {
+  if (input.type === "worker_done" && input.outcome === undefined) {
+    throw new JobError(
+      "outcome_required",
+      "type: worker_done には outcome(succeeded / failed)が必要です",
+      { validTypes: MESSAGE_TYPES },
+    );
+  }
+
+  const sent = await runMutation(client, input.run, () =>
+    client.send({
+      subject: input.subject,
+      to: input.to,
+      body: input.body,
+      type: input.type,
+      priority: input.priority,
+      threadId: input.threadId,
+      taskId: input.taskId,
+      dispatchId: input.dispatchId,
+      run: input.run,
+    }),
+  );
+  const source = unwrapResult(sent);
+
+  return {
+    ok: true,
+    messageId: pickIdDeep(source, ["messageId", "message_id", "id"]) ?? null,
+    deliveryId: pickIdDeep(source, ["deliveryId", "delivery_id"]) ?? null,
+    to: input.to ?? null,
+    runId: input.run ?? null,
+    type: input.type ?? null,
+    subject: input.subject,
+  };
+}
+
+/** 介入: タスクのキャンセル(CLI の手順どおり worker を fence してから task を failed にする)。 */
+export interface CancelTaskInput {
+  taskId: string;
+  run?: string;
+  reason?: string;
+  mode?: "stop" | "abandon";
+}
+
+export async function cancelTask(client: OrcaClient, input: CancelTaskInput): Promise<JsonObject> {
+  const list = await client.taskList({ run: input.run, brief: false });
+  const task = findTaskById(list, input.taskId);
+  const rawStatus = pickString(task, ["status", "state", "taskStatus"]);
+  const state = mapTaskState(rawStatus);
+  const runId = pickString(task, ["run_id", "runId"]) ?? input.run ?? null;
+  const mode = input.mode ?? "stop";
+  const reason = input.reason ?? "cancelled";
+
+  // 完了・キャンセル済みのタスクには何もしない(冪等)
+  if (state === "completed" || state === "failed" || state === "cancelled") {
+    return {
+      taskId: input.taskId,
+      state,
+      cancelled: false,
+      runId,
+      warnings: [`タスクはすでに ${rawStatus} です。変更していません`],
+    };
+  }
+
+  const dispatchIds = new Set(
+    extractDispatches(await client.dispatchShow(input.taskId))
+      .map((dispatch) => pickString(dispatch, DISPATCH_ID_KEYS))
+      .filter((value): value is string => value !== undefined),
+  );
+  const taskDispatchId = pickString(task, TASK_DISPATCH_KEYS);
+  if (taskDispatchId !== undefined) {
+    dispatchIds.add(taskDispatchId);
+  }
+
+  // 1) worker を fence する(実手順: stop / abandon → task を failed にする)
+  const workers: JsonObject[] = [];
+  const warnings: string[] = [];
+  for (const dispatchId of [...dispatchIds].slice(0, 3)) {
+    try {
+      const fenced = unwrapResult(
+        mode === "abandon"
+          ? await client.workerAbandon(dispatchId)
+          : await client.workerStop(dispatchId),
+      );
+      workers.push({
+        dispatchId,
+        action: mode,
+        resultState: pickString(fenced, ["state", "workerState", "status"]) ?? null,
+        processAction: pickString(fenced, ["processAction", "process_action"]) ?? null,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      workers.push({ dispatchId, action: mode, error: message });
+      warnings.push(`dispatch ${dispatchId} の ${mode} に失敗: ${message}`);
+    }
+  }
+
+  // 2) タスクを failed + cancelled 理由で確定する(CLI のキャンセル手順)
+  try {
+    await runMutation(client, runId ?? undefined, () =>
+      client.taskUpdate({
+        id: input.taskId,
+        status: "failed",
+        result: `cancelled: ${reason}`,
+        run: runId ?? undefined,
+      }),
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const boundRun = error instanceof OrcaCommandError ? extractBoundRun(error.message) : undefined;
+    throw new JobError(
+      "cancel_incomplete",
+      `worker は fence しましたが task のキャンセル確定に失敗しました: ${message}`,
+      { taskId: input.taskId, runId, fencedWorkers: workers, boundRun },
+    );
+  }
+
+  return {
+    taskId: input.taskId,
+    state: "cancelled",
+    cancelled: true,
+    runId,
+    mode,
+    reason,
+    workers,
+    warnings,
+    note: "CLI のキャンセル手順(worker fence → task failed/cancelled)を実行しました",
+  };
+}
+
 /** result: 完了時の result と worker 出力のし尾部を読む(読み取りのみ)。 */
 export async function getTaskResult(client: OrcaClient, input: TaskResultInput): Promise<JsonObject> {
   const list = await client.taskList({ run: input.run, brief: false });
@@ -597,7 +788,7 @@ export async function getTaskResult(client: OrcaClient, input: TaskResultInput):
       .map((dispatch) => pickString(dispatch, DISPATCH_ID_KEYS))
       .filter((value): value is string => value !== undefined),
   );
-  const taskDispatchId = pickString(task, DISPATCH_ID_KEYS);
+  const taskDispatchId = pickString(task, TASK_DISPATCH_KEYS);
   if (taskDispatchId !== undefined) {
     dispatchIds.add(taskDispatchId);
   }
