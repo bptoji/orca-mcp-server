@@ -20,18 +20,20 @@ npm test          # vitest(子プロセス不要の単体テスト)
 
 ## MCP クライアント設定例
 
-ビルド(`npm run build`)後に設定ファイルへ登録します。
+ビルド(`npm run build`)後に設定ファイルへ登録します。`<your-user>` と `<repo-dir>` はご自身の環境に読み替えてください。
 
 ```json
 {
   "mcpServers": {
     "orca": {
       "command": "node",
-      "args": ["C:\\Users\\e12171\\orca\\projects\\orca-mcp\\dist\\index.js"]
+      "args": ["C:\\Users\\<your-user>\\<repo-dir>\\orca-mcp\\dist\\index.js"]
     }
   }
 }
 ```
+
+macOS / Linux では `"args": ["/home/<your-user>/<repo-dir>/orca-mcp/dist/index.js"]` のように絶対パスで指定します。
 
 開発中にビルドへ依存したくない場合は `npx tsx src/index.ts` を `command` にしても動きます。
 
