@@ -4,11 +4,11 @@ import { pathToFileURL } from "node:url";
 import { McpServer } from "@modelcontextprotocol/server";
 import { serveStdio } from "@modelcontextprotocol/server/stdio";
 import { OrcaClient } from "./orca/client.js";
+import { registerJobTools } from "./tools/job.js";
 import { registerStatusTool } from "./tools/status.js";
 import { registerGetWorktreeTool, registerListWorktreesTool } from "./tools/worktrees.js";
 import { registerListAgentsTool } from "./tools/agents.js";
-import { registerGetTaskStatusTool } from "./tools/task-status.js";
-// 未登録の足場(エージェントを起動する): tools/delegate.ts / tools/message.ts
+// 未登録の足場(低レベルすぎる API を外部に出さない): tools/delegate.ts / tools/message.ts
 
 export const SERVER_NAME = "orca-mcp";
 export const SERVER_VERSION = "1.0.0";
@@ -19,12 +19,13 @@ export function createServer(client: OrcaClient = new OrcaClient()): McpServer {
     { name: SERVER_NAME, version: SERVER_VERSION },
     { capabilities: { tools: {} } },
   );
-  // フェーズ 2: 読み取り(read-only)ツールのみ。エージェントを起動・変更するツールは未登録。
+  // 主軸: 非同期 Job API(submit / poll / result)。1 呼び出しでワーカーを待たせない。
+  registerJobTools(server, client);
+  // 観測用 read-only(デバッグ・状況確認用)。低レベルの作成系は登録しない。
   registerStatusTool(server, client);
   registerListWorktreesTool(server, client);
   registerGetWorktreeTool(server, client);
   registerListAgentsTool(server, client);
-  registerGetTaskStatusTool(server, client);
   return server;
 }
 

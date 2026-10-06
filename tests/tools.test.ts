@@ -10,7 +10,11 @@ import {
   LIST_WORKTREES_TOOL_NAME,
 } from "../src/tools/worktrees.js";
 import { LIST_AGENTS_TOOL_NAME } from "../src/tools/agents.js";
-import { TASK_STATUS_TOOL_NAME } from "../src/tools/task-status.js";
+import {
+  DELEGATE_TASK_TOOL_NAME,
+  TASK_RESULT_TOOL_NAME,
+  TASK_STATUS_TOOL_NAME,
+} from "../src/tools/job.js";
 
 // SDK 内部の登録テーブルにアクセスするための薄い型(スモークテスト用)。
 interface RegisteredToolsAccess {
@@ -47,7 +51,7 @@ function createStubClient() {
 }
 
 describe("createServer", () => {
-  it("McpServer を返し、読み取り(read-only)ツール 5 個だけが登録されている", () => {
+  it("Job API 3 個 + 観測 read-only 4 個だけが登録されている", () => {
     const { stub } = createStubClient();
     const server = createServer(stub);
     expect(server).toBeInstanceOf(McpServer);
@@ -56,22 +60,42 @@ describe("createServer", () => {
     ).sort();
     expect(registered).toEqual(
       [
+        DELEGATE_TASK_TOOL_NAME,
+        TASK_STATUS_TOOL_NAME,
+        TASK_RESULT_TOOL_NAME,
         STATUS_TOOL_NAME,
         LIST_WORKTREES_TOOL_NAME,
         GET_WORKTREE_TOOL_NAME,
         LIST_AGENTS_TOOL_NAME,
-        TASK_STATUS_TOOL_NAME,
       ].sort(),
     );
   });
 
-  it("エージェントを起動するツール(delegate / message)は未登録のまま", () => {
+  it("低レベルすぎる API と未登録の足場を公開していない", () => {
     const { stub } = createStubClient();
     const registered = Object.keys(
       (createServer(stub) as unknown as RegisteredToolsAccess)._registeredTools,
     );
-    expect(registered).not.toContain("orca_delegate");
-    expect(registered).not.toContain("orca_message");
+    for (const hidden of [
+      "orca_delegate",
+      "orca_message",
+      "orca_create_worktree",
+      "orca_start_agent",
+      "orca_send_terminal",
+      "orca_terminal_send",
+    ]) {
+      expect(registered).not.toContain(hidden);
+    }
+  });
+
+  it("Job API の submit は read-only ではないと明示している", () => {
+    const { stub } = createStubClient();
+    const tools = (createServer(stub) as unknown as RegisteredToolsAccess)._registeredTools;
+    const submit = tools[DELEGATE_TASK_TOOL_NAME] as { annotations?: Record<string, boolean> };
+    expect(submit.annotations?.readOnlyHint).toBe(false);
+    expect(submit.annotations?.destructiveHint).toBe(true);
+    const poll = tools[TASK_STATUS_TOOL_NAME] as { annotations?: Record<string, boolean> };
+    expect(poll.annotations?.readOnlyHint).toBe(true);
   });
 
   it("サーバー名とバージョン", () => {

@@ -37,36 +37,70 @@ npm test          # vitest(子プロセス不要の単体テスト)
 
 ## ツール一覧
 
-現在は **フェーズ 2: 読み取り(read-only)5 ツール**。すべて内部で orca CLI を 1 回呼ぶだ
-けの観測専用で、エージェントの起動・送信・停止・タスク変更は一切行いません。
-エージェントを起動する `orca_delegate` / `orca_message` は足場のみで未登録です。
+公開 API は **非同期 Job API(submit / poll / result)** を主軸にします。
+**1 回の MCP 呼び出しでワーカーの完了を待ちません**(30 分ブロックのような設計にしない)。
+低レベルすぎる API(`orca_create_worktree` / `orca_start_agent` / `orca_send_terminal` 之类)は
+外部に出さず、内部実装に隠しています。
 
-| ツール | 状態 | 内容 | 対応 orca コマンド |
+### Job API
+
+| ツール | 役割 | 内部で呼ぶもの | 待つ? |
 | --- | --- | --- | --- |
-| `orca_status` | 登録済 | ランタイム準備状態を JSON で返す(入力なし) | `orca status --json` |
-| `orca_list_worktrees` | 登録済 | ワークツリー一覧(repo / limit 指定可) | `orca worktree list --json` |
-| `orca_get_worktree` | 登録済 | 1 件のワークツリー詳細(セレクタ指定) | `orca worktree show --json` |
-| `orca_list_agents` | 登録済 | worktree 横断のエージェント一覧(平坦化) | `orca worktree ps --json` |
-| `orca_get_task_status` | 登録済 | タスク一覧(+ id 指定で dispatch 状況) | `orca orchestration task-list` / `dispatch-show` |
-| `orca_delegate` | 未登録 | タスク作成 + 指定ターミナルへ dispatch | `orca orchestration task-create` + `dispatch` |
-| `orca_message` | 未登録 | メッセージ送信 / 受信箱チェック / 返信 / 一覧 | `orca orchestration send` / `check` / `reply` / `inbox` |
+| `orca_delegate_task` | **submit** | run-create(未指定時) → task-create → worktree create --agent → dispatch | 待たない |
+| `orca_get_task_status` | **poll** | task-list / dispatch-show / worker-list / gate-list | 待たない |
+| `orca_get_task_result` | **result** | task-list / dispatch-show / worker-read | 待たない |
 
-### 読み取りツールの挙動
+```
+orca_delegate_task({ spec: "README を更新して" })
+  → { "taskId": "task_abc123", "state": "running", "runId": "run_…",
+      "target": { "kind": "new_worktree", "worktree": "…", "terminal": "term_…", "agent": "codex" },
+      "dispatchId": "disp_1", "warnings": [] }
+
+orca_get_task_status({ taskId: "task_abc123" })
+  → { "taskId": "task_abc123", "state": "running", "phase": "implementation",
+      "rawStatus": "dispatched",
+      "workers": [ { "agent": "codex", "status": "completed", "dispatchId": "disp_1" },
+                   { "agent": "claude", "status": "running", "dispatchId": "disp_2" } ],
+      "gates": [], "nextAction": "poll again with orca_get_task_status" }
+
+orca_get_task_result({ taskId: "task_abc123" })
+  → { "state": "completed", "result": "README を更新しました",
+      "outputs": [ { "dispatchId": "disp_1", "source": "transcript", "text": "…", "cursor": "…" } ] }
+```
+
+- `state`: `queued / running / blocked / completed / failed / cancelled`(CLI 生の値は `rawStatus`)
+- `phase`: `queued / starting / implementation / decision_gate / settling / finished`
+- dispatch だけ失敗しても **タスクは生き続ける** → `state: "queued"` + `warnings` で返す
+- CLI 側の失敗はコードごと転送する(例: `run_not_found` + `data.orchestrationRequestId`)
+
+### 観測用 read-only
+
+| ツール | 内容 | 対応 orca コマンド |
+| --- | --- | --- |
+| `orca_status` | ランタイム準備状態(入力なし) | `orca status --json` |
+| `orca_list_worktrees` | ワークツリー一覧(repo / limit) | `orca worktree list --json` |
+| `orca_get_worktree` | 1 件のワークツリー詳細 | `orca worktree show --json` |
+| `orca_list_agents` | worktree 横断のエージェント一覧 | `orca worktree ps --json` |
+
+未登録(足場のみ): `orca_delegate`(低レベルすぎる委譲) / `orca_message`(send / check / reply / inbox)。
+
+### 挙動の約束
 
 - **入力はすべて argv 配列**で、セレクタや自由文は 1 要素としてそのまま渡す(shell 文字列は作らない)
-- `orca_list_agents` は既定で `prompt` を 200 文字に切り詰め、`lastAssistantMessage` を省略する
-  (`full: true` で全文)
-- CLI が `ok:false` を返したときは `code` をそのまま応答に載せる。例: Run 未バインドで
-  `orca_get_task_status` → `code: "run_required"`(+ CLI の `data.nextSteps`)、`isError: true`
+- **どのツールもワーカーの完了を待たない。** 完了監視は呼び出し側の poll に委ねる
+- 大きな欄は既定で切り詰める(`orca_list_agents` の `prompt` は 200 文字、
+  `orca_get_task_result` の worker 出力は 4000 文字、`specPreview` は 200 文字)
+- CLI が `ok:false` を返したときは `code` をそのまま応答に載せる(`isError: true`)。
+  例: `run_required` / `run_not_found` / `worktree_not_found`(+ `data.nextSteps` など)
+- ジョブ層の失敗は別の語彙: `task_not_found` / `task_id_missing` / `run_create_failed`
 
-### 使用例(概念図・全フェーズ)
+### 使用例(典型的な流れ)
 
-1. `orca_status` で稼働中のランタイムを把握する
-2. `orca_list_worktrees` / `orca_get_worktree` で対象 worktree を特定する ← 今ここ
-3. `orca_list_agents` で起動中のエージェント(dsh / codex / claude)を把握する ← 今ここ
-4. `orca_delegate` で「仕様 → タスク作成 → ターミナルへ dispatch」を一気に委譲する
-5. `orca_get_task_status` で進捗を見る ← 今ここ
-6. `orca_message`(action=check)でワーカーからの完了報告を受け取る
+1. `orca_status` でランタイムが起動しているか確認する
+2. `orca_delegate_task({ spec })` で委譲 → `{ taskId, state: "running" }` を即受け取る
+3. `orca_get_task_status({ taskId })` を数分おきに poll する(他作業を挟んでよい)
+4. `state: "completed"` になったら `orca_get_task_result({ taskId })` で成果を受け取る
+5. 状況確認が欲しいときだけ `orca_list_worktrees` / `orca_list_agents` を使う
 
 ## スクリプト
 
@@ -86,18 +120,19 @@ orca-mcp/
 ├─ src/
 │  ├─ index.ts          # エントリ(createServer + stdio 接続)
 │  ├─ orca/
-│  │  ├─ client.ts      # 型付き orca CLI クライアント(runner 注入可能)
 │  │  ├─ command.ts     # 子プロセス実行の最下層(--json 付与・JSON パース・タイムアウト)
+│  │  ├─ client.ts      # 型付き orca CLI クライアント(runner 注入可能)
+│  │  ├─ job.ts         # 非同期 Job API の内部モデル(正規化 + submit/poll/result)
 │  │  └─ schemas.ts     # ツール入力の zod スキーマ
 │  └─ tools/
 │     ├─ result.ts      # 共通の CallToolResult ヘルパー(text / isError)
+│     ├─ job.ts         # orca_delegate_task / orca_get_task_status / orca_get_task_result
 │     ├─ status.ts      # orca_status
 │     ├─ worktrees.ts   # orca_list_worktrees / orca_get_worktree
 │     ├─ agents.ts      # orca_list_agents(worktree ps の平坦化)
-│     ├─ task-status.ts # orca_get_task_status
 │     ├─ delegate.ts    # orca_delegate(未登録の足場)
 │     └─ message.ts     # orca_message(未登録の足場)
-├─ tests/               # orca ランタイム不要の単体テスト
+├─ tests/               # orca ランタイム不要の単体テスト(job.test.ts は偽 client)
 ├─ AGENTS.md            # エージェント向け開発規約
 ├─ README.md
 ├─ package.json

@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   delegateInputSchema,
+  delegateTaskInputSchema,
+  getTaskResultInputSchema,
   getTaskStatusInputSchema,
   getWorktreeInputSchema,
   listAgentsInputSchema,
@@ -24,19 +26,40 @@ describe("delegateInputSchema", () => {
 });
 
 describe("getTaskStatusInputSchema", () => {
-  it("brief の既定は true", () => {
-    expect(getTaskStatusInputSchema.parse({}).brief).toBe(true);
+  it("taskId が必須(空文字は拒否)", () => {
+    expect(getTaskStatusInputSchema.safeParse({}).success).toBe(false);
+    expect(getTaskStatusInputSchema.safeParse({ taskId: "" }).success).toBe(false);
+    expect(getTaskStatusInputSchema.safeParse({ taskId: "task_abc123" }).success).toBe(true);
   });
 
-  it("id / status / run / from は任意", () => {
-    const parsed = getTaskStatusInputSchema.parse({
-      id: "t1",
-      status: "ready",
-      run: "run_legacy_local",
-      from: "term_1",
-    });
-    expect(parsed.id).toBe("t1");
-    expect(parsed.status).toBe("ready");
+  it("run は任意", () => {
+    const parsed = getTaskStatusInputSchema.parse({ taskId: "t1", run: "run_1" });
+    expect(parsed.taskId).toBe("t1");
+    expect(parsed.run).toBe("run_1");
+  });
+});
+
+describe("delegateTaskInputSchema", () => {
+  it("spec だけ必須(低レベルな target 指定は全て任意)", () => {
+    expect(delegateTaskInputSchema.safeParse({}).success).toBe(false);
+    expect(delegateTaskInputSchema.safeParse({ spec: "README を更新" }).success).toBe(true);
+  });
+
+  it("agent の既定は codex", () => {
+    expect(delegateTaskInputSchema.parse({ spec: "a" }).agent).toBe("codex");
+  });
+
+  it("deps は文字列配列", () => {
+    expect(delegateTaskInputSchema.safeParse({ spec: "a", deps: ["t1", "t2"] }).success).toBe(true);
+    expect(delegateTaskInputSchema.safeParse({ spec: "a", deps: [1] }).success).toBe(false);
+  });
+});
+
+describe("getTaskResultInputSchema", () => {
+  it("taskId が必須、outputLimit は 1..200", () => {
+    expect(getTaskResultInputSchema.safeParse({}).success).toBe(false);
+    expect(getTaskResultInputSchema.safeParse({ taskId: "t1", outputLimit: 40 }).success).toBe(true);
+    expect(getTaskResultInputSchema.safeParse({ taskId: "t1", outputLimit: 201 }).success).toBe(false);
   });
 });
 

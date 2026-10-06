@@ -19,6 +19,44 @@ export interface WorktreeShowInput {
   worktree: string;
 }
 
+export interface WorktreeCreateInput {
+  name: string;
+  repo?: string;
+  agent?: string;
+  prompt?: string;
+  setup?: "run" | "skip" | "inherit";
+  baseBranch?: string;
+  comment?: string;
+  parentWorktree?: string;
+  noParent?: boolean;
+}
+
+export interface TerminalListInput {
+  worktree?: string;
+  limit?: number;
+}
+
+export interface WorkerListInput {
+  run?: string;
+  terminalState?: string;
+  limit?: number;
+  cursor?: string;
+}
+
+export interface WorkerReadInput {
+  dispatch: string;
+  source?: "auto" | "transcript" | "terminal";
+  cursor?: string;
+  limit?: number;
+}
+
+export interface GateListInput {
+  task?: string;
+  status?: string;
+  run?: string;
+  from?: string;
+}
+
 export interface TaskCreateInput {
   spec: string;
   title?: string;
@@ -191,6 +229,62 @@ export class OrcaClient {
     if (limit !== undefined) {
       args.push("--limit", String(limit));
     }
+    return this.call(args);
+  }
+
+  /** `orca worktree create` — 新しいチェックアウト(任意でエージェントも起動)。 */
+  worktreeCreate(input: WorktreeCreateInput): Promise<JsonObject> {
+    const args = ["worktree", "create", "--name", input.name];
+    if (input.repo !== undefined) args.push("--repo", input.repo);
+    if (input.agent !== undefined) args.push("--agent", input.agent);
+    if (input.prompt !== undefined) args.push("--prompt", input.prompt);
+    if (input.setup !== undefined) args.push("--setup", input.setup);
+    if (input.baseBranch !== undefined) args.push("--base-branch", input.baseBranch);
+    if (input.comment !== undefined) args.push("--comment", input.comment);
+    if (input.parentWorktree !== undefined) args.push("--parent-worktree", input.parentWorktree);
+    if (input.noParent === true) args.push("--no-parent");
+    return this.call(args);
+  }
+
+  /** `orca terminal list` — 稼働中ターミナル(handle 取得用)。 */
+  terminalList(input: TerminalListInput = {}): Promise<JsonObject> {
+    const args = ["terminal", "list"];
+    if (input.worktree !== undefined) args.push("--worktree", input.worktree);
+    if (input.limit !== undefined) args.push("--limit", String(input.limit));
+    return this.call(args);
+  }
+
+  /** `orca orchestration worker-list` — worker のリソース計上。 */
+  workerList(input: WorkerListInput = {}): Promise<JsonObject> {
+    const args = ["orchestration", "worker-list"];
+    if (input.run !== undefined) args.push("--run", input.run);
+    if (input.terminalState !== undefined) args.push("--terminal-state", input.terminalState);
+    if (input.limit !== undefined) args.push("--limit", String(input.limit));
+    if (input.cursor !== undefined) args.push("--cursor", input.cursor);
+    return this.call(args);
+  }
+
+  /** `orca orchestration worker-show` — 1 つの dispatch の worker 詳細。 */
+  workerShow(dispatch: string): Promise<JsonObject> {
+    return this.call(["orchestration", "worker-show", "--dispatch", dispatch]);
+  }
+
+  /** `orca orchestration worker-read` — worker の出力(読み取り)。 */
+  workerRead(input: WorkerReadInput): Promise<JsonObject> {
+    const args = ["orchestration", "worker-read", "--dispatch", input.dispatch];
+    if (input.source !== undefined) args.push("--source", input.source);
+    if (input.cursor !== undefined) args.push("--cursor", input.cursor);
+    if (input.limit !== undefined) args.push("--limit", String(input.limit));
+    return this.call(args);
+  }
+
+  /** `orca orchestration gate-list` — 意思決定ゲート(blocked の理由になり得る)。 */
+  gateList(input: GateListInput = {}): Promise<JsonObject> {
+    const args = ["orchestration", "gate-list"];
+    if (input.task !== undefined) args.push("--task", input.task);
+    if (input.status !== undefined) args.push("--status", input.status);
+    if (input.run !== undefined) args.push("--run", input.run);
+    if (input.from !== undefined) args.push("--from", input.from);
     return this.call(args);
   }
 

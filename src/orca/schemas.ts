@@ -57,6 +57,63 @@ export const listAgentsInputSchema = z.object({
 });
 export type ListAgentsInput = z.infer<typeof listAgentsInputSchema>;
 
+export const delegateTaskInputSchema = z.object({
+  spec: z.string().min(1).describe("ワーカーに渡すタスク仕様(指示文)。これ 1 本で委譲できる"),
+  title: z.string().min(1).optional().describe("タスクの表示タイトル(worktree 名にも使う)"),
+  agent: z
+    .string()
+    .min(1)
+    .default("codex")
+    .describe("新規 worktree で起動するエージェント(既定 codex)"),
+  worktree: z
+    .string()
+    .min(1)
+    .optional()
+    .describe("既存 worktree のセレクタ。指定時はその worktree のターミナルへ dispatch"),
+  terminal: z
+    .string()
+    .min(1)
+    .optional()
+    .describe("既存ターミナルの handle。指定時はここが最優先(dispatch 先を明示するときに使う)"),
+  repo: z.string().min(1).optional().describe("新規 worktree を作る対象リポジトリのセレクタ"),
+  run: z
+    .string()
+    .min(1)
+    .optional()
+    .describe("対象の orchestration Run ID(省略時は新規 Run を作成する)"),
+  deps: z.array(z.string().min(1)).optional().describe("依存するタスク ID の配列"),
+  parent: z.string().min(1).optional().describe("親タスク ID"),
+  prompt: z
+    .string()
+    .min(1)
+    .optional()
+    .describe("新規エージェントへ渡す初回プロンプト(省略時は spec をそのまま使う)"),
+});
+export type DelegateTaskInputSchema = z.infer<typeof delegateTaskInputSchema>;
+
+export const getTaskStatusInputSchema = z.object({
+  taskId: z.string().min(1).describe("orca_delegate_task が返したタスク ID"),
+  run: z
+    .string()
+    .min(1)
+    .optional()
+    .describe("対象の orchestration Run ID(指定していれば検索が速く確実になる)"),
+});
+export type GetTaskStatusInput = z.infer<typeof getTaskStatusInputSchema>;
+
+export const getTaskResultInputSchema = z.object({
+  taskId: z.string().min(1).describe("対象のタスク ID"),
+  run: z.string().min(1).optional().describe("対象の orchestration Run ID"),
+  outputLimit: z
+    .number()
+    .int()
+    .min(1)
+    .max(200)
+    .optional()
+    .describe("worker 1 件あたりで読む出力行数の上限(既定 40)"),
+});
+export type GetTaskResultInput = z.infer<typeof getTaskResultInputSchema>;
+
 export const delegateInputSchema = z.object({
   spec: z.string().min(1).describe("ワーカーに渡すタスク仕様(指示文)"),
   title: z.string().min(1).optional().describe("タスクの表示タイトル"),
@@ -71,27 +128,6 @@ export const delegateInputSchema = z.object({
   inject: z.boolean().default(false).describe("ターミナルへタスクを直接注入するかどうか"),
 });
 export type DelegateInput = z.infer<typeof delegateInputSchema>;
-
-export const getTaskStatusInputSchema = z.object({
-  id: z
-    .string()
-    .min(1)
-    .optional()
-    .describe("この ID のタスク 1 件に絞る(渡すと dispatch 状況も併せて返す)"),
-  status: z
-    .string()
-    .min(1)
-    .optional()
-    .describe("ステータスで絞り込む(例: pending / ready / in_progress / done / blocked)"),
-  ready: z.boolean().optional().describe("依存が解けて着手可能なタスクだけに絞る"),
-  brief: z.boolean().default(true).describe("簡潔な一覧形式で受け取るかどうか"),
-  run: z
-    .string()
-    .optional()
-    .describe("対象の orchestration Run ID(未バインドだと CLI が run_required を返す)"),
-  from: z.string().optional().describe("送信元ターミナルのハンドル"),
-});
-export type GetTaskStatusInput = z.infer<typeof getTaskStatusInputSchema>;
 
 export const messageInputSchema = z.discriminatedUnion("action", [
   z.object({
