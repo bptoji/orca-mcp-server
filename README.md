@@ -41,22 +41,22 @@ macOS / Linux では `"args": ["/home/<your-user>/<repo-dir>/orca-mcp/dist/index
 
 公開 API は **非同期 Job API(submit / poll / result)** を主軸にします。
 **1 回の MCP 呼び出しでワーカーの完了を待ちません**(30 分ブロックのような設計にしない)。
-低レベルすぎる API(`orca_create_worktree` / `orca_start_agent` / `orca_send_terminal` 之类)は
+低レベルすぎる API(`orca_create_worktree` / `orca_start_agent` / `orca_send_terminal` など)は
 外部に出さず、内部実装に隠しています。
 
 ### Job API
 
 | ツール | 役割 | 内部で呼ぶもの | 待つ? |
 | --- | --- | --- | --- |
-| `orca_delegate_task` | **submit** | run-create(未指定時) → task-create → worktree create --agent → dispatch | 待たない |
+| `orca_delegate_task` | **submit** | run-create(未指定時) → task-create(通常は Commander 用) → supervised worker-start | 待たない |
 | `orca_get_task_status` | **poll** | task-list / dispatch-show / worker-list / gate-list | 待たない |
 | `orca_get_task_result` | **result** | task-list / dispatch-show / worker-read | 待たない |
 
 ```
 orca_delegate_task({ spec: "README を更新して" })
   → { "taskId": "task_abc123", "state": "running", "runId": "run_…",
-      "target": { "kind": "new_worktree", "worktree": "…", "terminal": "term_…", "agent": "codex" },
-      "dispatchId": "disp_1", "warnings": [] }
+      "target": { "kind": "supervised_worker", "worktree": "new-child", "terminal": null, "agent": "codex" },
+      "commander": true, "dispatchId": "disp_1", "warnings": [] }
 
 orca_get_task_status({ taskId: "task_abc123" })
   → { "taskId": "task_abc123", "state": "running", "phase": "implementation",
@@ -72,8 +72,26 @@ orca_get_task_result({ taskId: "task_abc123" })
 
 - `state`: `queued / running / blocked / completed / failed / cancelled`(CLI 生の値は `rawStatus`)
 - `phase`: `queued / starting / implementation / decision_gate / settling / finished`
-- dispatch だけ失敗しても **タスクは生き続ける** → `state: "queued"` + `warnings` で返す
+- worker-start（または明示的な互換 dispatch）だけ失敗しても **タスクは生き続ける** → `state: "queued"` + `warnings` で返す
 - CLI 側の失敗はコードごと転送する(例: `run_not_found` + `data.orchestrationRequestId`)
+
+#### Job API における委譲の仕組み
+
+`orca_delegate_task` は、外部Agentから受け取ったゴールを Orca 内の Commander Agent に渡す非同期 API です。Commander Agent がゴールを解釈してタスクを分解し、必要に応じて複数の supervised Worker（サブエージェント）へ差配します。
+
+```text
+外部Agent
+  → orca_delegate_task
+  → Commander Agent
+      → タスク分解・Worker選択・並列実行・レビュー
+      → supervised Worker（Codex / Claude など）
+```
+
+通常の利用では `terminal` や `worktree` を指定せず、ゴールと必要な制約だけを渡してください。個々のWorkerを直接選択・起動することは、通常このAPIの利用者側では行いません。
+
+内部では `run-create`（run 未指定時）→ `task-create`（Commander 用の指示を付与）→ `worker-start --worktree new-child --agent <agent>` の順で Commander を起動します。完了を待たずに返された `taskId` を使って `orca_get_task_status` で進捗を確認し、完了後に `orca_get_task_result` で結果を取得してください。
+
+`worker-start` が失敗した場合もタスクは保持され、`state: "queued"` と `warnings` が返ります。`orca_delegate_task` で既存の `terminal` または `worktree` を明示した場合は、Commander を起動せず、指定された terminal / worktree に対してタスクを直接 `dispatch` します。
 
 ### 介入(intervene)
 
@@ -114,8 +132,8 @@ orca_cancel_task({ taskId: "task_abc123", reason: "方針変更" })
 | `orca_get_worktree` | 1 件のワークツリー詳細 | `orca worktree show --json` |
 | `orca_list_agents` | worktree 横断のエージェント一覧 | `orca worktree ps --json` |
 
-未登録(足場のみ): `orca_delegate`(低レベルすぎる委譲) / `orca_message`(check / reply / inbox 込みの send)。
-送信は `orca_send_message` として公開しているので、そちらを使ってください。
+`orca_delegate` と `orca_message` は内部実装として保持しており、MCP ツールとしては公開していません。
+送信は `orca_send_message` を使ってください。
 
 ### 挙動の約束
 
@@ -170,8 +188,8 @@ orca-mcp/
 │     ├─ status.ts      # orca_status
 │     ├─ worktrees.ts   # orca_list_worktrees / orca_get_worktree
 │     ├─ agents.ts      # orca_list_agents(worktree ps の平坦化)
-│     ├─ delegate.ts    # orca_delegate(未登録の足場)
-│     └─ message.ts     # orca_message(未登録の足場)
+│     ├─ delegate.ts    # orca_delegate(内部実装)
+│     └─ message.ts     # orca_message(内部実装)
 ├─ tests/               # orca ランタイム不要の単体テスト(job.test.ts は偽 client)
 ├─ AGENTS.md            # エージェント向け開発規約
 ├─ README.md

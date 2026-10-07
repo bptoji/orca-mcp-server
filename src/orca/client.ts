@@ -91,6 +91,17 @@ export interface DispatchInput {
   inject?: boolean;
 }
 
+export interface WorkerStartInput {
+  task: string;
+  agent: string;
+  worktree: "current" | "new-child" | "new-top-level";
+  name?: string;
+  repo?: string;
+  setup?: "run" | "skip" | "inherit";
+  run?: string;
+  from?: string;
+}
+
 export interface DispatchShowInput {
   preamble?: boolean;
   from?: string;
@@ -339,6 +350,26 @@ export class OrcaClient {
     if (input.from !== undefined) args.push("--from", input.from);
     if (input.run !== undefined) args.push("--run", input.run);
     if (input.inject === true) args.push("--inject");
+    return this.call(args);
+  }
+
+  /** `orca orchestration worker-start` — supervised worker を起動する。 */
+  workerStart(input: WorkerStartInput): Promise<JsonObject> {
+    const args = [
+      "orchestration",
+      "worker-start",
+      "--task",
+      input.task,
+      "--worktree",
+      input.worktree,
+      "--agent",
+      input.agent,
+    ];
+    if (input.name !== undefined) args.push("--name", input.name);
+    if (input.repo !== undefined) args.push("--repo", input.repo);
+    if (input.setup !== undefined) args.push("--setup", input.setup);
+    if (input.run !== undefined) args.push("--run", input.run);
+    if (input.from !== undefined) args.push("--from", input.from);
     return this.call(args);
   }
 

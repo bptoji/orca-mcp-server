@@ -364,6 +364,33 @@ export interface DelegateTaskInput {
   prompt?: string;
 }
 
+export const COMMANDER_PROMPT = `You are the lead coding orchestrator for this task.
+
+Goal:
+{{goal}}
+
+Repository:
+{{repo}}
+
+Constraints:
+{{constraints}}
+
+Responsibilities:
+1. Inspect the repository and break the goal into well-scoped subtasks.
+2. Delegate independent work to supervised workers, preferably in parallel.
+3. Review worker outputs and diffs, request corrections, and run applicable tests.
+4. Do not merge, push, deploy, delete branches, or modify production resources without an explicit approval gate.
+5. Report completed work, tests, changed files, and unresolved risks.
+
+Use the Orca orchestration CLI and orchestration skill for coordination.`;
+
+function commanderSpec(input: DelegateTaskInput): string {
+  return COMMANDER_PROMPT
+    .replace("{{goal}}", input.spec)
+    .replace("{{repo}}", input.repo ?? "the current repository")
+    .replace("{{constraints}}", input.prompt ?? "Preserve existing APIs and project conventions.");
+}
+
 export interface TaskStatusInput {
   taskId: string;
   run?: string;
@@ -403,7 +430,7 @@ export async function delegateTask(
   // 2) task-create(ここが成功すれば Job は成立する)
   const task = await runMutation(client, runId, () =>
     client.taskCreate({
-      spec: input.spec,
+      spec: input.terminal === undefined && input.worktree === undefined ? commanderSpec(input) : input.spec,
       title: input.title,
       deps: input.deps,
       parent: input.parent,
@@ -416,6 +443,34 @@ export async function delegateTask(
   }
 
   // 3) dispatch 先を決める(terminal > worktree > 新規 worktree + agent)
+  if (input.terminal === undefined && input.worktree === undefined && typeof client.workerStart === "function") {
+    try {
+      const started = await runMutation(client, runId, () =>
+        client.workerStart({
+          task: taskId,
+          worktree: "new-child",
+          agent: input.agent ?? "codex",
+          name: input.title,
+          repo: input.repo,
+          run: runId,
+        }),
+      );
+      const startedResult = unwrapResult(started);
+      return {
+        taskId,
+        state: "running",
+        runId,
+        target: { kind: "supervised_worker", worktree: "new-child", terminal: null, agent: input.agent ?? "codex" },
+        dispatchId: pickIdDeep(startedResult, DISPATCH_ID_KEYS) ?? null,
+        commander: true,
+        warnings,
+      };
+    } catch (error) {
+      warnings.push(`worker-start failed: ${error instanceof Error ? error.message : String(error)}`);
+      return { taskId, state: "queued", runId, commander: true, dispatchId: null, warnings };
+    }
+  }
+
   let handle: string | undefined = input.terminal;
   let kind: "terminal" | "worktree" | "new_worktree" = "terminal";
   let worktreeSelector: string | undefined = input.worktree;
