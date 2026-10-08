@@ -418,6 +418,7 @@ poll を打ち切る前に数回待ってください。**launcher 運用では�
 | `state: "queued"` から進まない | worker-start 失敗(dispatch が無く Commander 未起動) | `nextAction` の指示どおり delegate し直すか cancel する |
 | `state: "failed"` / `stage: "agent_readiness"` | pane に生きたプロセスが見えていない(dsh) | `agentCmdOverrides.dsh` を launcher に向ける。`workerReportPending: true` なら報告を待つ |
 | `lastError=Agent startup blocked: agent-trust-workspace` | copilot の **folder trust** 促しで起動が止まっている | `agentCmdOverrides.copilot = node` + launcher(`COPILOT_ALLOW_ALL=true` を焼く)。`--add-dir` / `--allow-all-paths` では消えない |
+| `nested_worker_depth_exceeded`(子 worker が起動しない) | Orca の **Nested worker depth** が既定 1。MCP が起動する Commander は既に depth 1 なので、その子は depth 2 で拒否される | Orca の Settings → Orchestration → "Nested worker depth" を 2 にする(既定 1 / 1 以上の整数)。`depth 2, max 1` がそのまま応答に出る |
 | `running` のまま progress が止まる | エージェントの**ツール承認プロンプト**で worker が停止 | `attentionNotes` をたどって pane を確認。codex は `--approve-for-me`、claude は `agentDefaultArgs.claude` の `--permission-mode acceptEdits --allowedTools Bash …` |
 | claude の worker が `dispatched` のまま動かない、pane に `Not logged in` | claude の auth 切れ(権限設定ではない) | Orca 側のアカウント紐づけ / pane で `/login` |
 | `blocked` / `phase: "decision_gate"` | 承認ゲート待ち | `orca_resolve_gate({ gateId, resolution, run })` で進める |
@@ -501,6 +502,15 @@ worker 単体の完走は claude でも確認済みです(2026-10-08、上の `a
 `worker-start ready` → 承認停止ゼロ → `poll#13 completed`)。
 `--agent copilot` の完走も確認済みです(2026-10-08、上の launcher 設定で
 `readiness ready=true` → `delegate running` → `poll#2 completed` → cancel `fullyStopped: true`)。
+**分解(decomposition)の実測**もしています(2026-10-08、`Nested worker depth = 2` で `--agent copilot`)。
+
+```
+delegate running → poll#4 children=4 → poll#7 completed
+子タスク 3 件が copilot worker で state=succeeded / outcome=succeeded(並列)
+result children=4 / filesModified ["README.md"]
+```
+
+depth が 1 のままだと子 worker の起動は `nested_worker_depth_exceeded` で止まります(下の引き出し参照)。
 
 ### 開発上の決まり(抜粋)
 

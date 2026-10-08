@@ -182,6 +182,17 @@ docs/
   `--allow-all-tools`(非対話モードでは必須)/ `--allow-all-paths` / `--allow-all-urls` /
   `--allow-all` = `--yolo`(全面)。設定キーは `defaultPermissionMode`(`manual` / `assisted` / `allow-all`)で、
   `--mode interactive|plan|autopilot`。`banner` は `once` / `always` / `never`。
+- **子 worker の深さは Orca 側の設定**(2026-10-08 実測)。既定は `settings.nestedWorkerMaxDepth = 1`
+  (`NESTED_WORKER_MAX_DEPTH_DEFAULT`。root coordinator が depth 0、第一世代 worker が depth 1)。
+  **MCP が起動する Commander は `worker-start` 経路なので既に depth 1** — その子 worker は depth 2 で
+  `nested_worker_depth_exceeded`(応答に `depth 2, max 1` と出る)になり、`new-child` / `new-top-level` /
+  `current` のいずれでも起動できない。UI は Settings → Orchestration → "Nested worker depth"(1 以上の整数、
+  不正値は 1 にクランプ)。`2` に上げると実測で通った: 分解 goal で `poll#4 children=4` → `poll#7 completed`、
+  子タスク 3 件が copilot worker で `succeeded`(並列)、`result children=4` / `filesModified ["README.md"]`。
+  1 のままだと Commander は正しく blocked 報告する(`provenance: worker_report` /
+  `subject: "Blocked: nested_worker_depth_exceeded"`)ので、E2E の分解 goal は depth 2 で回すこと。
+  設定の live 値は `profile-state.db`(sqlite)側にある — `orca-data.json` は export で遅れるため、
+  反映確認は DB をコピーして読む(アプリ起動中は本体ファイルが読めない)。
 - **`repo` は repo セレクタ**(E2E 実機確認): `id:<repoId>` / `path:<repo home>` は解決できるが、
   worktree の displayName(`name:weever`)や worktree path は `repo_not_found`。repoId は
   `orca worktree current --json` の `result.worktree.repoId`。
