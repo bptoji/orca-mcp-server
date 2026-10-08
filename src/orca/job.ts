@@ -683,8 +683,9 @@ export async function getTaskStatus(client: OrcaClient, input: TaskStatusInput):
 
   // dispatch id は dispatch-show と task 行(dispatch_id)の両方から拾う
   const dispatchesPayload = await client.dispatchShow(input.taskId);
+  const dispatchRows = extractDispatches(dispatchesPayload);
   const dispatchIds = new Set(
-    extractDispatches(dispatchesPayload)
+    dispatchRows
       .map((dispatch) => pickString(dispatch, DISPATCH_ID_KEYS))
       .filter((value): value is string => value !== undefined),
   );
@@ -729,6 +730,18 @@ export async function getTaskStatus(client: OrcaClient, input: TaskStatusInput):
       : null;
 
   const phase = estimatePhase(state, [...workers, ...childWorkers], gates);
+
+  // dsh 型の worker は launch token が記録されず dispatch が agent_readiness で死ぬが、
+  // pane は注入された goal を完走し `task-update` で報告する(E2E 実測: failed → completed)。
+  // state は偽装せず、「報告が後から届く可能性がある」だけを正直に載せる。
+  const tokenlessFailedDispatch = dispatchRows.some(
+    (dispatch) =>
+      (pickString(dispatch, ["status", "state"]) ?? "") === "failed" &&
+      pickString(dispatch, ["launch_token_hash", "launchTokenHash"]) === undefined,
+  );
+  const liveWorker = workers.some((row) => row["liveness"] === "alive" || row["status"] === "running");
+  const workerReportPending = state === "failed" && tokenlessFailedDispatch && liveWorker;
+
   return {
     taskId: input.taskId,
     state,
@@ -746,6 +759,7 @@ export async function getTaskStatus(client: OrcaClient, input: TaskStatusInput):
     children,
     gates,
     dispatchIds: [...dispatchIds],
+    workerReportPending,
     // worker が「要 attention」なら、ゲート以外の人間側停止(エージェントの承認プロンプトなど)の
     // 可能性がある。E2E で `orca skills get …` の承認待ち Commander が running のまま止まった。
     attentionRequired: workers.some((row) => row["requiresAttention"] === true),
@@ -758,6 +772,12 @@ export async function getTaskStatus(client: OrcaClient, input: TaskStatusInput):
     createdAt: task["created_at"] ?? task["createdAt"] ?? null,
     completedAt: task["completed_at"] ?? task["completedAt"] ?? null,
     nextAction: nextActionHint(state, phase, workers.length + childWorkers.length + dispatchIds.size),
+    ...(workerReportPending
+      ? {
+          workerReportNote:
+            "dispatch は launch token 無しで失敗していますが worker terminal は生存中です。worker は task-update で報告するため、この failed は一時的で completed が後から届くことがあります(実測)。poll を打ち切る前に数回待ってください",
+        }
+      : {}),
   };
 }
 

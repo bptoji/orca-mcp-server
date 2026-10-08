@@ -671,6 +671,122 @@ describe("getTaskStatus(poll) — worker の attention", () => {
   });
 });
 
+describe("getTaskStatus(poll) — dsh 型 worker の task-update 報告待ち", () => {
+  // 実測(2026-10-08): dsh worker は launch token が記録されず dispatch が agent_readiness で失敗、
+  // task は即 failed になる。pane は goal を完走し task-update で報告するので completed が後から届く。
+  const dshTaskList = {
+    ok: true,
+    result: {
+      tasks: [
+        {
+          id: "task_dsh",
+          run_id: "run_dsh",
+          status: "failed",
+          spec: "DSH-PROBE.md を作る",
+          dispatch_id: "ctx_dsh",
+        },
+      ],
+      count: 1,
+    },
+  };
+  const tokenlessDispatch = {
+    ok: true,
+    result: {
+      dispatch: {
+        id: "ctx_dsh",
+        task_id: "task_dsh",
+        status: "failed",
+        last_failure: "timeout",
+        launch_token_hash: null,
+      },
+    },
+  };
+  const aliveWorkerList = {
+    ok: true,
+    result: {
+      workers: [
+        {
+          dispatchId: "ctx_dsh",
+          taskId: "task_dsh",
+          workerState: "ready",
+          agentTerminalHandle: "term_dsh",
+          terminalState: "active",
+          projection: {
+            outcome: "in_progress",
+            stage: { activity: "working" },
+            liveness: { verdict: "alive" },
+            attention: { requiresAction: false, categories: [] },
+          },
+        },
+      ],
+      counts: { active: 1 },
+    },
+  };
+
+  it("launch token 無しで失敗した dispatch + 生存 worker なら workerReportPending: true", async () => {
+    const { client } = createFakeClient({
+      taskList: dshTaskList,
+      dispatchShow: tokenlessDispatch,
+      workerList: aliveWorkerList,
+    });
+    const view = await getTaskStatus(client, { taskId: "task_dsh" });
+    expect(view["state"]).toBe("failed");
+    expect(view["workerReportPending"]).toBe(true);
+    expect(String(view["workerReportNote"])).toContain("task-update");
+  });
+
+  it("worker が生存でなければ workerReportPending: false(note も出さない)", async () => {
+    const { client } = createFakeClient({
+      taskList: dshTaskList,
+      dispatchShow: tokenlessDispatch,
+      workerList: {
+        ok: true,
+        result: {
+          workers: [
+            {
+              dispatchId: "ctx_dsh",
+              taskId: "task_dsh",
+              workerState: "released",
+              terminalState: "closed",
+              projection: {
+                outcome: "failed",
+                stage: { activity: "unknown" },
+                liveness: { verdict: "exited" },
+                attention: { requiresAction: false, categories: [] },
+              },
+            },
+          ],
+          counts: { active: 0 },
+        },
+      },
+    });
+    const view = await getTaskStatus(client, { taskId: "task_dsh" });
+    expect(view["workerReportPending"]).toBe(false);
+    expect(view["workerReportNote"]).toBeUndefined();
+  });
+
+  it("launch token が入った dispatch(codex / claude)なら workerReportPending: false", async () => {
+    const { client } = createFakeClient({
+      taskList: dshTaskList,
+      dispatchShow: {
+        ok: true,
+        result: {
+          dispatch: {
+            id: "ctx_dsh",
+            task_id: "task_dsh",
+            status: "failed",
+            last_failure: "timeout",
+            launch_token_hash: "10e0bf264833065684f1c1c05aba7591936661e63c956e4b3a02ecc73d00aa2d",
+          },
+        },
+      },
+      workerList: aliveWorkerList,
+    });
+    const view = await getTaskStatus(client, { taskId: "task_dsh" });
+    expect(view["workerReportPending"]).toBe(false);
+  });
+});
+
 describe("getTaskStatus(poll) — Commander の配下", () => {
   // Commander(task_cmd)が task-create で分解した子タスクと、その worker の fixture
   const commanderTaskList = {

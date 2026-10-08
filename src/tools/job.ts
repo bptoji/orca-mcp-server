@@ -50,7 +50,7 @@ export function registerJobTools(server: McpServer, client: OrcaClient): void {
     {
       title: "Orca Get Task Status",
       description:
-        "委譲したタスクの現在状態を正規化して返す(非同期 poll)。内部で task-list / dispatch-show / worker-list / gate-list を読むだけで、何も変更しない。state は queued / running / blocked / completed / failed / cancelled、phase は queued / starting / implementation / decision_gate / settling / finished。commander は Commander 自身の worker、children は Commander が task-create で分解した**直接の子タスク**(direct children、`parent_id` が対象タスクと一致するもの)とその worker(state 付き)なので、1 回の poll で配下の進捗が見える。孫以降(deep DAG)は children に現れない(子タスク自身の poll で見る)。gates が pending のときは orca_resolve_gate で承認/却下できる。生の status は rawStatus に残す。",
+        "委譲したタスクの現在状態を正規化して返す(非同期 poll)。内部で task-list / dispatch-show / worker-list / gate-list を読むだけで、何も変更しない。state は queued / running / blocked / completed / failed / cancelled、phase は queued / starting / implementation / decision_gate / settling / finished。commander は Commander 自身の worker、children は Commander が task-create で分解した**直接の子タスク**(direct children、`parent_id` が対象タスクと一致するもの)とその worker(state 付き)なので、1 回の poll で配下の進捗が見える。孫以降(deep DAG)は children に現れない(子タスク自身の poll で見る)。gates が pending のときは orca_resolve_gate で承認/却下できる。生の status は rawStatus に残す。launch token 無しで失敗した dispatch(dsh 型)で worker terminal が生存中の場合は workerReportPending: true と workerReportNote を添える — その failed は一時的で、worker の task-update 報告により completed が後から届く(実測)。state は偽装しない。",
       inputSchema: getTaskStatusInputSchema,
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
