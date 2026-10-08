@@ -38,7 +38,7 @@ MCP クライアント(Claude Code / Claude Desktop / dsh など)から使えま
 5. [つまったときの引き出し](#つまったときの引き出し)
 6. [開発](#開発)
 
-**dsh を使いたい人**は [dsh を worker に使う](#dsh-を-worker-に使う) を先に読んでください(設定が 1 行必要です)。
+**dsh を使いたい人**は [dsh を Commander / Worker に使う](#dsh-を-commander--worker-に使う) を先に読んでください(設定が 1 行必要です)。
 
 ---
 
@@ -111,7 +111,7 @@ providers 列挙にそのエージェント名は出ない)。`orca_delegate_tas
 | --- | --- |
 | **codex を Commander / Worker に(既定)** | `agentDefaultArgs.codex = --approve-for-me` を推奨。これがないと Codex 側の**承認プロンプト**でジョブが止まります |
 | **claude を Commander / Worker に** | `agentDefaultArgs.claude = --permission-mode acceptEdits --allowedTools Bash Read Edit Write Glob Grep`。設定なしだと `orca skills get …` などの**ツール承認プロンプト**でジョブが止まります |
-| **dsh を Worker に** | `agentCmdOverrides.dsh = node "C:\<repo-dir>\orca-mcp\scripts\dsh-tui-launcher.mjs"` |
+| **dsh を Commander / Worker に** | `agentCmdOverrides.dsh = node "C:\<repo-dir>\orca-mcp\scripts\dsh-tui-launcher.mjs"` — launcher を挟まないと readiness を通過できません |
 | **dsh を ACP 機能付きで**(任意) | `agentCmdOverrides.dsh = node "C:\<repo-dir>\orca-mcp\scripts\dsh-acp-worker.mjs"` — 下の [ACP ブリッジ](#dsh-を-acp-で動かす任意のブリッジ) |
 | **対話で dsh-tui を使う** | 設定不要。`dst .`(エイリアス)で起動すれば `agentCmdOverrides` を通しません |
 
@@ -210,7 +210,7 @@ repoId は `orca worktree current --json` の `result.worktree.repoId` で取れ
 
 **`commanderAgent` の条件** — 注入されたプロンプトを**非対話で消費できる**エージェントである必要があります。
 `claude` / `codex` は supervised worker として動作します(承認設定は上の節)。`dsh` は下の
-[dsh の節](#dsh-を-worker-に使う)の設定が必要です。
+[dsh の節](#dsh-を-commander--worker-に使う)の設定が必要です。
 
 **worker-start が失敗してもタスクは消えません** — `state: "queued"` + `warnings` で返ります。
 `queued` は放置しても進みません(dispatch が無い = Commander 未起動)。`nextAction` が
@@ -299,7 +299,7 @@ orca_cancel_task({ taskId: "task_abc123", reason: "方針変更" })   // cascade
 
 ---
 
-## dsh を worker に使う
+## dsh を Commander / Worker に使う
 
 `dsh` を `worker-start --agent dsh` で起動すると dsh-tui(対話)が立ち上がり、**dispatch が
 `agent_readiness` で失敗して task が `failed` に落ちます**。dsh-tui は注入を受け取れますが、**pane の起動コマンドに dsh-tui を直接指定すると readiness のゲートを通過できません**(実測)。
@@ -322,10 +322,17 @@ result = {"provenance":"worker_report","outcome":"succeeded", …}
 注入はそのまま dsh-tui のプロンプト欄に入り、中のエージェントがワークを完走して `worker_done` で
 報告します。**この運用に ACP ブリッジは不要です。**
 
+**Commander(`commanderAgent: "dsh"`)としても完走します**(E2E 実測)。
+
+```
+readiness ready=true → delegate running → poll#7 children=1 → poll#9 completed
+result children=1 → cancel cancelled=true fullyStopped=true
+```
+
 | 目的 | 設定 |
 | --- | --- |
 | 対話で dsh-tui を使う | 設定不要。`dst .`(エイリアス)で起動する — `agentCmdOverrides` を通しません |
-| Worker として使う(既定) | `node …\scripts\dsh-tui-launcher.mjs` |
+| Commander / Worker として使う(既定) | `node …\scripts\dsh-tui-launcher.mjs` |
 | ACP 機能が要るとき | `node …\scripts\dsh-acp-worker.mjs`(下の節) |
 
 launcher の仕事は 4 つだけです: dsh-tui の Node エントリを解決する(`npm root -g` → PATH)、

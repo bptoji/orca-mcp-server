@@ -80,7 +80,10 @@ docs/
   読み、記憶した CLI 構文を使わない」という Orca 公式の推奨を固定で焼く。
 - 作業ワーカーの選択は Commander 側。MCP 側の語彙は `commanderAgent`(= どの Commander を起動するか)。
 - **`commanderAgent` は Orca 側で設定されたエージェント名のみ**(`worker-start --agent` の制約)。
-  実機で `dsh` は dsh-tui(対話)が起動して dispatch `failed`、`"dsh headless"` は `agent_unconfigured`。
+  実機で `"dsh headless"` は `agent_unconfigured`。launcher 登録前の `dsh`(dsh-tui 直接起動)は
+  dispatch `failed`。launcher 登録後は **worker でも Commander でも完走する**(2026-10-08 E2E 実測:
+  `readiness ready=true` → `delegate running` → `poll#7 children=1` → `poll#9 completed` →
+  `result children=1` → `cancel fullyStopped: true`)。
   非対話の Commander が欲しいなら Orca のエージェント設定(`agentCmdOverrides`、CLI からの設定コマンドは無い)に
   起動コマンドを登録してもらう — MCP 側でエージェント引数を組み込むフラグは無い。
   dsh の既定登録コマンドは `dsh-tui .`(pane 実測)。worker にするには launcher を向ける:
