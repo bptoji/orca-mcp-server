@@ -111,13 +111,16 @@ providers 列挙にそのエージェント名は出ない)。`orca_delegate_tas
 | --- | --- |
 | **codex を Commander / Worker に(既定)** | `agentDefaultArgs.codex = --approve-for-me` を推奨。これがないと Codex 側の**承認プロンプト**でジョブが止まります |
 | **claude を Commander / Worker に** | `agentDefaultArgs.claude = --permission-mode acceptEdits --allowedTools Bash Read Edit Write Glob Grep`。設定なしだと `orca skills get …` などの**ツール承認プロンプト**でジョブが止まります |
+| **copilot を Commander / Worker に** | `agentCmdOverrides.copilot = node` + `agentDefaultArgs.copilot = "C:\<repo-dir>\orca-mcp\scripts\copilot-launcher.mjs" --allow-all-tools`。launcher を挟むと folder trust の確認を求められずに起動します。挟まないと `agent_readiness` で `agent-trust-workspace` に落ちます |
 | **dsh を Commander / Worker に** | `agentCmdOverrides.dsh = node "C:\<repo-dir>\orca-mcp\scripts\dsh-tui-launcher.mjs"` — launcher を挟まないと readiness を通過できません |
 | **dsh を ACP 機能付きで**(任意) | `agentCmdOverrides.dsh = node "C:\<repo-dir>\orca-mcp\scripts\dsh-acp-worker.mjs"` — 下の [ACP ブリッジ](#dsh-を-acp-で動かす任意のブリッジ) |
 | **対話で dsh-tui を使う** | 設定不要。`dst .`(エイリアス)で起動すれば `agentCmdOverrides` を通しません |
 
 - `"dsh headless"` のような追加引数は `agent_unconfigured` で拒否されます。
 - 承認プロンプトは **MCP 側から解除できません**。`orca terminal send` はエージェントの承認プロンプトへの
-  入力を `agent_prompt_blocked` で拒否します(人間が UI で答える設計)。上の設定で事前に潰してください。
+  入力を `agent_prompt_blocked` で拒否します(人間が UI で答える設計)。上の設定で承認を許可してから使ってください。
+- copilot の **folder trust**(`Confirm folder trust`)は、環境変数 `COPILOT_ALLOW_ALL=true` でのみ解除されます。
+  この変数は launcher が設定します(`agentDefaultEnv` を UI から設定する経路が見つかっていないため)。
   設定の根拠・実測の経緯は [AGENTS.md](./AGENTS.md) にまとめてあります。
 
 ---
@@ -322,7 +325,7 @@ result = {"provenance":"worker_report","outcome":"succeeded", …}
 注入はそのまま dsh-tui のプロンプト欄に入り、中のエージェントがワークを完走して `worker_done` で
 報告します。**この運用に ACP ブリッジは不要です。**
 
-**Commander(`commanderAgent: "dsh"`)としても完走します**(E2E 実測)。
+**Commander(`commanderAgent: "dsh"`)としても完走します。**
 
 ```
 readiness ready=true → delegate running → poll#7 children=1 → poll#9 completed
@@ -341,7 +344,7 @@ launcher の仕事は 4 つだけです: dsh-tui の Node エントリを解決�
 
 > **未解明点(正直に書いておきます)**: pane の起動コマンドが **dsh-tui 自身だと readiness を通過できず**、
 > **node 経由の launcher を挟むと通過する**、という差は再現できていますが**機構は解明していません**。
-> 観測された結果上の差は「dispatch に launch token が記録され `stage: input_accepted` に到達するか」です。
+> 観測されている差は「dispatch に launch token が記録され `stage: input_accepted` に到達するか」です。
 > 原因が判明したらこの節を更新してください。
 
 ### 報告の決まり(worker 側)
@@ -398,7 +401,7 @@ poll を打ち切る前に数回待ってください。**launcher 運用では�
   対話で dsh-tui を使いたい人の正解は `dst .` です。
 - `session/request_permission` への応答は形(shape)が命です: `{ "outcome": { "outcome": "selected", "optionId": "allow-once" } }`。
   `{ "outcome": { "selected": "allow-once" } }` にすると**拒否扱いで tool が `failed` になります**。
-- **ローカル LLM(key 不要)へルーティング**するには `.dsh/profiles/acp/cordis.patch.yml` にゲートウェイを焼きます。
+- **ローカル LLM(key 不要)へルーティング**するには `.dsh/profiles/acp/cordis.patch.yml` にゲートウェイを指定します。
   テンプレは `docs/templates/acp-cordis.patch.example.yml`(key 不要で通す決め手が `headers.Authorization`)。
   プロファイル patch は**起動時のみ**反映されるので、変更後はプロセスを再起動してください。
 - 1 タスク 1 プロセスで完結させたい旧経路(`scripts/dsh-headless-worker.mjs`)は、注入を stdin で拾って
@@ -414,6 +417,8 @@ poll を打ち切る前に数回待ってください。**launcher 運用では�
 | --- | --- | --- |
 | `state: "queued"` から進まない | worker-start 失敗(dispatch が無く Commander 未起動) | `nextAction` の指示どおり delegate し直すか cancel する |
 | `state: "failed"` / `stage: "agent_readiness"` | pane に生きたプロセスが見えていない(dsh) | `agentCmdOverrides.dsh` を launcher に向ける。`workerReportPending: true` なら報告を待つ |
+| `lastError=Agent startup blocked: agent-trust-workspace` | copilot が **folder trust** の確認を求めて起動が止まっている | `agentCmdOverrides.copilot = node` + launcher(launcher が `COPILOT_ALLOW_ALL=true` を設定して起動する)。`--add-dir` / `--allow-all-paths` では消えない |
+| `nested_worker_depth_exceeded`(子 worker が起動しない) | Orca の **Nested worker depth** が既定 1。MCP が起動する Commander は既に depth 1 なので、その子は depth 2 で拒否される | Orca の Settings → Orchestration → "Nested worker depth" を 2 にする(既定 1 / 1 以上の整数)。`depth 2, max 1` がそのまま応答に出る |
 | `running` のまま progress が止まる | エージェントの**ツール承認プロンプト**で worker が停止 | `attentionNotes` をたどって pane を確認。codex は `--approve-for-me`、claude は `agentDefaultArgs.claude` の `--permission-mode acceptEdits --allowedTools Bash …` |
 | claude の worker が `dispatched` のまま動かない、pane に `Not logged in` | claude の auth 切れ(権限設定ではない) | Orca 側のアカウント紐づけ / pane で `/login` |
 | `blocked` / `phase: "decision_gate"` | 承認ゲート待ち | `orca_resolve_gate({ gateId, resolution, run })` で進める |
@@ -464,6 +469,7 @@ orca-mcp/
 ├─ scripts/
 │  ├─ e2e.mjs                 # 実ランタイム E2E(readiness → delegate → poll → gate → result → cancel)
 │  ├─ dsh-tui-launcher.mjs    # dsh worker の既定: dsh-tui を起動して待つだけの最小 launcher
+│  ├─ copilot-launcher.mjs    # copilot worker 用: COPILOT_ALLOW_ALL=true を設定して copilot を起動する最小 launcher
 │  ├─ dsh-acp-worker.mjs      # Orca 注入 → ACP session/prompt に載せ直すブリッジ
 │  └─ dsh-headless-worker.mjs # 注入 → dsh --profile headless の argv に載せ直すブリッジ(旧経路)
 ├─ docs/templates/acp-cordis.patch.example.yml   # ACP 用ローカル LLM ルーティングのテンプレ
@@ -472,29 +478,6 @@ orca-mcp/
 ├─ package.json
 └─ tsconfig.json        # 開発用(noEmit) / tsconfig.build.json: ビルド用
 ```
-
-### E2E(実ランタイム検証)
-
-`npm test` は orca ランタイムを起動しません。実環境通しの検証は `scripts/e2e.mjs` が MCP サーバーを stdio で
-起動して `readiness → delegate → poll → gate → result → cancel` を通します(実エージェントが動くので 10〜30 分)。
-
-```powershell
-npm run build
-node scripts/e2e.mjs --minutes 30            # repo は `orca worktree current` の repoId から自動選択
-node scripts/e2e.mjs --repo id:<repoId> --agent claude --cleanup
-```
-
-- 手順: `orca_readiness` → `orca_delegate_task` → 30 秒間隔の `orca_get_task_status` →
-  pending gate は `approve (e2e)` で `orca_resolve_gate` → `orca_get_task_result({ includeChildren: true })` →
-  2 本目を途中で `orca_cancel_task`(cascade と `fullyStopped` を確認)
-- 全ステップの観測は `e2e-transcript.json` に残ります
-- `state: "queued"` で止まった場合は worker-start 失敗が原因なので、その場で cancel して終了します
-- 後片付けは child worktree を表示するだけ(`--cleanup` を付けると `orca worktree rm` まで実行)
-
-E2E は `--agent codex`(`agentDefaultArgs.codex = "--approve-for-me"`)で完走を確認済みです
-(readiness ok → delegate running → poll 6 回で completed → result → cancel `fullyStopped: true`)。
-worker 単体の完走は claude でも確認済みです(2026-10-08、上の `agentDefaultArgs.claude` 設定で
-`worker-start ready` → 承認停止ゼロ → `poll#13 completed`)。
 
 ### 開発上の決まり(抜粋)
 

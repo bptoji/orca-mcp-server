@@ -307,6 +307,28 @@ describe("evaluateReadiness", () => {
     expect(view["nextAction"]).not.toContain("--agent dsh");
   });
 
+  it("copilot も共有 skills root を読むので providers 列挙に無くても落とさない(実測: copilot skill list)", () => {
+    const claudeOnly: JsonObject = {
+      ok: true,
+      result: { skills: [{ name: "orchestration", providers: ["agent-skills", "claude", "codex"] }] },
+    };
+    const view = evaluateReadiness(readyStatus, claudeOnly, "copilot");
+    expect(view["ready"]).toBe(true);
+    expect(view["missing"]).toEqual([]);
+    expect(JSON.stringify(view["checks"])).toContain("共有 skills root");
+  });
+
+  it("copilot で skill が無いときは共有 skills root の確認を促す(--agent copilot を勧めない)", () => {
+    // 実測: `orca skills install --agent copilot` は skills CLI 側の agent 名が
+    // github-copilot なので "Invalid agents: copilot" で落ちる(exit 1)。
+    const noOrchestration: JsonObject = { ok: true, result: { skills: [{ name: "orca-cli" }] } };
+    const view = evaluateReadiness(readyStatus, noOrchestration, "copilot");
+    expect(view["ready"]).toBe(false);
+    expect(view["missing"]).toContain("orchestration available to copilot");
+    expect(view["nextAction"]).toContain("~/.agents/skills/orchestration/SKILL.md");
+    expect(view["nextAction"]).not.toContain("--agent copilot");
+  });
+
   it("同じ skill 名の複数行を union して判定する(共有 root 行 + provider 宛て行)", () => {
     // 実機で codex 宛ての導入後に providers が 2 行へ分かれた。1 行目だけ見ると false negative。
     const splitRows: JsonObject = {

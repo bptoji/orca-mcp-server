@@ -41,6 +41,7 @@ tests/              # vitest。子プロセスを実際に起動しない(モッ
 scripts/
   e2e.mjs           # 実ランタイム E2E(stdio でサーバーを起動し submit→poll→gate→result→cancel)
   dsh-tui-launcher.mjs    # dsh worker の既定: dsh-tui を起動して待つだけの最小 launcher
+  copilot-launcher.mjs    # copilot worker 用: COPILOT_ALLOW_ALL=true を設定して copilot を起動する最小 launcher
   dsh-acp-worker.mjs      # Orca 注入 → ACP session/prompt に載せ直すブリッジ(ACP 機能が要る時)
   dsh-headless-worker.mjs # Orca 注入 → dsh --profile headless の argv に載せ直すブリッジ(1 タスク 1 プロセス)
 docs/
@@ -75,9 +76,9 @@ docs/
 - このツールは常に Commander を起動する。既存 terminal / worktree への直接 dispatch が必要なら
   内部用の `tools/delegate.ts` を使う(公開しない)。
 - `prompt` という語は使わない。Commander へ課する制約は `constraints: string[]` で、
-  `COMMANDER_PROMPT` の Constraints 欄に箇条書きで焼く。
+  `COMMANDER_PROMPT` の Constraints 欄に箇条書きで書き込む。
 - `COMMANDER_PROMPT` には「orchestration を変更する前に `orca skills get orchestration --full` を
-  読み、記憶した CLI 構文を使わない」という Orca 公式の推奨を固定で焼く。
+  読み、記憶した CLI 構文を使わない」という Orca 公式の推奨を固定で書き込む。
 - 作業ワーカーの選択は Commander 側。MCP 側の語彙は `commanderAgent`(= どの Commander を起動するか)。
 - **`commanderAgent` は Orca 側で設定されたエージェント名のみ**(`worker-start --agent` の制約)。
   実機で `"dsh headless"` は `agent_unconfigured`。launcher 登録前の `dsh`(dsh-tui 直接起動)は
@@ -126,7 +127,7 @@ docs/
 - **報告の本体は `worker_done`**。dispatch 生存中の `task-update --status completed` は CLI が拒否する
   (実測: "cannot move to completed while supervised Dispatch … is active")。`task-update` は
   dispatch が無い / 落ちた後の事後報告専用。
-- **dsh の LLM はローカルゲートウェイへ焼ける**(key 不要)。手宣言ルートで `apiKeyEnv` を省くと
+- **dsh の LLM はローカルゲートウェイへ設定する**(key 不要)。手宣言ルートで `apiKeyEnv` を省くと
   pi-ai が `No API key for provider` で落とすので、`headers: {Authorization: Bearer local}` で
   通す(pi-ai の `getClientApiKey` が非空 authorization を `"unused"` として採用する)。
 - **エージェント側の承認プロンプトが E2E の最大の停止点**(claude / codex とも実測)。
@@ -158,6 +159,40 @@ docs/
 - **claude の `Login expired` / `Not logged in` は権限ではなく auth 切れ**(2026-10-08 実測)。この状態の worker は
   `dispatched` のまま進まない(pane にエラーが出る)。Orca 側のアカウント紐づけで解消した。pane 側には
   user スコープの `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` が必要(プロセス env スナップショットだと欠ける)。
+- **copilot は Commander でも Worker でも完走する**(2026-10-08 E2E 実測・本運用)。
+  `agentCmdOverrides.copilot = node` + `agentDefaultArgs.copilot = "…\scripts\copilot-launcher.mjs" --allow-all-tools` で
+  `readiness ready=true` → `delegate running` → `poll#2 completed` → `result completed` → `cancel fullyStopped: true`
+  (この goal では children=0、分解せずに完走した)。hooks は `orca agent hooks status` で `installed`
+  (`~/.copilot/hooks/orca.json`)。
+- **copilot の起動停止は folder trust**(2026-10-08 実測)。未設定の worker は `agent_readiness` で
+  `Agent startup blocked: agent-trust-workspace` に落ち、pane に
+  「Confirm folder trust … Do you trust the files in this folder?」が出る(dispatch 経由の注入が届かない)。
+  **解除できるのは env `COPILOT_ALLOW_ALL=true` だけ**だった(実測: pane の確認表示が消える):
+  `--add-dir .` / `--allow-all-paths` / `--allow-all-tools` では確認表示は消えず、`trustedFolders` は親ディレクトリを
+  信頼しても子 worktree に効かない(完全一致。`copilot config trustedFolders` は `Unknown settings key segment`)。
+  値は正確に `true` であることが効く(`1` / `yes` / `on` はツール自動承認だけで trust が残る)。
+  `agentDefaultEnv` キーは `orca-data.json` に存在するが(goose の空エントリのみ)UI からの設定経路が
+  見つかっていないので、**launcher(`scripts/copilot-launcher.mjs`)で env を設定して起動する**。
+- **copilot は共有 skills root を読む**(2026-10-08 実測)。`copilot skill list` の "Personal skills" に
+  `orchestration` と `orca-cli` が並び、源は `~/.agents/skills/`。なので `orca_readiness` の
+  `SHARED_SKILLS_ROOT_AGENTS` に copilot を含める(dsh と同じ型)。
+  `orca skills install --agent copilot` は `Invalid agents: copilot` で exit 1(skills CLI 側の名前は
+  `github-copilot`)。`--json` は `--dry-run` のみ対応(実インストールは npx の出力を stream する)。
+- **copilot の承認系フラグ**(実機 help 1.0.93): `--allow-tool <tools>`(承認なしで使うツール)/
+  `--allow-all-tools`(非対話モードでは必須)/ `--allow-all-paths` / `--allow-all-urls` /
+  `--allow-all` = `--yolo`(全面)。設定キーは `defaultPermissionMode`(`manual` / `assisted` / `allow-all`)で、
+  `--mode interactive|plan|autopilot`。`banner` は `once` / `always` / `never`。
+- **子 worker の深さは Orca 側の設定**(2026-10-08 実測)。既定は `settings.nestedWorkerMaxDepth = 1`
+  (`NESTED_WORKER_MAX_DEPTH_DEFAULT`。root coordinator が depth 0、第一世代 worker が depth 1)。
+  **MCP が起動する Commander は `worker-start` 経路なので既に depth 1** — その子 worker は depth 2 で
+  `nested_worker_depth_exceeded`(応答に `depth 2, max 1` と出る)になり、`new-child` / `new-top-level` /
+  `current` のいずれでも起動できない。UI は Settings → Orchestration → "Nested worker depth"(1 以上の整数、
+  不正値は 1 にクランプ)。`2` に上げると実測で通った: 分解 goal で `poll#4 children=4` → `poll#7 completed`、
+  子タスク 3 件が copilot worker で `succeeded`(並列)、`result children=4` / `filesModified ["README.md"]`。
+  1 のままだと Commander は正しく blocked 報告する(`provenance: worker_report` /
+  `subject: "Blocked: nested_worker_depth_exceeded"`)ので、E2E の分解 goal は depth 2 で回すこと。
+  設定の live 値は `profile-state.db`(sqlite)側にある — `orca-data.json` は export で遅れるため、
+  反映確認は DB をコピーして読む(アプリ起動中は本体ファイルが読めない)。
 - **`repo` は repo セレクタ**(E2E 実機確認): `id:<repoId>` / `path:<repo home>` は解決できるが、
   worktree の displayName(`name:weever`)や worktree path は `repo_not_found`。repoId は
   `orca worktree current --json` の `result.worktree.repoId`。
@@ -206,7 +241,7 @@ docs/
 - poll は worker の `projection.attention.requiresAction` を `attentionRequired` / `attentionNotes`
   (行には `attentionCategories`)として出す。ゲートが pending でないのに止まる典型はエージェント側の
   ツール承認プロンプト(E2E 実測)。Commander Prompt には「答えられない承認待ちで止めない / 新しい Run を
-  作らない(Run ownership、子 task は `--parent` 自分の task)」を固定で焼く。
+  作らない(Run ownership、子 task は `--parent` 自分の task)」を固定で書き込む。
 - 出力は既定で切り詰める(`specPreview` 200 字、worker 出力 4000 字、agents の prompt 200 字)。
 
 ## 登録ツール(現状)

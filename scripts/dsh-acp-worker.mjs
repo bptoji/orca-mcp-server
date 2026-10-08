@@ -22,7 +22,7 @@
 // 環境変数(すべて省略可):
 //   DSH_ACP_PROFILE      起動するプロファイル(既定 acp)
 //   DSH_ACP_PERMISSION   allow_once(既定)/ allow_always / reject
-//   DSH_ACP_MODEL        "provider/model" を指定して session/set_config_option で焼く
+//   DSH_ACP_MODEL        "provider/model" を指定して session/set_config_option で設定する
 //   DSH_ACP_EFFORT       off / low / high / max
 //   DSH_ACP_MCP          ACP の mcpServers 配列を JSON で(例: orca-mcp を注入)
 //   DSH_ACP_IDLE_EXIT_MS ターン後に次の注入を待つ上限(既定 30 分)
@@ -537,7 +537,7 @@ sessionId = created.result?.sessionId ?? null;
 log(`session = ${sessionId}`);
 
 // モデルと effort は worker-start では渡せない(worker-start の --model/--effort は
-// Claude / Codex / Cursor / Antigravity / Muse 限定)。ACP 側で焼く。
+// Claude / Codex / Cursor / Antigravity / Muse 限定)。ACP 側で設定する。
 const configOptions = created.result?.configOptions ?? [];
 if (process.env.DSH_ACP_MODEL) {
   const modelOption = configOptions.find((option) => option.id === "model");
