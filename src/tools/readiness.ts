@@ -15,8 +15,12 @@ const REQUIRED_SKILL = "orchestration";
  * providers に `dsh` が並ばなくても orchestration skill を読める。実機で確認済み:
  * `~/.agents/skills/orchestration/SKILL.md` が dsh の skill catalog に並ぶ
  * (providers 列挙は claude / codex などで、dsh をはじくために使うと誤検地になる)。
+ * copilot も同じ: `copilot skill list` の "Personal skills" に `~/.agents/skills/` が源として
+ * 並び、`orchestration` と `orca-cli` が実際に列挙された(2026-10-08 実測、Copilot CLI 1.0.92)。
+ * providers 列挙に copilot が入らないのはこのためで、`orca skills install --agent copilot` は
+ * skills CLI 側の agent 名が `github-copilot` で異なるため `Invalid agents: copilot` で落ちる。
  */
-const SHARED_SKILLS_ROOT_AGENTS = new Set(["dsh"]);
+const SHARED_SKILLS_ROOT_AGENTS = new Set(["dsh", "copilot"]);
 const SHARED_SKILLS_ROOT = "~/.agents/skills";
 
 export interface ReadinessCheck {

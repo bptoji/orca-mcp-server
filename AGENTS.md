@@ -41,6 +41,7 @@ tests/              # vitest。子プロセスを実際に起動しない(モッ
 scripts/
   e2e.mjs           # 実ランタイム E2E(stdio でサーバーを起動し submit→poll→gate→result→cancel)
   dsh-tui-launcher.mjs    # dsh worker の既定: dsh-tui を起動して待つだけの最小 launcher
+  copilot-launcher.mjs    # copilot worker 用: COPILOT_ALLOW_ALL=true を焼いて copilot を起動する最小 launcher
   dsh-acp-worker.mjs      # Orca 注入 → ACP session/prompt に載せ直すブリッジ(ACP 機能が要る時)
   dsh-headless-worker.mjs # Orca 注入 → dsh --profile headless の argv に載せ直すブリッジ(1 タスク 1 プロセス)
 docs/
@@ -158,6 +159,29 @@ docs/
 - **claude の `Login expired` / `Not logged in` は権限ではなく auth 切れ**(2026-10-08 実測)。この状態の worker は
   `dispatched` のまま進まない(pane にエラーが出る)。Orca 側のアカウント紐づけで解消した。pane 側には
   user スコープの `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` が必要(プロセス env スナップショットだと欠ける)。
+- **copilot は Commander でも Worker でも完走する**(2026-10-08 E2E 実測・本運用)。
+  `agentCmdOverrides.copilot = node` + `agentDefaultArgs.copilot = "…\scripts\copilot-launcher.mjs" --allow-all-tools` で
+  `readiness ready=true` → `delegate running` → `poll#2 completed` → `result completed` → `cancel fullyStopped: true`
+  (この goal では children=0、分解せずに完走した)。hooks は `orca agent hooks status` で `installed`
+  (`~/.copilot/hooks/orca.json`)。
+- **copilot の起動停止は folder trust**(2026-10-08 実測)。未設定の worker は `agent_readiness` で
+  `Agent startup blocked: agent-trust-workspace` に落ち、pane に
+  「Confirm folder trust … Do you trust the files in this folder?」が出る(dispatch 経由の注入が届かない)。
+  **解除できるのは env `COPILOT_ALLOW_ALL=true` だけ**だった(実測: pane の促しが消える):
+  `--add-dir .` / `--allow-all-paths` / `--allow-all-tools` では促しは消えず、`trustedFolders` は親ディレクトリを
+  信頼しても子 worktree に効かない(完全一致。`copilot config trustedFolders` は `Unknown settings key segment`)。
+  値は正確に `true` であることが効く(`1` / `yes` / `on` はツール自動承認だけで trust が残る)。
+  `agentDefaultEnv` キーは `orca-data.json` に存在するが(goose の空エントリのみ)UI からの設定経路が
+  見つかっていないので、**launcher(`scripts/copilot-launcher.mjs`)で env を焼く**。
+- **copilot は共有 skills root を読む**(2026-10-08 実測)。`copilot skill list` の "Personal skills" に
+  `orchestration` と `orca-cli` が並び、源は `~/.agents/skills/`。なので `orca_readiness` の
+  `SHARED_SKILLS_ROOT_AGENTS` に copilot を含める(dsh と同じ型)。
+  `orca skills install --agent copilot` は `Invalid agents: copilot` で exit 1(skills CLI 側の名前は
+  `github-copilot`)。`--json` は `--dry-run` のみ対応(実インストールは npx の出力を stream する)。
+- **copilot の承認系フラグ**(実機 help 1.0.93): `--allow-tool <tools>`(承認なしで使うツール)/
+  `--allow-all-tools`(非対話モードでは必須)/ `--allow-all-paths` / `--allow-all-urls` /
+  `--allow-all` = `--yolo`(全面)。設定キーは `defaultPermissionMode`(`manual` / `assisted` / `allow-all`)で、
+  `--mode interactive|plan|autopilot`。`banner` は `once` / `always` / `never`。
 - **`repo` は repo セレクタ**(E2E 実機確認): `id:<repoId>` / `path:<repo home>` は解決できるが、
   worktree の displayName(`name:weever`)や worktree path は `repo_not_found`。repoId は
   `orca worktree current --json` の `result.worktree.repoId`。

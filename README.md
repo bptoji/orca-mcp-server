@@ -111,6 +111,7 @@ providers 列挙にそのエージェント名は出ない)。`orca_delegate_tas
 | --- | --- |
 | **codex を Commander / Worker に(既定)** | `agentDefaultArgs.codex = --approve-for-me` を推奨。これがないと Codex 側の**承認プロンプト**でジョブが止まります |
 | **claude を Commander / Worker に** | `agentDefaultArgs.claude = --permission-mode acceptEdits --allowedTools Bash Read Edit Write Glob Grep`。設定なしだと `orca skills get …` などの**ツール承認プロンプト**でジョブが止まります |
+| **copilot を Commander / Worker に** | `agentCmdOverrides.copilot = node` + `agentDefaultArgs.copilot = "C:\<repo-dir>\orca-mcp\scripts\copilot-launcher.mjs" --allow-all-tools`。launcher を挟まないと **folder trust の促し**で `agent_readiness` が止まります |
 | **dsh を Commander / Worker に** | `agentCmdOverrides.dsh = node "C:\<repo-dir>\orca-mcp\scripts\dsh-tui-launcher.mjs"` — launcher を挟まないと readiness を通過できません |
 | **dsh を ACP 機能付きで**(任意) | `agentCmdOverrides.dsh = node "C:\<repo-dir>\orca-mcp\scripts\dsh-acp-worker.mjs"` — 下の [ACP ブリッジ](#dsh-を-acp-で動かす任意のブリッジ) |
 | **対話で dsh-tui を使う** | 設定不要。`dst .`(エイリアス)で起動すれば `agentCmdOverrides` を通しません |
@@ -118,6 +119,8 @@ providers 列挙にそのエージェント名は出ない)。`orca_delegate_tas
 - `"dsh headless"` のような追加引数は `agent_unconfigured` で拒否されます。
 - 承認プロンプトは **MCP 側から解除できません**。`orca terminal send` はエージェントの承認プロンプトへの
   入力を `agent_prompt_blocked` で拒否します(人間が UI で答える設計)。上の設定で事前に潰してください。
+- copilot の **folder trust**(`Confirm folder trust`)は env `COPILOT_ALLOW_ALL=true` でのみ解除されます。
+  上の launcher がそれを焼きます(`agentDefaultEnv` の設定経路は UI に見当たりません)。
   設定の根拠・実測の経緯は [AGENTS.md](./AGENTS.md) にまとめてあります。
 
 ---
@@ -414,6 +417,7 @@ poll を打ち切る前に数回待ってください。**launcher 運用では�
 | --- | --- | --- |
 | `state: "queued"` から進まない | worker-start 失敗(dispatch が無く Commander 未起動) | `nextAction` の指示どおり delegate し直すか cancel する |
 | `state: "failed"` / `stage: "agent_readiness"` | pane に生きたプロセスが見えていない(dsh) | `agentCmdOverrides.dsh` を launcher に向ける。`workerReportPending: true` なら報告を待つ |
+| `lastError=Agent startup blocked: agent-trust-workspace` | copilot の **folder trust** 促しで起動が止まっている | `agentCmdOverrides.copilot = node` + launcher(`COPILOT_ALLOW_ALL=true` を焼く)。`--add-dir` / `--allow-all-paths` では消えない |
 | `running` のまま progress が止まる | エージェントの**ツール承認プロンプト**で worker が停止 | `attentionNotes` をたどって pane を確認。codex は `--approve-for-me`、claude は `agentDefaultArgs.claude` の `--permission-mode acceptEdits --allowedTools Bash …` |
 | claude の worker が `dispatched` のまま動かない、pane に `Not logged in` | claude の auth 切れ(権限設定ではない) | Orca 側のアカウント紐づけ / pane で `/login` |
 | `blocked` / `phase: "decision_gate"` | 承認ゲート待ち | `orca_resolve_gate({ gateId, resolution, run })` で進める |
@@ -495,6 +499,8 @@ E2E は `--agent codex`(`agentDefaultArgs.codex = "--approve-for-me"`)で完走�
 (readiness ok → delegate running → poll 6 回で completed → result → cancel `fullyStopped: true`)。
 worker 単体の完走は claude でも確認済みです(2026-10-08、上の `agentDefaultArgs.claude` 設定で
 `worker-start ready` → 承認停止ゼロ → `poll#13 completed`)。
+`--agent copilot` の完走も確認済みです(2026-10-08、上の launcher 設定で
+`readiness ready=true` → `delegate running` → `poll#2 completed` → cancel `fullyStopped: true`)。
 
 ### 開発上の決まり(抜粋)
 
