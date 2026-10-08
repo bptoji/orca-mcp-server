@@ -153,6 +153,18 @@ export function extractEnvelopeError(data: unknown): OrcaEnvelopeError | undefin
 }
 
 /**
+ * stdout の JSON が orca CLI の `ok:true` エンベロープかどうか。
+ * 実測: `worker-start` は agent_readiness 失敗時に **ok:true の receipt を出して終了コード 1** で抜ける。
+ * エンベロープが意味論の主人なので、このケースは transport 成功として扱う(AGENTS.md 参照)。
+ */
+export function isOkEnvelope(data: unknown): boolean {
+  if (data === null || typeof data !== "object" || Array.isArray(data)) {
+    return false;
+  }
+  return (data as Record<string, unknown>)["ok"] === true;
+}
+
+/**
  * `execFile("orca", args)` で orca CLI を実行し、成否を OrcaCommandResult で返す。
  * 非ゼロ終了でも例外を投げない — 呼び出し側は result.ok / result.error.code で分岐する。
  *
@@ -229,10 +241,21 @@ export function runOrca<T = unknown>(
           // 3) 非ゼロ終了: execFile は終了コードを number の code に入れる
           if (typeof error.code === "number") {
             // stdout に ok:false エンベロープがあれば CLI 側の理由を優先して載せる
-            const parsedFailure = parseJsonOutput(base.stdout);
+            const parsedFailure = parseJsonOutput<T>(base.stdout);
             const cliError = parsedFailure.ok
               ? extractEnvelopeError(parsedFailure.data)
               : undefined;
+            // ok:true エンベロープが出ているなら CLI は意味論に成功している(worker-start の
+            // readiness 失敗 receipt がこれで抜ける)。終了コードは診断値としてだけ残す。
+            if (parsedFailure.ok && cliError === undefined && isOkEnvelope(parsedFailure.data)) {
+              resolve({
+                ...base,
+                ok: true,
+                exitCode: error.code,
+                data: parsedFailure.data,
+              });
+              return;
+            }
             resolve({
               ...base,
               ok: false,

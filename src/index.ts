@@ -9,6 +9,7 @@ import { registerInterveneTools } from "./tools/intervene.js";
 import { registerStatusTool } from "./tools/status.js";
 import { registerGetWorktreeTool, registerListWorktreesTool } from "./tools/worktrees.js";
 import { registerListAgentsTool } from "./tools/agents.js";
+import { registerReadinessTool } from "./tools/readiness.js";
 // 未登録の足場(低レベルすぎる API を外部に出さない): tools/delegate.ts / tools/message.ts
 
 export const SERVER_NAME = "orca-mcp";
@@ -26,6 +27,7 @@ export function createServer(client: OrcaClient = new OrcaClient()): McpServer {
   registerInterveneTools(server, client);
   // 観測用 read-only(デバッグ・状況確認用)。低レベルの作成系は登録しない。
   registerStatusTool(server, client);
+  registerReadinessTool(server, client);
   registerListWorktreesTool(server, client);
   registerGetWorktreeTool(server, client);
   registerListAgentsTool(server, client);

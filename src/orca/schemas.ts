@@ -57,25 +57,41 @@ export const listAgentsInputSchema = z.object({
 });
 export type ListAgentsInput = z.infer<typeof listAgentsInputSchema>;
 
-export const delegateTaskInputSchema = z.object({
-  spec: z.string().min(1).describe("ワーカーに渡すタスク仕様(指示文)。これ 1 本で委譲できる"),
-  title: z.string().min(1).optional().describe("タスクの表示タイトル(worktree 名にも使う)"),
-  agent: z
+/**
+ * orca_delegate_task は **Commander API 専用**。
+ * 公開する語彙は「ゴール + 制約 + どの Commander を起動するか」だけ。
+ * 既存 terminal / worktree への直接 dispatch は受け付けない(意味が 2 通りに
+ * なってしまい、同じツール名で 2 つの系を隠すことになるため)。
+ * 低レベルな直接 dispatch が必要なら内部用の tools/delegate.ts を使う。
+ */
+export const delegateTaskInputSchema = z.strictObject({
+  spec: z
+    .string()
+    .min(1)
+    .describe("Commander に渡すゴール(タスク仕様)。これ 1 本で委譲できる"),
+  title: z
+    .string()
+    .min(1)
+    .optional()
+    .describe("タスクの表示タイトル(task-title と Commander worker 名に使う)"),
+  commanderAgent: z
     .string()
     .min(1)
     .default("codex")
-    .describe("新規 worktree で起動するエージェント(既定 codex)"),
-  worktree: z
+    .describe(
+      "起動する Commander Agent の id(既定 codex)。実際の作業ワーカーを選ぶのは Commander 側",
+    ),
+  constraints: z
+    .array(z.string().min(1))
+    .optional()
+    .describe(
+      "Commander に課する制約。Commander 指示の Constraints 欄に箇条書きで入る(例: 既存 API を変えない / テストを追加する / マージしない)",
+    ),
+  repo: z
     .string()
     .min(1)
     .optional()
-    .describe("既存 worktree のセレクタ。指定時はその worktree のターミナルへ dispatch"),
-  terminal: z
-    .string()
-    .min(1)
-    .optional()
-    .describe("既存ターミナルの handle。指定時はここが最優先(dispatch 先を明示するときに使う)"),
-  repo: z.string().min(1).optional().describe("新規 worktree を作る対象リポジトリのセレクタ"),
+    .describe("対象リポジトリのセレクタ(id:<id> / name:<name> / path:<path>)"),
   run: z
     .string()
     .min(1)
@@ -83,11 +99,6 @@ export const delegateTaskInputSchema = z.object({
     .describe("対象の orchestration Run ID(省略時は新規 Run を作成する)"),
   deps: z.array(z.string().min(1)).optional().describe("依存するタスク ID の配列"),
   parent: z.string().min(1).optional().describe("親タスク ID"),
-  prompt: z
-    .string()
-    .min(1)
-    .optional()
-    .describe("新規エージェントへ渡す初回プロンプト(省略時は spec をそのまま使う)"),
 });
 export type DelegateTaskInputSchema = z.infer<typeof delegateTaskInputSchema>;
 
@@ -101,7 +112,7 @@ export const getTaskStatusInputSchema = z.object({
 });
 export type GetTaskStatusInput = z.infer<typeof getTaskStatusInputSchema>;
 
-export const getTaskResultInputSchema = z.object({
+export const getTaskResultInputSchema = z.strictObject({
   taskId: z.string().min(1).describe("対象のタスク ID"),
   run: z.string().min(1).optional().describe("対象の orchestration Run ID"),
   outputLimit: z
@@ -111,6 +122,12 @@ export const getTaskResultInputSchema = z.object({
     .max(200)
     .optional()
     .describe("worker 1 件あたりで読む出力行数の上限(既定 40)"),
+  includeChildren: z
+    .boolean()
+    .default(false)
+    .describe(
+      "true にすると Commander が分解した子タスクの result と worker 出力も集約して返す(既定 false = Commander だけ)",
+    ),
 });
 export type GetTaskResultInput = z.infer<typeof getTaskResultInputSchema>;
 
@@ -152,7 +169,7 @@ export const sendMessageInputSchema = z.object({
 });
 export type SendMessageInputSchema = z.infer<typeof sendMessageInputSchema>;
 
-export const cancelTaskInputSchema = z.object({
+export const cancelTaskInputSchema = z.strictObject({
   taskId: z.string().min(1).describe("キャンセルするタスク ID"),
   run: z.string().min(1).optional().describe("対象の orchestration Run ID"),
   reason: z
@@ -164,8 +181,48 @@ export const cancelTaskInputSchema = z.object({
     .enum(["stop", "abandon"])
     .default("stop")
     .describe("stop: worker を fence して止める / abandon: 不確実なまま fence する(プロセスに触らない)"),
+  cascade: z
+    .boolean()
+    .default(true)
+    .describe(
+      "true(既定)は子孫タスクとその worker まで**子から順**に止める(cascade)。false なら対象タスクだけ。worktree / ターミナルの削除はどちらも行わない",
+    ),
 });
 export type CancelTaskInputSchema = z.infer<typeof cancelTaskInputSchema>;
+
+/**
+ * Human-in-the-loop 用の介入: 判断ゲートを承認/却下して Commander を進める。
+ * gate-create は Commander 側の仕事なので公開しない(公開するのは解決だけ)。
+ */
+export const resolveGateInputSchema = z.strictObject({
+  gateId: z
+    .string()
+    .min(1)
+    .describe("orca_get_task_status の gates[].id(gate_… の ID)"),
+  resolution: z
+    .string()
+    .min(1)
+    .describe("結論のテキスト(gate の options のいずれか。例: approve / reject)"),
+  run: z
+    .string()
+    .min(1)
+    .describe(
+      "対象の orchestration Run ID(gate は Run バインドスコープ。MCP 側はバインドを持たないので必須)",
+    ),
+});
+export type ResolveGateInputSchema = z.infer<typeof resolveGateInputSchema>;
+
+/** 委譲の前提チェック。commanderAgent を渡すとそのエージェント向けの準備まで見る。 */
+export const readinessInputSchema = z.strictObject({
+  commanderAgent: z
+    .string()
+    .min(1)
+    .optional()
+    .describe(
+      "起動する予定の Commander Agent(例: codex / claude)。指定すると orchestration skill がそのエージェントで使えるかまで確認する",
+    ),
+});
+export type ReadinessInput = z.infer<typeof readinessInputSchema>;
 
 export const delegateInputSchema = z.object({
   spec: z.string().min(1).describe("ワーカーに渡すタスク仕様(指示文)"),

@@ -9,19 +9,22 @@ import {
   OrcaCommandError,
   type CommandRunner,
   type OrcaCommandResult,
+  type RunOptions,
 } from "../src/orca/command.js";
 
 /** 子プロセスを起動せずに argv 組み立てを検証するためのモック runner。 */
 function createMockRunner(data: unknown = { ok: true }, failure?: { code: string; message: string }) {
   const calls: string[][] = [];
-  const runner: CommandRunner = async (args) => {
+  const options: RunOptions[] = [];
+  const runner: CommandRunner = async (args, runOptions) => {
     calls.push(args);
+    options.push(runOptions ?? {});
     const result: OrcaCommandResult = failure
       ? { args, ok: false, exitCode: 2, stdout: "", stderr: failure.message, error: failure }
       : { args, ok: true, exitCode: 0, stdout: JSON.stringify(data), stderr: "", data };
     return result;
   };
-  return { runner, calls };
+  return { runner, calls, options };
 }
 
 describe("OrcaClient の引数組み立て", () => {
@@ -84,6 +87,42 @@ describe("OrcaClient の引数組み立て", () => {
     expect(calls[0]).toEqual(["orchestration", "send", "--subject", "hello", "--body", "world", "--json"]);
   });
 
+  it("send は worker_done の outcome を --outcome で渡す(消すと CLI が拒否する)", async () => {
+    const { runner, calls } = createMockRunner();
+    const client = new OrcaClient(runner);
+    await client.send({
+      subject: "done",
+      body: "work finished",
+      type: "worker_done",
+      outcome: "succeeded",
+      taskId: "t1",
+      dispatchId: "d1",
+      run: "r1",
+    });
+    const args = calls[0] ?? [];
+    expect(args).toContain("--outcome");
+    expect(args).toContain("succeeded");
+    expect(args).toEqual([
+      "orchestration",
+      "send",
+      "--subject",
+      "done",
+      "--run",
+      "r1",
+      "--body",
+      "work finished",
+      "--type",
+      "worker_done",
+      "--outcome",
+      "succeeded",
+      "--task-id",
+      "t1",
+      "--dispatch-id",
+      "d1",
+      "--json",
+    ]);
+  });
+
   it("worktree ps は --limit を文字列で渡す", async () => {
     const { runner, calls } = createMockRunner();
     const client = new OrcaClient(runner);
@@ -132,6 +171,99 @@ describe("OrcaClient の引数組み立て", () => {
       "term_1",
       "--json",
     ]);
+  });
+
+  it("worker-start は supervised worker 起動の argv をこの順で並べる", async () => {
+    const { runner, calls } = createMockRunner();
+    const client = new OrcaClient(runner);
+    await client.workerStart({
+      task: "t1",
+      worktree: "new-child",
+      agent: "codex",
+      name: "Commander",
+      repo: "name:foo",
+      run: "r1",
+    });
+    expect(calls[0]).toEqual([
+      "orchestration",
+      "worker-start",
+      "--task",
+      "t1",
+      "--worktree",
+      "new-child",
+      "--agent",
+      "codex",
+      "--name",
+      "Commander",
+      "--repo",
+      "name:foo",
+      "--run",
+      "r1",
+      "--json",
+    ]);
+  });
+
+  it("worker-start は worktree 作成に耐える transport timeout を渡す(既定 30s では足りない)", async () => {
+    const { runner, calls, options } = createMockRunner();
+    const client = new OrcaClient(runner);
+    await client.workerStart({ task: "t1", worktree: "new-child", agent: "claude", name: "E2E" });
+    expect(options[0]?.timeoutMs).toBe(180_000);
+
+    // 他のコマンドは transport timeout を上書きしない(既定 30s のまま)
+    await client.taskList({});
+    expect(options[1]?.timeoutMs).toBeUndefined();
+    expect(calls).toHaveLength(2);
+  });
+
+  it("worker-start は省略したフラグを付与しない", async () => {
+    const { runner, calls } = createMockRunner();
+    const client = new OrcaClient(runner);
+    await client.workerStart({ task: "t1", worktree: "current", agent: "claude" });
+    expect(calls[0]).toEqual([
+      "orchestration",
+      "worker-start",
+      "--task",
+      "t1",
+      "--worktree",
+      "current",
+      "--agent",
+      "claude",
+      "--json",
+    ]);
+  });
+
+  it("gate-resolve は --id / --resolution を渡し --run を付けない(gate は Run バインドスコープ)", async () => {
+    const { runner, calls } = createMockRunner();
+    const client = new OrcaClient(runner);
+    await client.gateResolve({ id: "gate_1", resolution: "approve" });
+    expect(calls[0]).toEqual([
+      "orchestration",
+      "gate-resolve",
+      "--id",
+      "gate_1",
+      "--resolution",
+      "approve",
+      "--json",
+    ]);
+    await client.gateResolve({ id: "gate_1", resolution: "reject", from: "term_1" });
+    expect(calls[1]).toEqual([
+      "orchestration",
+      "gate-resolve",
+      "--id",
+      "gate_1",
+      "--resolution",
+      "reject",
+      "--from",
+      "term_1",
+      "--json",
+    ]);
+  });
+
+  it("skills installed は skills / installed をそのまま渡す", async () => {
+    const { runner, calls } = createMockRunner();
+    const client = new OrcaClient(runner);
+    await client.skillsInstalled();
+    expect(calls[0]).toEqual(["skills", "installed", "--json"]);
   });
 
   it("dispatch-show は --preamble / --from を任意で付与する", async () => {

@@ -1,0 +1,43 @@
+# dsh の acp プロファイル用パッチのテンプレ(ローカル LLM ゲートウェイ / key 不要)
+#
+# 実体は ~/.dsh/profiles/acp/cordis.patch.yml に置く(このファイルはテンプレで、dsh は読まない)。
+# プロファイルのパッチは起動時にだけ適用される(acp-app は HMR 無効) → 編集したら再起動。
+#
+# 実測で必要だった 3 点:
+#   1. 手宣言ルートで apiKeyEnv を省くと pi-ai が "No API key for provider" で落とす
+#   2. headers.Authorization を非空にすると pi-ai の getClientApiKey が "unused" として採用し key 無しで通る
+#   3. acp の既定モデル(deepseek-official 系)は key 必須なので、ローカルルートへ焼き直す
+#      llm-deepseek を disabled にすると、既定ルート要求でこける経路自体が消える
+#
+# 置き換える値: <gateway-host> / <port> / <model-id> / <display name>
+
+- id: llm-pi-ai
+  config:
+    providers:
+      local-gateway:
+        displayName: local-gateway
+        api: openai-completions
+        baseURL: http://<gateway-host>:<port>/v1
+        headers:
+          # key 不要のゲートウェイでも「非空の authorization」が必須(実測)
+          Authorization: Bearer local
+        models:
+          - id: <model-id>
+            name: <display name>
+            contextWindow: 262144
+
+# acp プロファイルの既定モデル差し替え(session/new の configOptions に並ぶ)
+- id: acp
+  config:
+    provider: local-gateway
+    model: <model-id>
+
+# dsh 本体の既定モデルも同じルートへ
+- id: agent-default-model
+  config:
+    provider: local-gateway
+    model: <model-id>
+
+# key 必須の公式ルートは使わない
+- id: llm-deepseek
+  disabled: true

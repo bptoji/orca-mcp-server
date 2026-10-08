@@ -10,6 +10,12 @@ import {
 /** orca CLI の JSON 出力の共通形状(キーはコマンドごとに異なる)。 */
 export type JsonObject = Record<string, unknown>;
 
+/**
+ * worker-start 専用の transport timeout。worktree 作成 + setup hook + エージェント起動 +
+ * 初ターン観測まで同期で走るため、既定の 30s では足りない(実機 E2E で 30s 超を経験した)。
+ */
+const WORKER_START_TIMEOUT_MS = 180_000;
+
 export interface WorktreeListInput {
   repo?: string;
   limit?: number;
@@ -54,6 +60,13 @@ export interface GateListInput {
   task?: string;
   status?: string;
   run?: string;
+  from?: string;
+}
+
+/** `gate-resolve` には `--run` が無い(Run スコープは呼び出し元のバインドで決まる)。 */
+export interface GateResolveInput {
+  id: string;
+  resolution: string;
   from?: string;
 }
 
@@ -112,6 +125,8 @@ export interface SendInput {
   to?: string;
   body?: string;
   type?: string;
+  /** `worker_done` は CLI 側で `--outcome succeeded|failed` が必須(無いと CLI が拒否する)。 */
+  outcome?: "succeeded" | "failed";
   priority?: string;
   threadId?: string;
   taskId?: string;
@@ -119,8 +134,7 @@ export interface SendInput {
   run?: string;
 }
 
-export interface CheckInput {
-  terminal?: string;
+export interface CheckInput {  terminal?: string;
   run?: string;
   ack?: string;
   mode?: "unread" | "peek" | "all";
@@ -222,6 +236,11 @@ export class OrcaClient {
     return this.call(["status"]);
   }
 
+  /** `orca skills installed` — インストール済み skill の selector 一覧(read-only)。 */
+  skillsInstalled(): Promise<JsonObject> {
+    return this.call(["skills", "installed"]);
+  }
+
   /** `orca worktree list` — Orca 管理ワークツリーの一覧。 */
   worktreeList(input: WorktreeListInput = {}): Promise<JsonObject> {
     const args = ["worktree", "list"];
@@ -310,6 +329,13 @@ export class OrcaClient {
     return this.call(args);
   }
 
+  /** `orca orchestration gate-resolve` — pending の判断ゲートを承認/却下で解決する。 */
+  gateResolve(input: GateResolveInput): Promise<JsonObject> {
+    const args = ["orchestration", "gate-resolve", "--id", input.id, "--resolution", input.resolution];
+    if (input.from !== undefined) args.push("--from", input.from);
+    return this.call(args);
+  }
+
   /** `orca orchestration task-create` */
   taskCreate(input: TaskCreateInput): Promise<JsonObject> {
     const args = ["orchestration", "task-create", "--spec", input.spec];
@@ -370,7 +396,10 @@ export class OrcaClient {
     if (input.setup !== undefined) args.push("--setup", input.setup);
     if (input.run !== undefined) args.push("--run", input.run);
     if (input.from !== undefined) args.push("--from", input.from);
-    return this.call(args);
+    // worker-start は worktree 作成 + setup hook 実行 + エージェント起動 + 初ターン観測まで
+    // 同期で行う(実機で 30s を超えた)。既定 30s の transport timeout だと SIGKILL になるため、
+    // このコマンドだけ transport 側の上限を大きく取る。
+    return this.call(args, { timeoutMs: WORKER_START_TIMEOUT_MS });
   }
 
   /** `orca orchestration dispatch-show` — タスクの dispatch 状況。 */
@@ -388,6 +417,7 @@ export class OrcaClient {
     if (input.run !== undefined) args.push("--run", input.run);
     if (input.body !== undefined) args.push("--body", input.body);
     if (input.type !== undefined) args.push("--type", input.type);
+    if (input.outcome !== undefined) args.push("--outcome", input.outcome);
     if (input.priority !== undefined) args.push("--priority", input.priority);
     if (input.threadId !== undefined) args.push("--thread-id", input.threadId);
     if (input.taskId !== undefined) args.push("--task-id", input.taskId);
