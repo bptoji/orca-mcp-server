@@ -26,7 +26,7 @@ export function registerJobTools(server: McpServer, client: OrcaClient): void {
     {
       title: "Orca Delegate Task",
       description:
-        "ゴールを Commander Agent に委譲する(非同期 submit / Commander API)。内部で run-create(run 未指定時) → task-create(固定の Commander 指示 + goal + repo + constraints を spec に焼く) → worker-start --worktree new-child --agent <commanderAgent>(既定 codex) を行い、Commander の完了を待たずに { taskId, state: \"running\", commander: true } を返す。Commander がゴールを分解して supervised worker へ差配するので、利用者が個々のワーカーやターミナルを直接指定することはない(terminal / worktree は受け付けない)。worker-start だけ失敗してもタスクは生き、state: \"queued\" + warnings を返す(queued は放置しても進まない)。repo は repo セレクタで渡すこと — id:<repoId> / path:<repo home> は解決できるが、worktree の displayName や worktree path は repo_not_found になる(現在の worktree の repoId は orca worktree current --json の result.worktree.repoId)。",
+        "ゴールを Commander Agent に委譲する(非同期 submit / Commander API)。内部で run-create(run 未指定時) → task-create(固定の Commander 指示 + goal + repo + constraints を spec に書き込み) → worker-start --worktree new-child --agent <commanderAgent>(既定 codex) を行い、Commander の完了を待たずに { taskId, state: \"running\", commander: true } を返す。Commander がゴールを分解して supervised worker へ差配するので、利用者が個々のワーカーやターミナルを直接指定することはない(terminal / worktree は受け付けない)。worker-start だけ失敗してもタスクは生き、state: \"queued\" + warnings を返す(queued は放置しても進まない)。repo は repo セレクタで渡すこと — id:<repoId> / path:<repo home> は解決できるが、worktree の displayName や worktree path は repo_not_found になる(現在の worktree の repoId は orca worktree current --json の result.worktree.repoId)。",
       inputSchema: delegateTaskInputSchema,
       annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
     },

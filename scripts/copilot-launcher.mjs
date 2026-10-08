@@ -1,4 +1,4 @@
-// copilot worker 用の最小 launcher: COPILOT_ALLOW_ALL=true を焼いて copilot を起動し、終了を待つだけ。
+// copilot worker 用の最小 launcher: COPILOT_ALLOW_ALL=true を設定して copilot を起動し、終了を待つだけ。
 //
 // 動機(2026-10-08 実測): supervised worker の起動が `agent_readiness` で
 // `Agent startup blocked: agent-trust-workspace` に落ちる。pane には
@@ -6,13 +6,13 @@
 // dispatch 経由の注入が届かないため MCP 側・自動化側から答えられない。
 //
 // 実測で解けたのは env だけ:
-//   `COPILOT_ALLOW_ALL=true`(正確に "true") は「working directory を促しなしで信頼する」
+//   `COPILOT_ALLOW_ALL=true`(正確に "true") は「working directory を確認なしで信頼する」
 //   (copilot help environment)。他の truthy 表記("1" / "yes" / "on")はツールの自動承認だけで trust が残る。
 //   `--add-dir .` / `--allow-all-paths` / `--allow-all-tools` では trust プロンプトは消えなかった。
 //   `~/.copilot` の trustedFolders は親ディレクトリを信頼しても子 worktree に効かない(完全一致)。
 //   Orca 側に `agentDefaultEnv` キーは存在するが UI からの設定経路が見つかっていない(実測)。
 //
-// なので dsh と同じ launcher 経路で焼く: agentCmdOverrides.copilot = node、
+// なので dsh と同じ launcher 経路で設定する: agentCmdOverrides.copilot = node、
 // agentDefaultArgs.copilot = "このファイル" <copilot への追加引数…>。
 // 追加引数はそのまま copilot に転送する(例: --allow-all-tools)。
 //

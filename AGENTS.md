@@ -41,7 +41,7 @@ tests/              # vitest。子プロセスを実際に起動しない(モッ
 scripts/
   e2e.mjs           # 実ランタイム E2E(stdio でサーバーを起動し submit→poll→gate→result→cancel)
   dsh-tui-launcher.mjs    # dsh worker の既定: dsh-tui を起動して待つだけの最小 launcher
-  copilot-launcher.mjs    # copilot worker 用: COPILOT_ALLOW_ALL=true を焼いて copilot を起動する最小 launcher
+  copilot-launcher.mjs    # copilot worker 用: COPILOT_ALLOW_ALL=true を設定して copilot を起動する最小 launcher
   dsh-acp-worker.mjs      # Orca 注入 → ACP session/prompt に載せ直すブリッジ(ACP 機能が要る時)
   dsh-headless-worker.mjs # Orca 注入 → dsh --profile headless の argv に載せ直すブリッジ(1 タスク 1 プロセス)
 docs/
@@ -76,9 +76,9 @@ docs/
 - このツールは常に Commander を起動する。既存 terminal / worktree への直接 dispatch が必要なら
   内部用の `tools/delegate.ts` を使う(公開しない)。
 - `prompt` という語は使わない。Commander へ課する制約は `constraints: string[]` で、
-  `COMMANDER_PROMPT` の Constraints 欄に箇条書きで焼く。
+  `COMMANDER_PROMPT` の Constraints 欄に箇条書きで書き込む。
 - `COMMANDER_PROMPT` には「orchestration を変更する前に `orca skills get orchestration --full` を
-  読み、記憶した CLI 構文を使わない」という Orca 公式の推奨を固定で焼く。
+  読み、記憶した CLI 構文を使わない」という Orca 公式の推奨を固定で書き込む。
 - 作業ワーカーの選択は Commander 側。MCP 側の語彙は `commanderAgent`(= どの Commander を起動するか)。
 - **`commanderAgent` は Orca 側で設定されたエージェント名のみ**(`worker-start --agent` の制約)。
   実機で `"dsh headless"` は `agent_unconfigured`。launcher 登録前の `dsh`(dsh-tui 直接起動)は
@@ -127,7 +127,7 @@ docs/
 - **報告の本体は `worker_done`**。dispatch 生存中の `task-update --status completed` は CLI が拒否する
   (実測: "cannot move to completed while supervised Dispatch … is active")。`task-update` は
   dispatch が無い / 落ちた後の事後報告専用。
-- **dsh の LLM はローカルゲートウェイへ焼ける**(key 不要)。手宣言ルートで `apiKeyEnv` を省くと
+- **dsh の LLM はローカルゲートウェイへ設定する**(key 不要)。手宣言ルートで `apiKeyEnv` を省くと
   pi-ai が `No API key for provider` で落とすので、`headers: {Authorization: Bearer local}` で
   通す(pi-ai の `getClientApiKey` が非空 authorization を `"unused"` として採用する)。
 - **エージェント側の承認プロンプトが E2E の最大の停止点**(claude / codex とも実測)。
@@ -167,12 +167,12 @@ docs/
 - **copilot の起動停止は folder trust**(2026-10-08 実測)。未設定の worker は `agent_readiness` で
   `Agent startup blocked: agent-trust-workspace` に落ち、pane に
   「Confirm folder trust … Do you trust the files in this folder?」が出る(dispatch 経由の注入が届かない)。
-  **解除できるのは env `COPILOT_ALLOW_ALL=true` だけ**だった(実測: pane の促しが消える):
-  `--add-dir .` / `--allow-all-paths` / `--allow-all-tools` では促しは消えず、`trustedFolders` は親ディレクトリを
+  **解除できるのは env `COPILOT_ALLOW_ALL=true` だけ**だった(実測: pane の確認表示が消える):
+  `--add-dir .` / `--allow-all-paths` / `--allow-all-tools` では確認表示は消えず、`trustedFolders` は親ディレクトリを
   信頼しても子 worktree に効かない(完全一致。`copilot config trustedFolders` は `Unknown settings key segment`)。
   値は正確に `true` であることが効く(`1` / `yes` / `on` はツール自動承認だけで trust が残る)。
   `agentDefaultEnv` キーは `orca-data.json` に存在するが(goose の空エントリのみ)UI からの設定経路が
-  見つかっていないので、**launcher(`scripts/copilot-launcher.mjs`)で env を焼く**。
+  見つかっていないので、**launcher(`scripts/copilot-launcher.mjs`)で env を設定して起動する**。
 - **copilot は共有 skills root を読む**(2026-10-08 実測)。`copilot skill list` の "Personal skills" に
   `orchestration` と `orca-cli` が並び、源は `~/.agents/skills/`。なので `orca_readiness` の
   `SHARED_SKILLS_ROOT_AGENTS` に copilot を含める(dsh と同じ型)。
@@ -241,7 +241,7 @@ docs/
 - poll は worker の `projection.attention.requiresAction` を `attentionRequired` / `attentionNotes`
   (行には `attentionCategories`)として出す。ゲートが pending でないのに止まる典型はエージェント側の
   ツール承認プロンプト(E2E 実測)。Commander Prompt には「答えられない承認待ちで止めない / 新しい Run を
-  作らない(Run ownership、子 task は `--parent` 自分の task)」を固定で焼く。
+  作らない(Run ownership、子 task は `--parent` 自分の task)」を固定で書き込む。
 - 出力は既定で切り詰める(`specPreview` 200 字、worker 出力 4000 字、agents の prompt 200 字)。
 
 ## 登録ツール(現状)
