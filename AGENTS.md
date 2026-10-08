@@ -1,4 +1,4 @@
-﻿# AGENTS.md — orca-mcp
+# AGENTS.md — orca-mcp
 
 このリポジトリは **Orca CLI をラップする MCP サーバー** です。
 目的は **コーディングのゴールを Commander エージェントと supervised なマルチエージェントワーカーへ
@@ -129,12 +129,32 @@ docs/
 - **エージェント側の承認プロンプトが E2E の最大の停止点**(claude / codex とも実測)。
   `orca terminal send` は承認プロンプトへの入力を `agent_prompt_blocked` で拒否するため、
   MCP 側・自動化側から解除できない(人間が UI で答える)。E2E を通すならエージェント側の許可設定を
-  先に緩める(Claude: `Bash(orca:*)` allow / Codex: 下記)。
+  先に緩める(Claude: 下記 / Codex: 下記)。
 - **codex の承認は `--approve-for-me` で解く**(2026-10-08 実測・本運用)。`agentDefaultArgs.codex` に設定すると
   承認要求が workspace-write sandbox の自動レビューへ流れて停止しない。`approval_policy="never"` +
   `sandbox_mode="workspace-write"` は**逆効果**(コマンドが自動拒否され「blocked by policy」)。
   `--dangerously-bypass-approvals-and-sandbox` は通るが sandbox を完全に外す最終手段。
   `~/.codex/config.toml` の変更は不要(実行後に復元した)。
+- **claude の承認は Orca 側の `agentDefaultArgs.claude` で解く**(2026-10-08 実測・worker 完走)。
+  `--permission-mode acceptEdits --allowedTools Bash Read Edit Write Glob Grep` で承認停止ゼロ
+  (`worker-start ready` → `poll#13 completed`、pane に `⏵⏵ accept edits on`)。セッション限定なので
+  claude 全体の設定を変えなくてよい。**`--allowedTools` はツール名そのもの(`Bash`)で許可する**こと:
+  `Bash(orca:*)` のプレフィックス指定は複合コマンドの全サブコマンド要求に負けて
+  `orca skills get orchestration --full 2>&1 | head -300` が `head` で承認停止した(実測)。
+  カンマ区切りは空白を含まないので Orca の引数分割で 1 要素として届く。
+  `--permission-mode` の choices は 2.1.293 実機 help で `acceptEdits / auto / bypassPermissions / manual / dontAsk / plan`。
+  `~/.claude/settings.json` の `permissions.allow` + `permissions.defaultMode`(実測で完走:
+  `Bash(orca:*)` 等 + `acceptEdits`)でも解けるが、**そのマシン全体の claude に効く**ので運用側は
+  `agentDefaultArgs` を既定にする。`--dangerously-skip-permissions` / `bypassPermissions` は全面バイパスの最終手段。
+- **`--permission-mode auto` はローカルゲートウェイ経由で使えない**(2026-10-08 実測)。pane には
+  `⏵⏵ auto mode on` と出る(設定は届く)が、起動時に「this session isn't eligible because your requests go
+  through <gateway>」の notice で Enter 待ち(`orca terminal send --text "\n"` は ok:true で解除できる)、
+  以降 `The auto-mode safety classifier timed out` / 「Both shells are gated by the same unavailable
+  classifier」で shell・Write が gate され続け 28 分 poll しても未完了。ゲートウェイが safeguards contract を
+  実装する必要がある。`dontAsk` は未承認を自動拒否(止まらないが仕事も落ちる)。
+- **claude の `Login expired` / `Not logged in` は権限ではなく auth 切れ**(2026-10-08 実測)。この状態の worker は
+  `dispatched` のまま進まない(pane にエラーが出る)。Orca 側のアカウント紐づけで解消した。pane 側には
+  user スコープの `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` が必要(プロセス env スナップショットだと欠ける)。
 - **`repo` は repo セレクタ**(E2E 実機確認): `id:<repoId>` / `path:<repo home>` は解決できるが、
   worktree の displayName(`name:weever`)や worktree path は `repo_not_found`。repoId は
   `orca worktree current --json` の `result.worktree.repoId`。

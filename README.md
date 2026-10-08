@@ -1,4 +1,4 @@
-﻿# orca-mcp
+# orca-mcp
 
 [Orca](https://github.com/stablyai/orca) の CLI(`orca`)を MCP 経由で操作するための MCP サーバーです。
 
@@ -110,18 +110,15 @@ providers 列挙にそのエージェント名は出ない)。`orca_delegate_tas
 | 目的 | 設定 |
 | --- | --- |
 | **codex を Commander / Worker に(既定)** | `agentDefaultArgs.codex = --approve-for-me` を推奨。これがないと Codex 側の**承認プロンプト**でジョブが止まります |
-| **claude を Commander / Worker に** | タスク遂行は問題なし。`orca skills get …` などの**ツール承認プロンプト**で止まりやすいので `Bash(orca:*)` を allow しておく |
+| **claude を Commander / Worker に** | `agentDefaultArgs.claude = --permission-mode acceptEdits --allowedTools Bash Read Edit Write Glob Grep`。設定なしだと `orca skills get …` などの**ツール承認プロンプト**でジョブが止まります |
 | **dsh を Worker に** | `agentCmdOverrides.dsh = node "C:\<repo-dir>\orca-mcp\scripts\dsh-tui-launcher.mjs"` |
 | **dsh を ACP 機能付きで**(任意) | `agentCmdOverrides.dsh = node "C:\<repo-dir>\orca-mcp\scripts\dsh-acp-worker.mjs"` — 下の [ACP ブリッジ](#dsh-を-acp-で動かす任意のブリッジ) |
 | **対話で dsh-tui を使う** | 設定不要。`dst .`(エイリアス)で起動すれば `agentCmdOverrides` を通しません |
 
 - `"dsh headless"` のような追加引数は `agent_unconfigured` で拒否されます。
 - 承認プロンプトは **MCP 側から解除できません**。`orca terminal send` はエージェントの承認プロンプトへの
-  入力を `agent_prompt_blocked` で拒否します(人間が UI で答える設計)。
-- codex の承認は `--approve-for-me` で解きます(承認要求が workspace-write sandbox の自動レビューへ流れ、
-  sandbox を保ったまま通ります)。`approval_policy="never"` + `sandbox_mode="workspace-write"` は
-  **逆効果**(コマンドが自動拒否され「blocked by policy」)。`--dangerously-bypass-approvals-and-sandbox` は
-  通りますが sandbox を完全に外す最終手段です。
+  入力を `agent_prompt_blocked` で拒否します(人間が UI で答える設計)。上の設定で事前に潰してください。
+  設定の根拠・実測の経緯は [AGENTS.md](./AGENTS.md) にまとめてあります。
 
 ---
 
@@ -410,7 +407,8 @@ poll を打ち切る前に数回待ってください。**launcher 運用では�
 | --- | --- | --- |
 | `state: "queued"` から進まない | worker-start 失敗(dispatch が無く Commander 未起動) | `nextAction` の指示どおり delegate し直すか cancel する |
 | `state: "failed"` / `stage: "agent_readiness"` | pane に生きたプロセスが見えていない(dsh) | `agentCmdOverrides.dsh` を launcher に向ける。`workerReportPending: true` なら報告を待つ |
-| `running` のまま progress が止まる | エージェントの**ツール承認プロンプト**で worker が停止 | `attentionNotes` をたどって pane を確認。codex は `--approve-for-me`、claude は `Bash(orca:*)` allow |
+| `running` のまま progress が止まる | エージェントの**ツール承認プロンプト**で worker が停止 | `attentionNotes` をたどって pane を確認。codex は `--approve-for-me`、claude は `agentDefaultArgs.claude` の `--permission-mode acceptEdits --allowedTools Bash …` |
+| claude の worker が `dispatched` のまま動かない、pane に `Not logged in` | claude の auth 切れ(権限設定ではない) | Orca 側のアカウント紐づけ / pane で `/login` |
 | `blocked` / `phase: "decision_gate"` | 承認ゲート待ち | `orca_resolve_gate({ gateId, resolution, run })` で進める |
 | `consumer_fenced` | 呼び出し元の Run バインドが対象と違う | 介入ツールは自動で `run-use` して 1 回だけ再試行します。worker 側なら自分の terminal を 1 回バインド |
 | `repo_not_found` | worktree の `name:` / worktree path を渡した | `id:<repoId>` か `path:<repo home>` を使う(repoId は `orca worktree current --json`) |
@@ -488,6 +486,8 @@ node scripts/e2e.mjs --repo id:<repoId> --agent claude --cleanup
 
 E2E は `--agent codex`(`agentDefaultArgs.codex = "--approve-for-me"`)で完走を確認済みです
 (readiness ok → delegate running → poll 6 回で completed → result → cancel `fullyStopped: true`)。
+worker 単体の完走は claude でも確認済みです(2026-10-08、上の `agentDefaultArgs.claude` 設定で
+`worker-start ready` → 承認停止ゼロ → `poll#13 completed`)。
 
 ### 開発上の決まり(抜粋)
 
