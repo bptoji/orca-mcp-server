@@ -1,4 +1,6 @@
 // dsh --profile acp を Orca supervised worker / Commander にするブリッジ。
+// **既定の launcher は dsh-tui-launcher.mjs**(dsh-tui を起動するだけで readiness を通せる実測あり)。
+// ここを使うのは ACP 側の機能が要るとき(権限要求の機械応答 / MCP 注入 / マルチターン / モデル指定)。
 //
 // 背景(実機で確認した事実):
 //   dsh --profile acp は ACP(Agent Client Protocol)の JSON-RPC stdio サーバー。
@@ -25,8 +27,18 @@
 //   DSH_ACP_MCP          ACP の mcpServers 配列を JSON で(例: orca-mcp を注入)
 //   DSH_ACP_IDLE_EXIT_MS ターン後に次の注入を待つ上限(既定 30 分)
 //   DSH_ACP_MAX_TURNS    1 プロセスで回すターン上限(既定 40)
+//   DSH_ACP_QUICK_FIRST_MS 起動直後の注入 probe(既定 1.5 秒)
+//   DSH_ACP_LOOKUP_MS    dispatch 照合の上限(既定 180 秒。worker の dispatch は readiness
+//                        失敗後 ~110 秒で見える。短くすると worker pane が対話に落ちる)
+//   DSH_ACP_TUI_BIN / DSH_ACP_TUI_ARGS 対話フォールバックで起動する dsh-tui と引数
+//   DSH_ACP_NO_FALLBACK  =1 で対話フォールバック無効(タスク取得失敗で終了)
+//   DSH_ACP_LOG          ログファイル(既定 <tmp>/dsh-acp-worker.log)
+//
+// 対話で dsh-tui を使いたい人はブリッジを通さない `dst .`(agentCmdOverrides に引っかからない)。
 import { execFileSync, spawn, spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { once } from "node:events";
+import { existsSync, appendFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 
 const PROFILE = process.env.DSH_ACP_PROFILE ?? "acp";
@@ -34,12 +46,32 @@ const PERMISSION = process.env.DSH_ACP_PERMISSION ?? "allow_once";
 const IDLE_EXIT_MS = Number(process.env.DSH_ACP_IDLE_EXIT_MS ?? 30 * 60_000);
 const MAX_TURNS = Number(process.env.DSH_ACP_MAX_TURNS ?? 40);
 const FIRST_CHUNK_MS = Number(process.env.DSH_ACP_FIRST_CHUNK_MS ?? 20_000);
+// worker 起動(Orca が launch token を注入する)ではない pane では、注入を待たずに
+// dsh-tui へ素通しする。対話で dsh-tui を使いたい場合の使い分け(README 参照)。
+const QUICK_FIRST_MS = Number(process.env.DSH_ACP_QUICK_FIRST_MS ?? 1_500);
+// dispatch 照合の上限。worker の dispatch が assignee 付きで「見える」のは readiness が
+// 失敗した後(pane 起動から ~110 秒)。ここを短くすると worker pane が対話フォールバックに
+// 落ちる(20 秒 / 120 秒で実測デグレ)。対話で dsh-tui を使いたい人の正解は `dst .`(README 参照)。
+const LOOKUP_MS = Number(process.env.DSH_ACP_LOOKUP_MS ?? 180_000);
+const NO_FALLBACK = process.env.DSH_ACP_NO_FALLBACK === "1";
+const TUI_BIN = process.env.DSH_ACP_TUI_BIN ?? "";
+const TUI_ARGS = (process.env.DSH_ACP_TUI_ARGS ?? ".").split(" ").filter(Boolean);
+const LAUNCH_TOKEN = process.env.ORCA_AGENT_LAUNCH_TOKEN ?? "";
 const IDLE_MS = Number(process.env.DSH_ACP_IDLE_MS ?? 4_000);
 const MAX_MS = Number(process.env.DSH_ACP_MAX_MS ?? 180_000);
 const TAG = "dsh-acp-worker";
-
-const log = (...parts) => console.log(`[${TAG}]`, ...parts);
-const warn = (...parts) => console.log(`[${TAG}]`, ...parts);
+// pane の tail は古い行が流れるので、同じログをファイルにも積む(診断用)。
+const LOG_FILE = process.env.DSH_ACP_LOG ?? join(tmpdir(), "dsh-acp-worker.log");
+const log = (...parts) => {
+  const line = `[${TAG} ${new Date().toISOString().slice(11, 19)} pid=${process.pid}] ${parts.join(" ")}`;
+  console.log(line);
+  try {
+    appendFileSync(LOG_FILE, `${line}\n`);
+  } catch {
+    // ログファイルが書けなくても worker は止めない
+  }
+};
+const warn = (...parts) => log(...parts);
 
 // --- 1. dsh の Node エントリを解決(グローバル npm root、無ければ PATH 上のシムから導く)
 const resolveDshBin = () => {
@@ -62,10 +94,40 @@ const resolveDshBin = () => {
   return candidates.find((candidate) => existsSync(candidate)) ?? null;
 };
 
-// --- 2. stdin を「注入された 1 塊」として拾う(PTY なので EOF を待たない)
+// --- 2. dsh-tui の Node エントリを解決(対話フォールバック用。シムは .cmd なので shell は使わない)
+const resolveTuiBin = () => {
+  if (TUI_BIN.length > 0) {
+    return existsSync(TUI_BIN) ? TUI_BIN : null;
+  }
+  const candidates = [];
+  try {
+    const npmShim = process.platform === "win32" ? "npm.cmd" : "npm";
+    const root = spawnSync(npmShim, ["root", "-g"], { encoding: "utf8" }).stdout.trim();
+    if (root) {
+      candidates.push(join(root, "@deepseek-harness-tui", "dsh-tui", "bin", "dsh-tui.js"));
+      candidates.push(join(root, "node_modules", "@deepseek-harness-tui", "dsh-tui", "bin", "dsh-tui.js"));
+    }
+  } catch {
+    // npm が無い環境では PATH 経路だけを見る
+  }
+  for (const dir of (process.env.PATH ?? "").split(delimiter)) {
+    if (!dir) continue;
+    candidates.push(join(dir, "node_modules", "@deepseek-harness-tui", "dsh-tui", "bin", "dsh-tui.js"));
+  }
+  return candidates.find((candidate) => existsSync(candidate)) ?? null;
+};
+
+// 対話フォールバックで起動した子がすでに終わっていることがある(panic 等)ので、
+// 終了済みなら待たない。
+const childDone = (child) =>
+  child.exitCode !== null || child.signalCode !== null
+    ? Promise.resolve()
+    : once(child, "exit").then(() => undefined).catch(() => undefined);
+
+// --- 3. stdin を「注入された 1 塊」として拾う(PTY なので EOF を待たない)
 // 注入は agent readiness の後に行われるため、起動直後の idle で切ると空で終わる(実測)。
 // 1 塊を捕まえた以降は idle で締める。呼び出しごとにハンドラを付け外しして再利用する。
-const readInjected = ({ firstMs, idleMs, maxMs }) =>
+const readInjected = ({ firstMs, idleMs, maxMs, drainMs = 0 }) =>
   new Promise((resolve) => {
     const startedAt = Date.now();
     let buffer = "";
@@ -88,6 +150,13 @@ const readInjected = ({ firstMs, idleMs, maxMs }) =>
       idleTimer = setTimeout(() => finish("idle"), idleMs);
     };
     const onData = (chunk) => {
+      // 対話フォールバックの dsh-tui を殺した直後、マウス追跡等の CSI が stdin に漏れる(実測)。
+      // drainMs の間のデータは捨てる(注入は readiness の後に来るので実害なし)。
+      if (drainMs > 0 && elapsed() < drainMs) {
+        log(`stdin drain 破棄 +${chunk.length}字 elapsed=${elapsed()}ms`);
+        buffer = "";
+        return;
+      }
       buffer += chunk;
       log(`stdin chunk +${chunk.length}字 elapsed=${elapsed()}ms`);
       armIdle();
@@ -130,19 +199,28 @@ const currentWorktreePath = () => {
 
 const resolveMyTask = async (deadlineMs = 90_000) => {
   const deadline = Date.now() + deadlineMs;
-  while (Date.now() < deadline) {
+  // 1 回の試行が deadline を大きく超えると(実行中の run が多いとき)、対話フォールバックが
+  // 止まる。内側のループでも deadline を見る。
+  const outOfTime = () => Date.now() > deadline;
+  while (!outOfTime()) {
     try {
       const myPath = normalizePath(runOrca(["worktree", "current", "--json"]).worktree?.path);
       const terminals = runOrca(["terminal", "list", "--json"]).terminals ?? [];
       const mine = terminals.find((row) => normalizePath(row.worktreePath) === myPath);
       if (mine?.handle) {
-        // task-list は Run バインドが必要。このターミナルは未バインドなので run-list から辿る
-        const runs = runOrca(["orchestration", "run-list", "--limit", "20", "--json"]).runs ?? [];
+        // task-list は Run バインドが必要。このターミナルは未バインドなので run-list から辿る。
+        // 新しい Run 4 本だけ(worker の dispatch は直近の Run にある)。広く回すと 1 周が
+        // 20-30 秒になり、worker-start が完了した瞬間を素通りして取り逃す(実測デグレ)。
+        const runs = (runOrca(["orchestration", "run-list", "--limit", "10", "--json"]).runs ?? [])
+          .filter((row) => typeof row?.id === "string")
+          .sort((a, b) => String(b?.created_at ?? "").localeCompare(String(a?.created_at ?? "")))
+          .slice(0, 4);
         for (const runRow of runs) {
-          const runId = typeof runRow?.id === "string" ? runRow.id : null;
-          if (!runId) continue;
+          if (outOfTime()) break;
+          const runId = runRow.id;
           const tasks = runOrca(["orchestration", "task-list", "--run", runId, "--json"]).tasks ?? [];
           for (const row of tasks) {
+            if (outOfTime()) break;
             if (typeof row.id !== "string") continue;
             const dispatch = runOrca(["orchestration", "dispatch-show", "--task", row.id, "--json"]).dispatch;
             if (dispatch?.assignee_handle !== mine.handle) continue;
@@ -156,7 +234,8 @@ const resolveMyTask = async (deadlineMs = 90_000) => {
     } catch (error) {
       warn(`逆引き試行: ${error instanceof Error ? error.message : String(error)}`);
     }
-    await new Promise((sleepResolve) => setTimeout(sleepResolve, 5_000));
+    if (outOfTime()) break;
+    await new Promise((sleepResolve) => setTimeout(sleepResolve, 3_000));
   }
   return null;
 };
@@ -340,20 +419,65 @@ const cwd = currentWorktreePath();
 log(`dsh bin = ${dshBin}`);
 log(`worktree cwd = ${cwd}`);
 
-let firstText = await readInjected({ firstMs: FIRST_CHUNK_MS, idleMs: IDLE_MS, maxMs: MAX_MS });
+// 判定: 注入が来なければ dsh-tui を**先に起動**しつつ、並行して dispatch を照合する。
+//   対話 pane  → 照合は空のまま → そのまま TUI で作業できる(起動を待たせない)
+//   worker pane → 照合が当たる(worker の dispatch が見えるのは readiness 失敗後 ~110 秒、
+//                  worker-start が完了する ~170 秒の窓がある)→ TUI を止めて worker モードへ
+// launch token は対話 pane にも入る(実測)ので判定には使わない(診断表示のみ)。
+const workerMarked = LAUNCH_TOKEN !== "";
+log(`launch token = ${workerMarked ? "あり" : "なし"}`);
+
+const tuiBin = NO_FALLBACK ? null : resolveTuiBin();
+let firstText = await readInjected({ firstMs: QUICK_FIRST_MS, idleMs: IDLE_MS, maxMs: MAX_MS });
 let found = null;
+let interactiveChild = null;
+
 if (firstText.length === 0) {
-  log("stdin が空なので Orca 側から逆引きします");
-  found = await resolveMyTask();
-  firstText = found ? buildPreamble(found) + found.spec : "";
-} else {
-  // 注入されたテキストにも報告の指針を添える(dispatch / task が逆引きできる場合だけ)。
-  // 注入が既に来ているので、逆引きは短時間で切る(90 秒ぶん待つ必要はない)
-  found = await resolveMyTask(20_000);
-  firstText = found ? `${buildPreamble(found)}${firstText}` : firstText;
+  if (tuiBin !== null) {
+    log(`対話フォールバックを先読みで起動します ${tuiBin}`);
+    interactiveChild = spawn(process.execPath, [tuiBin, ...TUI_ARGS], {
+      cwd,
+      stdio: "inherit",
+      windowsHide: true,
+    });
+    interactiveChild.on("error", (error) => {
+      warn(`dsh-tui 起動失敗 ${error instanceof Error ? error.message : String(error)}`);
+    });
+  }
+  found = await resolveMyTask(LOOKUP_MS);
+  log(found ? `照合結果: task=${found.taskId} dispatch=${found.dispatchId}` : `照合上限 ${LOOKUP_MS}ms で dispatch なし`);
+  if (found === null) {
+    if (interactiveChild === null) {
+      console.error(`${TAG}: タスクを取得できませんでした(注入も dispatch 照合も空)`);
+      process.exit(2);
+    }
+    // 対話 pane: TUI が終わるまでここで待つ
+    await childDone(interactiveChild);
+    process.exit(0);
+  }
+  if (interactiveChild !== null) {
+    log("worker と判明 — 対話プロセスを止めて worker モードへ");
+    interactiveChild.kill();
+    await childDone(interactiveChild);
+    // dsh-tui が仕込んだマウス追跡/代替画面を元に戻す(殺した後の漏れ対策)
+    process.stdout.write("\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1049l\x1b[2J\x1b[H");
+  }
+  process.stdin.resume();
+  firstText = await readInjected({
+    firstMs: FIRST_CHUNK_MS,
+    idleMs: IDLE_MS,
+    maxMs: MAX_MS,
+    drainMs: interactiveChild !== null ? 1_000 : 0,
+  });
 }
 if (firstText.length === 0) {
-  console.error(`${TAG}: タスクを取得できませんでした(stdin 注入も逆引きも空)`);
+  firstText = found ? buildPreamble(found) + found.spec : "";
+} else if (found !== null) {
+  // 注入されたテキストにも報告の指針を添える(dispatch / task が逆引きできた場合だけ)
+  firstText = `${buildPreamble(found)}${firstText}`;
+}
+if (firstText.length === 0) {
+  console.error(`${TAG}: タスクを取得できませんでした(注入も dispatch 照合も空)`);
   process.exit(2);
 }
 
