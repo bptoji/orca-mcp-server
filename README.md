@@ -1,26 +1,64 @@
-# orca-mcp
+﻿# orca-mcp
 
-[Orca](https://github.com/stablyai/orca) の CLI(`orca`)を MCP 経由で操作するための
-MCP サーバーです。**コーディングのゴールを Commander エージェントと supervised な
-マルチエージェントワーカーへ委譲する、Orca CLI のオーケストレーションゲートウェイ**として、
-タスク委譲・進捗確認・判断ゲート解決・キャンセルを MCP クライアント
-(Claude Code / Claude Desktop / dsh など)から利用できます。
+[Orca](https://github.com/stablyai/orca) の CLI(`orca`)を MCP 経由で操作するための MCP サーバーです。
 
-## 必要環境
+**「この機能を作って」と頼んだら、Orca の中でエージェントが仕事をして、その進捗と結果を受け取れる**
+ゲートウェイです。あなたが渡すのは「作ってほしいもの」と「守ってほしい制約」だけ。
+読み取り・実装・テストは Commander と呼ばれるエージェントが受け持ち、必要なら複数のワーカー
+(Codex / Claude / dsh など)に割り振ります。
+
+利用者の手順は **頼む → 聞く → 受け取る** の 3 つだけです。
+
+| やりたいこと | ツール | 返ること |
+| --- | --- | --- |
+| 頼む | `orca_delegate_task` | `taskId`(即返る。仕事はここで始まる) |
+| 聞く | `orca_get_task_status` | 今の状態と、Commander が分解した子タスク・ワーカーの進捗 |
+| 受け取る | `orca_get_task_result` | 完了後の成果(ワーカー個々の成果も集約できる) |
+| 途中で手を出す(任意) | `orca_send_message` / `orca_resolve_gate` / `orca_cancel_task` | 指示の追加 / ゲートの承認 / 停止 |
+
+**1 回の MCP 呼び出しでワーカーの完了を待つことはありません。**(30 分ブロックし続ける設計にしていません)
+
+```
+あなた(MCP クライアント)
+  → orca_delegate_task        … 「作ってほしいもの」と制約を渡す(即 return)
+  → Commander Agent           … 読み解いて、タスクに分解し、ワーカーに配る
+      → supervised Worker(Codex / Claude / dsh …)
+  → orca_get_task_status      … 進捗を poll(他作業を挟んでよい)
+  → orca_get_task_result      … 完了後に成果を受け取る
+```
+
+MCP クライアント(Claude Code / Claude Desktop / dsh など)から使えます。
+
+## 目次(使う順)
+
+1. [セットアップ](#セットアップ)
+2. [Orca 側のエージェント設定](#orca-側のエージェント設定)(ここで最も詰まります)
+3. [使い方(典型的な流れ)](#使い方典型的な流れ)
+4. [ツールリファレンス](#ツールリファレンス)
+5. [つまったときの引き出し](#つまったときの引き出し)
+6. [開発](#開発)
+
+**dsh を使いたい人**は [dsh を worker に使う](#dsh-を-worker-に使う) を先に読んでください(設定が 1 行必要です)。
+
+---
+
+## セットアップ
+
+### 必要環境
 
 - Node.js **>= 20**(開発は v24 で検証)
 - PATH 上に `orca` CLI(または `ORCA_BIN` 環境変数でバイナリパスを指定)
 - 大半の操作は起動中の Orca ランタイムが必要(未起動なら `orca open`)
 
-## セットアップ
+### インストール
 
 ```bash
 npm install
 npm run build     # src → dist
-npm test          # vitest(子プロセス不要の単体テスト)
+npm test          # vitest(orca ランタイム不要の単体テスト)
 ```
 
-## MCP クライアント設定例
+### MCP クライアントへの登録
 
 ビルド(`npm run build`)後に設定ファイルへ登録します。`<your-user>` と `<repo-dir>` はご自身の環境に読み替えてください。
 
@@ -36,15 +74,76 @@ npm test          # vitest(子プロセス不要の単体テスト)
 ```
 
 macOS / Linux では `"args": ["/home/<your-user>/<repo-dir>/orca-mcp/dist/index.js"]` のように絶対パスで指定します。
+ビルドに依存したくない開発中は `"command": "npx"` + `"args": ["tsx", "src/index.ts"]` でも動きます。
 
-開発中にビルドへ依存したくない場合は `npx tsx src/index.ts` を `command` にしても動きます。
+### 頼む前のチェック
 
-## ツール一覧
+頼む前に `orca_readiness` を実行してください。**何もインストールしません**(勝手に skill を配らない)。
+足りないものは `missing` と、人間が実行する `nextAction` で返ります。
 
-公開 API は **非同期 Job API(submit / poll / result)** を主軸にします。
-**1 回の MCP 呼び出しでワーカーの完了を待ちません**(30 分ブロックのような設計にしない)。
-低レベルすぎる API(`orca_create_worktree` / `orca_start_agent` / `orca_send_terminal` など)は
-外部に出さず、内部実装に隠しています。
+```
+orca_readiness({ commanderAgent: "codex" })
+  → { "ready": false,
+      "checks": [ { "name": "orca runtime", "ok": true, "detail": "app.running=true …" },
+                  { "name": "orchestration enabled", "ok": true, "detail": "capabilities: 12 orchestration.*" },
+                  { "name": "orchestration skill installed", "ok": true, "detail": "installed skills: 319" },
+                  { "name": "orchestration available to codex", "ok": false,
+                    "detail": "orchestration skill providers: agent-skills, claude" } ],
+      "missing": ["orchestration available to codex"],
+      "commanderAgent": "codex",
+      "nextAction": "Run: orca skills install --skill orchestration --agent codex" }
+```
+
+`commanderAgent` を渡すと、そのエージェントが orchestration skill を読めるか(`skills installed` の
+`providers` 列挙)まで見ます。**同じ skill 名の行は union して判定する**(共有 root 経由で読める場合、
+providers 列挙にそのエージェント名は出ない)。`orca_delegate_task` の既定 `commanderAgent` は `codex` です。
+
+---
+
+## Orca 側のエージェント設定
+
+`orca_delegate_task` は `worker-start --agent <commanderAgent>` で Commander を起動します。
+`--agent` に渡せるのは **Orca 側で設定されたエージェント名だけ**です(MCP 側でエージェントの引数を
+組み込むフラグは無い)。設定キーは `agentCmdOverrides` / `agentDefaultArgs` で、**設定は Orca の UI からのみ**
+(CLI からの設定コマンドは無い)。
+
+| 目的 | 設定 |
+| --- | --- |
+| **codex を Commander / Worker に(既定)** | `agentDefaultArgs.codex = --approve-for-me` を推奨。これがないと Codex 側の**承認プロンプト**でジョブが止まります |
+| **claude を Commander / Worker に** | タスク遂行は問題なし。`orca skills get …` などの**ツール承認プロンプト**で止まりやすいので `Bash(orca:*)` を allow しておく |
+| **dsh を Worker に** | `agentCmdOverrides.dsh = node "C:\<repo-dir>\orca-mcp\scripts\dsh-tui-launcher.mjs"` |
+| **dsh を ACP 機能付きで**(任意) | `agentCmdOverrides.dsh = node "C:\<repo-dir>\orca-mcp\scripts\dsh-acp-worker.mjs"` — 下の [ACP ブリッジ](#dsh-を-acp-で動かす任意のブリッジ) |
+| **対話で dsh-tui を使う** | 設定不要。`dst .`(エイリアス)で起動すれば `agentCmdOverrides` を通しません |
+
+- `"dsh headless"` のような追加引数は `agent_unconfigured` で拒否されます。
+- 承認プロンプトは **MCP 側から解除できません**。`orca terminal send` はエージェントの承認プロンプトへの
+  入力を `agent_prompt_blocked` で拒否します(人間が UI で答える設計)。
+- codex の承認は `--approve-for-me` で解きます(承認要求が workspace-write sandbox の自動レビューへ流れ、
+  sandbox を保ったまま通ります)。`approval_policy="never"` + `sandbox_mode="workspace-write"` は
+  **逆効果**(コマンドが自動拒否され「blocked by policy」)。`--dangerously-bypass-approvals-and-sandbox` は
+  通りますが sandbox を完全に外す最終手段です。
+
+---
+
+## 使い方(典型的な流れ)
+
+1. `orca_readiness({ commanderAgent })` — 前提を確認する
+2. `orca_delegate_task({ spec, constraints })` — 頼む(委譲する) → `{ taskId, state: "running" }` を即受け取る
+3. `orca_get_task_status({ taskId })` — 数分おきに poll する(`children` に Commander が分解した子タスクと worker が出る)
+4. 方針を変えたいときだけ `orca_send_message({ subject, body, run, taskId })`
+5. `state: "blocked"` / `phase: "decision_gate"` になったら `orca_resolve_gate({ gateId, resolution, run })`
+6. 取り消すときだけ `orca_cancel_task({ taskId, reason })`(既定で子孫 worker も子から順に止める)
+7. `state: "completed"` になったら `orca_get_task_result({ taskId })`。ワーカー個々の成果まで欲しければ `includeChildren: true`
+8. 状況確認が欲しいときだけ `orca_list_worktrees` / `orca_get_worktree` / `orca_list_agents` / `orca_status`
+
+**poll / result / 観測ツールは変更を一切行いません。** 変更系は `orca_delegate_task` と介入 3 個だけです。
+
+---
+
+## ツールリファレンス
+
+公開 API は 11 個です。低レベルすぎる API(`orca_create_worktree` / `orca_start_agent` /
+`orca_send_terminal` など)は外部に出さず、内部実装に隠しています。
 
 ### Job API
 
@@ -57,7 +156,7 @@ macOS / Linux では `"args": ["/home/<your-user>/<repo-dir>/orca-mcp/dist/index
 ```
 orca_delegate_task({
   spec: "ユーザー認証機能を追加する",
-  repo: "name:my-project",
+  repo: "id:<repoId>",
   constraints: ["既存APIを変更しない", "テストを追加する", "マージはしない"]
 })
   → { "taskId": "task_abc123", "state": "running", "runId": "run_…",
@@ -92,83 +191,39 @@ orca_get_task_result({ taskId: "task_abc123", includeChildren: true })
       ] }
 ```
 
+**読み方の要点**
+
 - `state`: `queued / running / blocked / completed / failed / cancelled`(CLI 生の値は `rawStatus`)
-  - **`cancelled` は MCP 側の論理状態**。Orca 側の task は `status: failed` + `result: "cancelled: <reason>"`
-    で記録される(CLI に native の `cancelled` status が無いため)。デバッグで task 行を見るときは
-    `failed` として見える前提で読んでください
+  - **`cancelled` は MCP 側の論理状態**です。Orca 側の task は `status: failed` +
+    `result: "cancelled: <reason>"` で記録されます(CLI に native の `cancelled` が無い)。
 - `phase`: `queued / starting / implementation / decision_gate / settling / finished`
-  (Commander 配下の worker も含めて推定する)
-- worker-start だけ失敗しても **タスクは生き続ける** → `state: "queued"` + `warnings` で返す
-- CLI 側の失敗はコードごと転送する(例: `run_not_found` + `data.orchestrationRequestId`)
-- `children` は Commander が `task-create` で分解した**直接の子タスク**(direct children、`parent_id` が
-  対象タスクと一致するもの)とその worker。1 回の poll で「Commander の下で何が起きているか」が見える。
-  `childCount` は実件数、`returnedChildCount` が返した件数(上限 20)、`childrenTruncated` で打ち切りを伝える
-- **孫以降(deep DAG)は `children` に現れない**。Commander → child A → grandchild A-1 のような深い構造では、
-  A-1 は child A 自身の poll / result で見る。Commander Prompt は「深い連鎖より並列の波」を推奨しているので
-  MVP では direct children だけで十分としている
-- `attentionRequired` / `attentionNotes` は worker 側の「人間側の対応が必要そう」の合図
-  (`projection.attention.requiresAction`)。ゲートが pending でないのに progress が止まる典型は、
-  エージェントのターミナルに出る**ツール承認プロンプト**で worker が止まっているケース
-  (E2E で `orca skills get orchestration --full` の承認待ちにより `running` のまま停止した)。
-  `attentionNotes` の `terminal(read) で確認` をたどってください
-- `orca_get_task_result` は既定で Commander だけ読む。`includeChildren: true` で**直接の子タスク**の
-  `result` と出力も集約する(子 10 件・worker-read 8 件まで)。孫以降は集約しない
+- `children` は Commander が分解した**直接の子タスク**(`parent_id` 一致)とその worker。
+  `childCount` は実件数、`returnedChildCount` が返した件数(上限 20)、`childrenTruncated` で打ち切りを伝えます。
+  **孫以降は出ません**(その子の poll / result で見る)。
+- `attentionRequired` / `attentionNotes` は worker 側の「人間側の対応が必要そう」の合図。
+  ゲートが pending でないのに progress が止まる典型は、エージェントのターミナルに出る**ツール承認プロンプト**です
+  (`attentionNotes` の `terminal(read) で確認` をたどってください)。
+- `orca_get_task_result` は既定で Commander だけ読みます。`includeChildren: true` で直接の子タスクの
+  `result` と出力も集約します(子 10 件・worker-read 8 件まで)。
+- 大きな欄は既定で切り詰めます(`specPreview` 200 字、worker 出力 4000 字、`orca_list_agents` の `prompt` 200 字)。
 
-#### Job API における委譲の仕組み
+**`repo` の渡し方** — `repo` は **repo セレクタ**です。`id:<repoId>` と `path:<repo home>` は解決できますが、
+worktree の displayName(`name:weever`)や worktree path は `repo_not_found` になります。
+repoId は `orca worktree current --json` の `result.worktree.repoId` で取れます。
 
-`orca_delegate_task` は、外部Agentから受け取ったゴールを Orca 内の Commander Agent に渡す非同期 API です。Commander Agent がゴールを解釈してタスクを分解し、必要に応じて複数の supervised Worker（サブエージェント）へ差配します。
+**`commanderAgent` の条件** — 注入されたプロンプトを**非対話で消費できる**エージェントである必要があります。
+`claude` / `codex` は supervised worker として動作します(承認設定は上の節)。`dsh` は下の
+[dsh の節](#dsh-を-worker-に使う)の設定が必要です。
 
-```text
-外部Agent
-  → orca_delegate_task
-  → Commander Agent
-      → タスク分解・Worker選択・並列実行・レビュー
-      → supervised Worker（Codex / Claude など）
-```
-
-通常の利用では、ゴールと必要な制約だけを渡してください。個々の Worker を直接選択・起動することは、この API の利用者側では行いません。`orca_delegate_task` は **常に Commander を起動する API** で、既存の `terminal` / `worktree` への直接 dispatch は受け付けません(schema が拒否する)。低レベルな直接 dispatch が必要なら内部用の `tools/delegate.ts` を使ってください。
-
-内部では `run-create`（run 未指定時）→ `task-create`（固定の Commander 指示 + goal + repo + constraints を spec へ焼く）→ `worker-start --worktree new-child --agent <commanderAgent>` の順で Commander を起動します。完了を待たずに返された `taskId` を使って `orca_get_task_status` で進捗を確認し、完了後に `orca_get_task_result` で結果を取得してください。
-
-Commander への指示には、Orca 公式の推奨として「orchestration を変更する前に `orca skills get orchestration --full` で現在のバージョンに合った guide を読む」節を固定で焼いています(CLI flag はバージョンで変わるため、記憶した構文を使わせない)。
-
-`worker-start` が失敗した場合もタスクは保持され、`state: "queued"` と `warnings` が返ります。
-`queued` は放置しても進みません(dispatch が無い = Commander 未起動)。`orca_get_task_status` の
-`nextAction` が「delegate し直すか cancel する」を明示するので、そのどちらかを選んでください。
+**worker-start が失敗してもタスクは消えません** — `state: "queued"` + `warnings` で返ります。
+`queued` は放置しても進みません(dispatch が無い = Commander 未起動)。`nextAction` が
+「delegate し直す / cancel する」を明示するので、どちらかを選んでください。
 `worker-start` は worktree 作成 + setup hook + エージェント起動 + 初ターン観測まで同期で走るため、
-このコマンドだけ transport 側の timeout を **180 秒**に広げています(既定 30 秒では SIGKILL された実測あり)。
-
-**`repo` は repo セレクタで渡す**(E2E で実機確認)。`id:<repoId>` と `path:<repo home>` は解決できるが、
-**worktree の displayName(`name:weever`)や worktree の path は `repo_not_found`** になる
-(worktree ではなく repo 側で解決されるため)。現在の worktree から選ぶには
-`orca worktree current --json` の `result.worktree.repoId` を使ってください。
-
-**`commanderAgent` は「注入されたプロンプトを非対話で消費できるエージェント」である必要がある**
-(E2E 実機確認)。`worker-start --agent` は Orca 側で設定されたエージェント名のみ受け付ける:
-
-- `claude` / `codex` — supervised worker として動作する(実機で worker 契約の確認まで完了)
-  - `claude`: タスク遂行は問題なし。`orca skills get …` などの**ツール承認プロンプト**で止まりやすい
-  - `codex`: 注入された preamble + TASK を消費し、`worker_done` を `--outcome` / `--task-id` /
-    `--dispatch-id` 付きで正しく組み立てる。ただし `orca orchestration send` 実行前に
-    **Codex 側の承認プロンプト**が出て、承認されるまで報告が届かない
-    (初回プロンプトも composer に置かれるだけで、Enter が必要だった)
-- `dsh` — 起動はするが **dsh-tui(対話)が起動して dispatch が `failed`** になる(注入プロンプトを消費しない)
-- `dsh headless` のような追加引数は **`agent_unconfigured`** で拒否される(`worker-start` にエージェント
-  引数を渡すフラグが無い)
-
-**承認プロンプトは MCP 側から解雇できない**: `orca terminal send` はエージェントの承認プロンプトへの
-入力を `agent_prompt_blocked` で拒否する(人間が UI で答える設計)。E2E を止めずに通したいなら
-エージェント側の許可設定(Claude Code は `Bash(orca:*)` の allow、Codex は `~/.codex/config.toml` の
-approval policy / allowlist)を先に緩めてください。
-
-`dsh --profile headless "<task>"`(1 タスク回答して stdout に出す)を Commander にしたい場合は、
-その起動コマンドを Orca 側のエージェント設定に登録してから `commanderAgent` で指定してください
-(設定キーは `agentCmdOverrides`、CLI からの設定コマンドは無く UI 設定のみ)。
-**dsh を ACP で supervised worker にする経路は上の「dsh を ACP で動かす」節が本体です。**
+このコマンドだけ transport 側の timeout を **180 秒**に広げています。
 
 ### 介入(intervene)
 
-委譲したジョブに**明示的に頼まれたときだけ**手を出す 3 個です。poll / result / 観測ツールは変更を一切行いません。
+委譲したジョブへ**あなたが明示的に介入を決めたときだけ**使う 3 個です。
 
 | ツール | 役割 | 内部で呼ぶもの | 破壊的? |
 | --- | --- | --- | --- |
@@ -192,120 +247,184 @@ orca_resolve_gate({ gateId: "gate_333059a5ece6", resolution: "approve", run: "ru
 orca_cancel_task({ taskId: "task_abc123", reason: "方針変更" })   // cascade 既定 true
   → { "taskId": "task_abc123", "state": "cancelled", "cancelled": true, "fullyStopped": true,
       "cascade": true, "taskCount": 3, "mode": "stop",
-      "tasks": [ { "taskId": "task_deep", "state": "cancelled", "fenced": [ … ] },
-                 { "taskId": "task_backend", "state": "cancelled", "fenced": [ … ] },
-                 { "taskId": "task_abc123", "state": "cancelled", "fenced": [ … ] } ],
+      "tasks": [ { "taskId": "task_deep", "state": "cancelled", "fenced": [ … ] }, … ],
       "workers": [ { "taskId": "task_deep", "dispatchId": "ctx_…", "action": "stop", "resultState": "stopped" }, … ],
       "warnings": [] }
 ```
 
 - `type` は CLI が受け付ける種別のみ(`status / dispatch / worker_done / merge_ready / escalation /
   handoff / decision_gate / question / heartbeat`)。**`worker_done` には `outcome` と `dispatchId` が必須**
-  (欠ければ `outcome_required` / `dispatch_id_required`)で、`worker_done` 以外に `outcome` を付けると
-  `outcome_not_allowed` — いずれも CLI に叩き合う前に MCP 側で弾く
+  (欠ければ `outcome_required` / `dispatch_id_required`、`worker_done` 以外に `outcome` を付けると
+  `outcome_not_allowed` — いずれも CLI に送る前に MCP 側で弾きます)
 - 宛先 `to` は `run:<id>` / `dispatch:<id>` / `@all` / `@codex` / `@worktree:<id>`、省略時は Run の受信箱
-- MCP 側は Run バインドを持たないので `run`(`orca_delegate_task` が返した `runId`)を渡す
-- **ゲートは Run バインドスコープ**(`gate-resolve` に `--run` が無い)なので `orca_resolve_gate` の
-  `run` は必須。Run に gate が無ければ `gate_not_found`、解決済みなら何もしない(冪等)
-- Commander Prompt は「承認ゲート無しでは merge / push / deploy をしない」と約束しているため、
-  **ゲートを解決する API が無いとジョブが途中で詰まる**(blocked / decision_gate の `nextAction` が指す)
-- **キャンセルは CLI の手順どおり**: worker を fence してから `--status failed --result cancelled`。
-  完了済み・キャンセル済みのタスクには何もしない(冪等、`cancelled: false` + warning)
-- `mode: "abandon"` は `orca orchestration worker-abandon`("Fence a worker without claiming its process
-  stopped" — 生きている可能性のある資源を残し、プロセスにも filesystem にも触らない)に対応する。
-  公開ドキュメントの掲載有無は CLI バージョンで変わるため、**ローカル版での確認を根拠にしている**
-  (実機 1.4.220 で `orca orchestration worker-abandon --help` を確認済み)。迷ったら `stop` を使う
-- **cancel は 2 段階(preflight → mutation)**: まず対象全タスクの dispatch を読み切ってから叩く。
-  1 タスクに dispatch が **3 件を超える場合は何も変更する前に `cancel_dispatch_scope_too_large`** で断る
-  (silent slice で黙って切ると、dispatch を生かしたまま task だけ failed になり `cancelled: true` に見える)。
-  同様に子孫が 12 件を超える場合は `cancel_scope_too_large` — 子孫を 12 件で切ると post-order の末尾である
-  Commander だけが対象から漏れ、「一部しか止めていないのに `cancelled: true`」になるため。
-  `detail` に `taskCount` / `dispatchIds` が出るので、`cascade: false` か個別 cancel を選べる
-- **Commander の worker が止められなければ cancel 成功を返さない**: 対象タスクの fence に 1 件でも
-  失敗したら `cancel_incomplete`(`state: "partial"`, `cancelled: false`, `fullyStopped: false`)で、
-  **対象 task は更新しない**。Commander はこれ以上 orchestration を進める主体なので、走りたままの
-  cancel 宣言は危険(子 worker をさらに作り得る)。子タスクの fence 失敗は `warnings` に留めて進め、
-  `fullyStopped: false` で「実プロセス停止の保証なし」を正直に出す
-- **cancel はジョブ単位**: 既定 `cascade: true` で、Commander が分解した**子孫タスクとその worker を
-  子から順**に止める(親だけ止めて子 Worker を走らせたままにしない)。`cascade: false` なら対象だけ。
-  子タスクの確定失敗は `warnings` に留め、Commander の確定は進める
-- worker fence に失敗しても `warnings` に記録して task のキャンセルは進める。
-  確定だけ失敗したら `cancel_incomplete`(fence 済みの worker 一覧を `detail` に載せる)
-- worktree やターミナルの削除は行わない(残す。後片付けは人間側の判断)
-- **変更系は MCP サーバー内で直列化する**: Run バインドはプロセス共有の状態なので、
-  `run-use` + 再試行の並びを他リクエストと挟まない(並行 cancel で binding が書き換わる競合を避ける)
+- MCP 側は Run バインドを持たないので `run`(`orca_delegate_task` が返した `runId`)を渡してください
+- **ゲートは Run バインドスコープ**(`gate-resolve` に `--run` が無い)なので `orca_resolve_gate` の `run` は必須。
+  Run に gate が無ければ `gate_not_found`、解決済みなら何もしません(冪等)
+- Commander Prompt は「承認ゲート無しでは merge / push / deploy をしない」と約束しています。
+  **ゲートを解決する API がないとジョブは途中で詰まります**(blocked / decision_gate の `nextAction` が指します)
+- **cancel はジョブ単位**(既定 `cascade: true`)。Commander が分解した**子孫タスクとその worker を子から順**に
+  止めます(親だけ止めて子 Worker を走らせたままにしない)。`cascade: false` なら対象だけ
+- cancel は 2 段階(preflight → mutation)。子孫が 12 件を超える場合は `cancel_scope_too_large`、
+  1 タスクの dispatch が 3 件を超える場合は `cancel_dispatch_scope_too_large` で、**何も変更する前に**断ります
+  (`detail` に `taskCount` / `dispatchIds` が出るので `cascade: false` か個別 cancel を選べます)
+- **Commander の worker が止められなければ cancel 成功を返しません** — 対象タスクの fence に 1 件でも失敗したら
+  `cancel_incomplete`(`state: "partial"`, `cancelled: false`, `fullyStopped: false`)で対象 task は更新しません。
+  成功応答の `fullyStopped` が「実プロセスを全部止められたか」です
+- `mode: "abandon"` は `orca orchestration worker-abandon`(資源を残しプロセスにも filesystem にも触らない)に対応します。
+  迷ったら `stop` を使ってください
+- worktree やターミナルの削除は行いません(後片付けは人間側の判断)
 
 ### 観測用 read-only
 
 | ツール | 内容 | 対応 orca コマンド |
 | --- | --- | --- |
 | `orca_status` | ランタイム準備状態(入力なし) | `orca status --json` |
-| `orca_readiness` | 委譲の前提チェック(runtime / orchestration / orchestration skill) | `orca status --json` + `orca skills installed --json` |
+| `orca_readiness` | 頼む前のチェック(runtime / orchestration / orchestration skill) | `orca status --json` + `orca skills installed --json` |
 | `orca_list_worktrees` | ワークツリー一覧(repo / limit) | `orca worktree list --json` |
 | `orca_get_worktree` | 1 件のワークツリー詳細 | `orca worktree show --json` |
 | `orca_list_agents` | worktree 横断のエージェント一覧 | `orca worktree ps --json` |
 
-```
-orca_readiness({ commanderAgent: "codex" })
-  → { "ready": false,
-      "checks": [ { "name": "orca runtime", "ok": true, "detail": "app.running=true …" },
-                  { "name": "orchestration enabled", "ok": true, "detail": "capabilities: 12 orchestration.*" },
-                  { "name": "orchestration skill installed", "ok": true, "detail": "installed skills: 319" },
-                  { "name": "orchestration available to codex", "ok": false,
-                    "detail": "orchestration skill providers: agent-skills, claude" } ],
-      "missing": ["orchestration available to codex"],
-      "commanderAgent": "codex",
-      "nextAction": "Run: orca skills install --skill orchestration --agent codex" }
-```
-
-`orca_readiness` は**何もインストールしない**(勝手に skill を配らない)。足りないものは
-`missing` と `nextAction`(人間が実行するコマンド)で返すだけ。
-`commanderAgent` を渡すと、そのエージェントが orchestration skill を読めるか
-(`skills installed` の `providers` 列挙)まで見る — codex を起動するのに skill が
-claude 側にしか無い、という状態を委譲前に気づける。
-`orca_delegate_task` の既定 `commanderAgent` は `codex` なので、上の例のような状態では
-delegate 前に `orca_readiness({ commanderAgent: "codex" })` で気づける(実ホストで観測された形)。
-
 `orca_delegate` と `orca_message` は内部実装として保持しており、MCP ツールとしては公開していません。
 送信は `orca_send_message` を使ってください。
 
-readiness の providers 判定は**同じ skill 名の行を union** して見る(E2E で踏んだ)。
-`orca skills install --skill orchestration --agent codex` は共有 root(`~/.agents/skills`)へ copy され、
-その後に codex 宛てを入れると `skills installed` が `orchestration` を **2 行**(providers
-`agent-skills, claude` と `codex`)で返す。1 行目だけ見ると codex を false negative にする。
-`--agent codex` の install 自体は `--json` 非対応(`--json` は `--dry-run` のみ)で、
-git の env(`GIT_CONFIG_COUNT`)が汚れていると clone に失敗する。
-
 ### 挙動の約束
 
-- **入力はすべて argv 配列**で、セレクタや自由文は 1 要素としてそのまま渡す(shell 文字列は作らない)
-- **どのツールもワーカーの完了を待たない。** 完了監視は呼び出し側の poll に委ねる
-- 大きな欄は既定で切り詰める(`orca_list_agents` の `prompt` は 200 文字、
-  `orca_get_task_result` の worker 出力は 4000 文字、`specPreview` は 200 文字)
-- CLI が `ok:false` を返したときは `code` をそのまま応答に載せる(`isError: true`)。
-  例: `run_required` / `run_not_found` / `worktree_not_found`(+ `data.nextSteps` など)
-- ジョブ層の失敗は別の語彙: `task_not_found` / `task_id_missing` / `run_create_failed` /
-  `outcome_required` / `outcome_not_allowed` / `dispatch_id_required` / `cancel_incomplete` /
-  `cancel_scope_too_large` / `cancel_dispatch_scope_too_large` / `gate_not_found`
-- orca CLI は**呼び出し元ターミナルを 1 つの Run にバインド**する。違う Run への変更は
-  `consumer_fenced` で拒否されるため、介入ツールだけが必要に応じて `run-use` で
-  バインドを切り替えて 1 回だけ再試行する( poll / 観測ツールは切り替えない)
+- **入力はすべて argv 配列**。セレクタや自由文は 1 要素としてそのまま渡します(shell 文字列は作りません)
+- **どのツールもワーカーの完了を待ちません**。完了監視は呼び出し側の poll に委ねます
+- CLI が `ok:false` を返したときは `code` をそのまま応答に載せます(`isError: true`)。
+  例: `run_required` / `run_not_found` / `worktree_not_found`(+ `data.nextSteps`)
+- ジョブ層の失敗語彙: `task_not_found` / `task_id_missing` / `run_create_failed` / `outcome_required` /
+  `outcome_not_allowed` / `dispatch_id_required` / `cancel_incomplete` / `cancel_scope_too_large` /
+  `cancel_dispatch_scope_too_large` / `gate_not_found`
+- orca CLI は**呼び出し元ターミナルを 1 つの Run にバインド**します。違う Run への変更は `consumer_fenced` で
+  拒否されるため、介入ツールだけが必要に応じて `run-use` でバインドを切り替えて 1 回だけ再試行します
+  (poll / 観測ツールは切り替えません)。変更系は MCP サーバー内で直列化します
 
-### 使用例(典型的な流れ)
+---
 
-1. `orca_readiness({ commanderAgent })` でランタイム・orchestration・skill の前提を確認する
-2. `orca_delegate_task({ spec, constraints })` で委譲 → `{ taskId, state: "running", commander: true }` を即受け取る
-3. `orca_get_task_status({ taskId })` を数分おきに poll する(他作業を挟んでよい)。
-   `children` に Commander が分解した子タスクと worker の state が出る
-4. 方針を変えたいときだけ `orca_send_message({ subject, body, run, taskId })` で指示を出す
-5. `state: "blocked"` / `phase: "decision_gate"` になったら `orca_resolve_gate({ gateId, resolution, run })`
-   で承認/却下して Commander を進める
-6. 取り消すときだけ `orca_cancel_task({ taskId, reason })` を使う(既定で子孫 worker も子から順に止める)
-7. `state: "completed"` になったら `orca_get_task_result({ taskId })` で成果を受け取る。
-   ワーカー個々の成果まで欲しければ `includeChildren: true`
-8. 状況確認が欲しいときだけ `orca_list_worktrees` / `orca_list_agents` を使う
+## dsh を worker に使う
 
-## スクリプト
+`dsh` を `worker-start --agent dsh` で起動すると dsh-tui(対話)が立ち上がり、**dispatch が
+`agent_readiness` で失敗して task が `failed` に落ちます**。dsh-tui は注入を受け取れますが、**pane の起動コマンドに dsh-tui を直接指定すると readiness のゲートを通過できません**(実測)。
+launcher を挟むと通過します。
+
+そこで **dsh 用の launcher を向けます**:
+
+```
+node C:\<repo-dir>\orca-mcp\scripts\dsh-tui-launcher.mjs
+```
+
+実測(`agentCmdOverrides.dsh` をここへ向けて `worker-start --agent dsh --worktree new-child`):
+
+```
+worker-start  state=ready stage=input_accepted   ← 15 秒で ready
+poll#1 dispatched → poll#2 dispatched → poll#3 completed
+result = {"provenance":"worker_report","outcome":"succeeded", …}
+```
+
+注入はそのまま dsh-tui のプロンプト欄に入り、中のエージェントがワークを完走して `worker_done` で
+報告します。**この運用に ACP ブリッジは不要です。**
+
+| 目的 | 設定 |
+| --- | --- |
+| 対話で dsh-tui を使う | 設定不要。`dst .`(エイリアス)で起動する — `agentCmdOverrides` を通しません |
+| Worker として使う(既定) | `node …\scripts\dsh-tui-launcher.mjs` |
+| ACP 機能が要るとき | `node …\scripts\dsh-acp-worker.mjs`(下の節) |
+
+launcher の仕事は 4 つだけです: dsh-tui の Node エントリを解決する(`npm root -g` → PATH)、
+`stdio: "inherit"` で pane の PTY を TUI に渡す、TUI の終了まで pane の foreground プロセスとして生存する、
+終了コードを伝えて診断ログを残す。**注入も ACP も報告も一切しません。**
+
+> **未解明点(正直に書いておきます)**: pane の起動コマンドが **dsh-tui 自身だと readiness を通過できず**、
+> **node 経由の launcher を挟むと通過する**、という差は再現できていますが**機構は解明していません**。
+> 観測された結果上の差は「dispatch に launch token が記録され `stage: input_accepted` に到達するか」です。
+> 原因が判明したらこの節を更新してください。
+
+### 報告の決まり(worker 側)
+
+- **報告の本体は `worker_done`**(`--outcome` / `--task-id` / `--dispatch-id` 付き)。
+  dispatch が生存中の `task-update --status completed` は CLI が拒否します
+  ("cannot move to completed while supervised Dispatch … is active")
+- `task-update` は dispatch が無い / 落ちた後の**事後報告専用**です。`--status` の有効値は
+  `pending / ready / dispatched / completed / failed / blocked`(`success` は無い)
+- 報告が `consumer_fenced` になったら、**自分の terminal だけ** `orca orchestration run-use --id <run>` で
+  1 回バインドして再試行します
+- `worker-release` / `worker-list` の後始末は Coordinator 側の仕事です(worker に課しません)
+
+### `workerReportPending`(poll が完了を取り逃さないための補助)
+
+worker-start が readiness で失敗すると task は即 `failed` になりますが、pane 側のワークは完走して
+後から報告が届くことがあります。`orca_get_task_status` は **launch token 無しで失敗した dispatch +
+生存 worker** の場合に `workerReportPending: true` と `workerReportNote` を添えます(**`state` は偽装しません**)。
+poll を打ち切る前に数回待ってください。**launcher 運用では通常この経路は出番なし**です
+(通常どおり `worker_done` で settlement されます)。
+
+### dsh を ACP で動かす(任意のブリッジ)
+
+`dsh --profile acp` は ACP(Agent Client Protocol)の JSON-RPC stdio サーバーです。
+**Orca のターミナル注入を直接向けると pane に `-32700 Parse error` が出て始まらない**ので、
+「注入テキストを `session/prompt` に載せ直す」ブリッジを挟みます。使うのは次の機能が要るときだけです。
+
+| 観点 | launcher | acp ブリッジ |
+| --- | --- | --- |
+| 注入 | dsh-tui のプロンプト欄へ素通し | `session/prompt` に載せ替え |
+| 承認プロンプト | dsh-tui 側の設定次第 | `session/request_permission` を**ブリッジが `allow_once` で機械応答** |
+| ターン | 1 pane 1 セッション | 同一セッションでマルチターン(後続 send が 2 ターン目) |
+| モデル / effort | dsh 自前 config | `session/set_config_option` で外部から選択 |
+| MCP 注入 | 不可 | `session/new` の `mcpServers` に orca-mcp を渡せる |
+| 永続 | なし | `session/list` / `session/resume`(プロセスを跨いで文脈が復元) |
+
+環境変数(すべて省略可):
+
+| 変数 | 既定 / 意味 |
+| --- | --- |
+| `DSH_ACP_PROFILE` | `acp` |
+| `DSH_ACP_PERMISSION` | `allow_once`(権限要求への応答) |
+| `DSH_ACP_MODEL` / `DSH_ACP_EFFORT` | 未指定(`"provider/model"` 形式) |
+| `DSH_ACP_MCP` | 未指定(JSON 配列で MCP サーバーを注入) |
+| `DSH_ACP_IDLE_EXIT_MS` | 1800000(ターン後に次の注入を待つ上限) |
+| `DSH_ACP_MAX_TURNS` | 40 |
+| `DSH_ACP_QUICK_FIRST_MS` | 1500(起動直後の注入 probe) |
+| `DSH_ACP_LOOKUP_MS` | 180000(dispatch 照合の上限。**短くすると worker pane が対話フォールバックに落ちる**) |
+| `DSH_ACP_TUI_BIN` / `DSH_ACP_TUI_ARGS` | 対話フォールバックで起動する dsh-tui の Node エントリと引数 |
+| `DSH_ACP_NO_FALLBACK` | 未指定(設定すると対話フォールバックを無効化) |
+
+- ブリッジは「短い probe で注入を見る → dispatch を照合する → どちらも無ければ dsh-tui へ素通し」で
+  対話 pane と worker pane を判別します(`ORCA_AGENT_LAUNCH_TOKEN` は対話 pane にも入るので判別に使いません)。
+  対話で dsh-tui を使いたい人の正解は `dst .` です。
+- `session/request_permission` への応答は形(shape)が命です: `{ "outcome": { "outcome": "selected", "optionId": "allow-once" } }`。
+  `{ "outcome": { "selected": "allow-once" } }` にすると**拒否扱いで tool が `failed` になります**。
+- **ローカル LLM(key 不要)へルーティング**するには `.dsh/profiles/acp/cordis.patch.yml` にゲートウェイを焼きます。
+  テンプレは `docs/templates/acp-cordis.patch.example.yml`(key 不要で通す決め手が `headers.Authorization`)。
+  プロファイル patch は**起動時のみ**反映されるので、変更後はプロセスを再起動してください。
+- 1 タスク 1 プロセスで完結させたい旧経路(`scripts/dsh-headless-worker.mjs`)は、注入を stdin で拾って
+  `dsh --profile headless <task>` を argv で起動するブリッジです。credential を要求します
+  (`~/.deepseek/config.json` の `apiKey` または `DEEPSEEK_API_KEY`、無ければ `MISSING_CREDENTIAL` で exit)。
+  通常の worker 運用は launcher を使ってください。
+
+---
+
+## つまったときの引き出し
+
+| 症状 | 原因 | 対処 |
+| --- | --- | --- |
+| `state: "queued"` から進まない | worker-start 失敗(dispatch が無く Commander 未起動) | `nextAction` の指示どおり delegate し直すか cancel する |
+| `state: "failed"` / `stage: "agent_readiness"` | pane に生きたプロセスが見えていない(dsh) | `agentCmdOverrides.dsh` を launcher に向ける。`workerReportPending: true` なら報告を待つ |
+| `running` のまま progress が止まる | エージェントの**ツール承認プロンプト**で worker が停止 | `attentionNotes` をたどって pane を確認。codex は `--approve-for-me`、claude は `Bash(orca:*)` allow |
+| `blocked` / `phase: "decision_gate"` | 承認ゲート待ち | `orca_resolve_gate({ gateId, resolution, run })` で進める |
+| `consumer_fenced` | 呼び出し元の Run バインドが対象と違う | 介入ツールは自動で `run-use` して 1 回だけ再試行します。worker 側なら自分の terminal を 1 回バインド |
+| `repo_not_found` | worktree の `name:` / worktree path を渡した | `id:<repoId>` か `path:<repo home>` を使う(repoId は `orca worktree current --json`) |
+| `outcome_required` / `dispatch_id_required` | `worker_done` に `outcome` / `dispatchId` が無い | 両方を付けて送り直す |
+| `cancel_incomplete`(`fullyStopped: false`) | Commander の worker を止められなかった | 対象 task は未更新。pane を確認して worker を止めてから cancel し直す |
+| `cancel_scope_too_large` / `cancel_dispatch_scope_too_large` | 子孫 12 件超 / 1 タスク 3 dispatch 超 | 何も変更していません。`cascade: false` か個別 cancel を選ぶ |
+| cancel した task が `failed` に見える | `cancelled` は MCP 側の論理状態 | 実体は `status: failed` + `result: "cancelled: <reason>"`。想定どおり |
+| `gate_not_found` | その Run に gate が無い | `run` を対象 Run に直す(`gate-list` は Run バインドスコープ) |
+| `orca 起動失敗: orca CLI が見つかりませんでした` | PATH / `ORCA_BIN` | PATH を確認するか `ORCA_BIN` にバイナリパスを指定 |
+| MCP クライアントに接続されない | 未ビルド / stdio 設定 | `npm run build` 後に `npm run dev` で手動起動して確認 |
+
+---
+
+## 開発
 
 | コマンド | 内容 |
 | --- | --- |
@@ -313,226 +432,10 @@ git の env(`GIT_CONFIG_COUNT`)が汚れていると clone に失敗する。
 | `npm run build` | `tsc` で `src/` を `dist/` へビルド |
 | `npm start` | `node dist/index.js` |
 | `npm run typecheck` | 型チェックのみ(src + tests) |
-| `npm test` | vitest 1 回 |
+| `npm test` | vitest 1 回(orca ランタイム不要) |
 | `npm run test:watch` | vitest watch |
 
-### dsh を supervised worker にするブリッジ(`scripts/dsh-headless-worker.mjs`)
-
-`dsh` を `worker-start --agent dsh` で起動すると dsh-tui(対話)が立ち上がり、注入プロンプトが
-consumed されずに dispatch が `failed`(stage `agent_readiness`)になります。非対話の
-`dsh --profile headless` はタスクを **argv** で要求するため、Orca のターミナル注入では届きません
-(`-` で stdin 経路にすると PTY は EOF を送らないので永久待ちになる)。
-
-そこで `scripts/dsh-headless-worker.mjs` が「注入テキストを stdin から拾い(4 秒 idle / 30 秒上限)、
-`node <dsh bin.js> --profile headless <task>` を **argv 配列**で起動する」ブリッジになります
-(shell 文字列は作りません)。Orca のエージェント起動コマンドをこれに向けます:
-
-```
-node C:\<repo-dir>\orca-mcp\scripts\dsh-headless-worker.mjs
-```
-
-**実機で確認した前提 2 つ**:
-
-1. **注入は readiness の後に行われる**。agent hooks を持たない dsh には stdin が 1 バイトも届かない
-   (実測 120 秒で 0 字)。なのでラッパーは `worktree current` → `terminal list`(path 照合で自分の
-   ターミナル)→ `run-list` → `task-list --run` → `dispatch-show`(`assignee_handle` 一致)で
-   **自分のタスクを逆引き**する(`task-list` は Run バインドが必要。新ターミナルは未バインド)。
-2. **dispatch は `agent_readiness` で `failed` になる**ため `worker_done` を送っても完走できない。
-   ラッパーは報告を **`task-update --status success --result …`** に切り替える(ゲートウェイの poll は
-   task 状態を読むので届く)。worker 側の観測(`worker-list` の attention 等)は dsh では使われない。
-
-`dsh --profile headless` は credential を要求する(`~/.deepseek/config.json` の `apiKey`、または
-`DEEPSEEK_API_KEY`)。無い場合は `MISSING_CREDENTIAL` で即 exit する。
-
-### dsh を ACP で supervised worker / Commander にするブリッジ(`scripts/dsh-acp-worker.mjs`)
-
-`dsh --profile acp` は **ACP(Agent Client Protocol)の JSON-RPC stdio サーバー**です
-(`%DSH_HOME%\profiles\acp`、`dsh --profile acp --help` = "Serve automation clients over Agent Client Protocol stdio")。
-**Orca のターミナル注入を直接向けると pane に `{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}`
-が出てタスクが始まらない**(実測)。なので「注入テキストを `session/prompt` に載せ直す」このブリッジが要ります。
-
-```
-node C:\<repo-dir>\orca-mcp\scripts\dsh-acp-worker.mjs
-```
-
-headless 版に対する利点(**すべて実機で確認**):
-
-| 観点 | headless | acp ブリッジ |
-| --- | --- | --- |
-| ターン | 1 タスク 1 プロセス | 同一セッションでマルチターン(後続 send が 2 ターン目) |
-| 承認プロンプト | 人間待ちになり得る | `session/request_permission` を **ブリッジが `allow_once` で機械応答** |
-| モデル / effort | dsh は自前 config | `session/set_config_option` で外部から選択(`worker-start --model/--effort` は dsh 不可の救済) |
-| MCP 注入 | 不可 | `session/new` の `mcpServers` に orca-mcp を渡せる(`DSH_ACP_MCP`) |
-| 停止 | プロセス kill | `session/close` / `session/cancel` |
-| 永続 | なし | `session/list` / `session/resume`(**プロセスを跨いで文脈が復元**することを実測) |
-
-環境変数(すべて省略可): `DSH_ACP_PROFILE`(既定 `acp`)・`DSH_ACP_PERMISSION`(`allow_once` 既定)/
-`DSH_ACP_MODEL`(`"provider/model"`）・`DSH_ACP_EFFORT`・`DSH_ACP_MCP`(JSON 配列)・
-`DSH_ACP_IDLE_EXIT_MS`(ターン後に次の注入を待つ上限、既定 30 分)・`DSH_ACP_MAX_TURNS`(既定 40)。
-
-**前提 — ローカル LLM へのルーティング(実機)**: `DEEPSEEK_API_KEY` が無いマシンでも動くよう、
-`.dsh/profiles/acp/cordis.patch.yml` にローカルゲートウェイを焼いています。
-**テンプレは `docs/templates/acp-cordis.patch.example.yml`**(プレースホルダ版。実体の IP は置かない)。
-
-```yaml
-- id: llm-pi-ai
-  config:
-    providers:
-      vllm:
-        api: openai-completions
-        baseURL: http://<local-gateway>/v1
-        headers:
-          Authorization: Bearer local   # ← keyless の決め手
-- id: acp
-  config: { provider: vllm, model: <model-id> }
-- id: agent-default-model
-  config: { provider: vllm, model: <model-id> }
-- id: llm-deepseek
-  disabled: true
-```
-
-- dsh-tui と同じ `apiKeyEnv: VLLM_API_KEY` 写法は**新しいプロセスでは使えない**
-  (key は dsh-tui を起動したプロセスの env にしか無く、子に引き継がれない)。
-- 手宣言ルートで `apiKeyEnv` を省くと pi-ai が `No API key for provider: <route>` で落とす
-  (README の "configured-but-keyless" は installed catalog ルート側の話)。
-- 回避は `headers.Authorization`: pi-ai の `getClientApiKey` は **authorization ヘッダが非空なら
-  key を `"unused"` として通す**(`dsh-llm` の予約ヘッダは `user-agent` のみで素通し)。
-- プロファイル patch は**起動時のみ**反映(acp-app が HMR 無効)。変更後はプロセス再起動。
-
-実機で確認した挙動: `initialize` → `session/new`(configOptions にローカルモデルが並ぶ)→
-`session/prompt` が `stopReason: end_turn` で完走 → `tool_call`/`tool_call_update` のツールループ →
-同一接続の 2 ターン目で文脈維持 → 別プロセスの `session/resume` 後も文脈維持。
-
-**承認の自動応答は shape が命**(実測で踏んだ): `session/request_permission` への応答は
-`{ "outcome": { "outcome": "selected", "optionId": "allow-once" } }`。
-`{ "outcome": { "selected": "allow-once" } }`(よくある誤記)にすると**拒否扱いで tool が `failed` になり、
-エージェントは「人間が拒否した」と解釈して止まる**。拒否は `{ "outcome": { "outcome": "cancelled" } }`。
-
-**dsh は agent hooks を持つ**(2026-10-06 以降): `orca agent hooks status --json` の `dsh` が
-`installed`(`C:\Users\<you>\.dsh\cordis.patch.yml` の orca-managed 節 → `~/.orca/agent-hooks/dsh-hooks.json`)。
-なので headless 節に書いた「dsh は stdin を 1 バイトも受け取れない / dispatch が `agent_readiness` で
-`failed`」は**hooks 導入前の記述**です。ブリッジは両経路に備え、preamble に
-`worker_done` → 拒否されたら `task-update` の順の報告指針を焼きます。
-
-**ただし `agent_readiness` は今も通らない**(2026-10-08 実測)。原因は hooks の有無ではなく **launch token**:
-
-| 起動 | `dispatch.launch_token_hash` | dispatch 結果 |
-| --- | --- | --- |
-| `--agent codex`(登録コマンド) | 入る(`222b05cd…`) | `state: ready` / `stage: input_accepted` |
-| `--agent dsh` + `agentCmdOverrides`(ブリッジ) | **空** | `agent_readiness` で `failed`(`terminal_handle_stale` / `timeout`) |
-
-pane の env には token が入っていて hooks も `launchTokenHash` を返す(実測)が、
-**dispatch 側に token が記録されない**ため readiness の照合が成立しない。
-= `agentCmdOverrides` で起動コマンドを差し替えた worker は、現状 `worker_done` を送れる
-live dispatch に到達できない。
-
-**なので dsh worker の報告経路は `task-update` が本体**(preamble がそれを指示する):
-
-- `--status` の有効値は `pending / ready / dispatched / completed / failed / blocked`(`success` は無い)
-- 報告が `consumer_fenced` になるのは「その terminal が Run に未バインド」のとき。
-  **自分の terminal だけ** `orca orchestration run-use --id <run>` で 1 回バインドして再試行する
-- `worker-release` / `worker-list` の後始末は Coordinator 側の仕事(worker に課しない)
-
-ゲートウェイの poll は task 状態を読むので、`task-update` の報告はそのまま呼び出し側に届く。
-
-**E2E 実測(2026-10-08、`node scripts/e2e.mjs --agent dsh`)**:
-
-```
-readiness ready=true missing=[]            … dsh が共有 skills root を読む判定が ok
-delegate  state=queued dispatch=ctx_a15fbb9f376c
-          warnings=["worker-start receipt state=failed stage=agent_readiness lastError=timeout …"]
-```
-
-worker の pane 側はブリッジが起動し、注入の逆引き → ACP セッション → skill 読込 →
-read/pwsh のツール実行 → 最終応答まで完走し、`session/request_permission` も `allow_once` で
-自動応答されています(**pane に承認停止が出ない**)。止まるのは dispatch の readiness だけです。
-
-`worker-start` は readiness 失敗を **`ok:true` の receipt + 終了コード 1** で返すので、
-`command.ts` は stdout の `ok:true` を transport 成功として扱い(`isOkEnvelope`)、
-`delegateTask` は `state: "queued"` + 正直な warning(stage / lastError / 報告経路)に落とします。
-終了コードを主人にすると receipt が丸ごと `non_zero_exit` になり、失敗理由が
-「終了コード 1」だけになっていました(E2E で踏んだ)。
-
-`orca_readiness` は `commanderAgent: "dsh"` を**共有 skills root 経由**で ok にします
-(dsh は `~/.agents/skills` を scan するので `skills installed` の providers 列挙に `dsh` は出ない)。
-
-### E2E(実ランタイム検証)
-
-`npm test` は orca ランタイムを起動しません。**実環境通し**は `scripts/e2e.mjs` が
-MCP サーバーを stdio で起動して、`readiness → delegate → poll → gate → result → cancel` を
-通します(実エージェントが動くので 10〜30 分)。
-
-```powershell
-npm run build
-node scripts/e2e.mjs --minutes 30            # repo は `orca worktree current` の repoId から自動選択
-node scripts/e2e.mjs --repo id:<repoId> --agent claude --cleanup
-```
-
-- 手順: `orca_readiness` → `orca_delegate_task`(Commander 起動)→ 30 秒間隔の `orca_get_task_status` →
-  pending gate は `approve (e2e)` で `orca_resolve_gate` → `orca_get_task_result({ includeChildren: true })` →
-  2 本目を途中で `orca_cancel_task`(cascade と `fullyStopped` を確認)
-- 全ステップの観測は `e2e-transcript.json` に残ります
-- `state: "queued"` で止まった場合は worker-start 失敗が原因なので、その場で cancel して終了します
-- 後片付けは child worktree を表示するだけ(`--cleanup` を付けると `orca worktree rm` まで実行)
-
-#### E2E で実測した挙動(そのまま実装に反映済み)
-
-| 実測 | 対応 |
-| --- | --- |
-| `repo` に worktree の `name:` / worktree path を渡すと `repo_not_found` | repo セレクタの解説を追加(`id:<repoId>` / `path:<repo home>` を使う) |
-| `worker-start` が 30 秒で SIGKILL され `queued` に着地(worktree は作られて残る) | `worker-start` だけ transport timeout を 180 秒に |
-| Claude Code の承認プロンプト(`orca skills get …`)で Commander が `running` のまま停止 | poll が `attentionRequired` / `attentionNotes` を出す。Commander Prompt に「答えられない承認待ちで止まらず `--help` へ退避する」節 |
-| Commander が自分の Run を使わず新しい `run-create` を試みる | Commander Prompt に Run ownership(新しい Run を作らない / `--parent` は自分の task) |
-| 実 worker の cancel は `fullyStopped: true`、worker-stop は冪等(2 回目の fence も成功) | README の cancel 節に反映 |
-| `worker-start` は readiness 失敗を **`ok:true` の receipt + 終了コード 1** で返す | `isOkEnvelope` で transport 成功として扱い、delegate は `queued` + 正直な warning(stage / lastError / 報告経路)に落とす |
-| 同じ skill 名の行が複数(`agent-skills, claude` と `codex`)に分かれ、1 行目だけだと false negative | providers を **union** して判定(E2E が readiness で止まった実測) |
-| codex は既定設定(`approval_policy` 未設定)で承認プロンプトに停止。`approval_policy="never"` + `sandbox_mode="workspace-write"` は逆に**コマンドを自動拒否**して「環境ポリシーにより拒否」と報告する | 完走には `--approve-for-me`(承認要求を workspace-write sandbox の自動レビューへ流す)。`agentDefaultArgs.codex` に設定し、`~/.codex/config.toml` は無変更 |
-
-#### 承認/sandbox 選択肢の実測ラダー(codex-cli 0.160.1 / 新規 git worktree)
-
-| 設定 | `orca skills get orchestration --full` | worktree への書き込み |
-| --- | --- | --- |
-| `--approve-for-me` | exit 0 | 成功 — **sandbox(workspace-write)を保ったまま通る** |
-| `-s workspace-write -c approval_policy="never"` | `rejected: blocked by policy` | 拒否(自動拒否) |
-| `-s danger-full-access -c approval_policy="never"` | exit 0 | 成功(sandbox 無し) |
-| `--dangerously-bypass-approvals-and-sandbox` | exit 0 | 成功(sandbox 無し。codex 側が "EXTREMELY DANGEROUS / externally sandboxed 環境専用" と明記) |
-
-`--approve-for-me` は `codex`(対話 TUI)にも `codex exec` にも存在する。自動レビューはモデル判定なので
-たまにコマンドを拒否する(その場合は worker が拒否を報告して止まらない)。
-
-#### E2E 完走記録(2026-10-08 / `--agent codex` / `agentDefaultArgs.codex = "--approve-for-me"`)
-
-```
-readiness  ready=true missing=[]
-delegate   state=running  task_70de0802ffa1 / run_cf1a8d9cd0b6  warnings=[]
-poll       #1-#5 running(implementation) → poll 終了 state=completed(phase=finished, polls=6)
-result     state=completed
-worker pane  git diff / git status / orca orchestration check を**承認プロンプトなし**で実行し、
-             `orca orchestration send --type worker_done` → "Sent msg_3ed2ddd8bbcf"
-cancel       2 本目を delegate → poll#1 running(workers=1) → cancel cancelled=true fullyStopped=true
-             cancel 後 state=failed(MCP 側の論理 cancelled の実体)
-cleanup      worktree rm: E2E cancel 検証 / E2E README 検証記録
-```
-
-#### E2E 完走記録(2026-10-08 / `--agent codex` / 承認設定を緩めた一時的な実行)
-
-`~/.codex/config.toml` に `approval_policy="never"` + `sandbox_mode="danger-full-access"` を
-入れた状態での完走(実行後に復元)。上の `--approve-for-me` 完走が本運用の記録。
-
-```
-readiness ready=true missing=[]
-delegate  state=running  taskId=task_d6f10b7d1061 runId=run_1ee39fc4ee51  warnings=[]
-poll#1..#3 running(phase=implementation) → poll#4 state=completed phase=finished
-result    state=completed
-cancel    2 本目を delegate → poll#1 blocked(workers=1) → cancel cancelled=true fullyStopped=true
-          cancel 後 state=failed(MCP 側の論理 cancelled の実体)
-cleanup   worktree rm: E2E cancel 検証 / E2E README 検証記録
-```
-
-`--agent dsh` は readiness の launch token で dispatch が `agent_readiness` に失敗するため
-同じ完走はしない(上の dsh 節参照)。worker 側の作業自体は pane で完走している。
-
-## 構成
+### 構成
 
 ```
 orca-mcp/
@@ -553,17 +456,47 @@ orca-mcp/
 │     ├─ agents.ts      # orca_list_agents(worktree ps の平坦化)
 │     ├─ delegate.ts    # orca_delegate(内部実装)
 │     └─ message.ts     # orca_message(内部実装)
-├─ tests/               # orca ランタイム不要の単体テスト(job.test.ts は偽 client)
 ├─ scripts/
-│  └─ e2e.mjs           # 実ランタイム E2E(readiness → delegate → poll → gate → result → cancel)
+│  ├─ e2e.mjs                 # 実ランタイム E2E(readiness → delegate → poll → gate → result → cancel)
+│  ├─ dsh-tui-launcher.mjs    # dsh worker の既定: dsh-tui を起動して待つだけの最小 launcher
+│  ├─ dsh-acp-worker.mjs      # Orca 注入 → ACP session/prompt に載せ直すブリッジ
+│  └─ dsh-headless-worker.mjs # 注入 → dsh --profile headless の argv に載せ直すブリッジ(旧経路)
+├─ docs/templates/acp-cordis.patch.example.yml   # ACP 用ローカル LLM ルーティングのテンプレ
+├─ tests/               # orca ランタイム不要の単体テスト(job.test.ts は偽 client)
 ├─ AGENTS.md            # エージェント向け開発規約
-├─ README.md
 ├─ package.json
 └─ tsconfig.json        # 開発用(noEmit) / tsconfig.build.json: ビルド用
 ```
 
-## トラブルシューティング
+### E2E(実ランタイム検証)
 
-- `orca 起動失敗: orca CLI が見つかりませんでした` → PATH か `ORCA_BIN` を確認
-- 終了コード非ゼロ → ツールの応答に stderr が含まれます(`orca status` でランタイム起動確認)
-- MCP クライアントに接続されない → `npm run dev` で手動起動し、stdio 接続であることを確認
+`npm test` は orca ランタイムを起動しません。実環境通しの検証は `scripts/e2e.mjs` が MCP サーバーを stdio で
+起動して `readiness → delegate → poll → gate → result → cancel` を通します(実エージェントが動くので 10〜30 分)。
+
+```powershell
+npm run build
+node scripts/e2e.mjs --minutes 30            # repo は `orca worktree current` の repoId から自動選択
+node scripts/e2e.mjs --repo id:<repoId> --agent claude --cleanup
+```
+
+- 手順: `orca_readiness` → `orca_delegate_task` → 30 秒間隔の `orca_get_task_status` →
+  pending gate は `approve (e2e)` で `orca_resolve_gate` → `orca_get_task_result({ includeChildren: true })` →
+  2 本目を途中で `orca_cancel_task`(cascade と `fullyStopped` を確認)
+- 全ステップの観測は `e2e-transcript.json` に残ります
+- `state: "queued"` で止まった場合は worker-start 失敗が原因なので、その場で cancel して終了します
+- 後片付けは child worktree を表示するだけ(`--cleanup` を付けると `orca worktree rm` まで実行)
+
+E2E は `--agent codex`(`agentDefaultArgs.codex = "--approve-for-me"`)で完走を確認済みです
+(readiness ok → delegate running → poll 6 回で completed → result → cancel `fullyStopped: true`)。
+
+### 開発上の決まり(抜粋)
+
+- 引数は常に **argv 配列**(`execFile(bin, argvArray)`、shell 文字列は作らない)
+- stdout は MCP ワイヤー専用。ログ・診断は `console.error` へ
+- 失敗はプロトコル例外にせず `isError: true` の CallToolResult で返す
+- `worker-start` は readiness 失敗を **`ok:true` の receipt + 終了コード 1** で返すので、
+  stdout の `ok:true` を transport 成功として扱う(`isOkEnvelope`)。終了コードを基準にすると
+  receipt が `non_zero_exit` になり delegate が `queued` に落ちます
+- リポジトリの文章は日本語で書く(README・AGENTS.md・ツールの title/description・テスト名)
+
+開発規約全体は [AGENTS.md](./AGENTS.md) にあります。

@@ -1,4 +1,4 @@
-# AGENTS.md — orca-mcp
+﻿# AGENTS.md — orca-mcp
 
 このリポジトリは **Orca CLI をラップする MCP サーバー** です。
 目的は **コーディングのゴールを Commander エージェントと supervised なマルチエージェントワーカーへ
@@ -40,7 +40,8 @@ src/
 tests/              # vitest。子プロセスを実際に起動しない(モック runner / 偽 client)
 scripts/
   e2e.mjs           # 実ランタイム E2E(stdio でサーバーを起動し submit→poll→gate→result→cancel)
-  dsh-acp-worker.mjs      # Orca 注入 → ACP session/prompt に載せ直すブリッジ(推奨・マルチターン)
+  dsh-tui-launcher.mjs    # dsh worker の既定: dsh-tui を起動して待つだけの最小 launcher
+  dsh-acp-worker.mjs      # Orca 注入 → ACP session/prompt に載せ直すブリッジ(ACP 機能が要る時)
   dsh-headless-worker.mjs # Orca 注入 → dsh --profile headless の argv に載せ直すブリッジ(1 タスク 1 プロセス)
 docs/
   templates/acp-cordis.patch.example.yml  # dsh acp プロファイル用パッチのテンプレ(IP 等は置かない)
@@ -82,8 +83,9 @@ docs/
   実機で `dsh` は dsh-tui(対話)が起動して dispatch `failed`、`"dsh headless"` は `agent_unconfigured`。
   非対話の Commander が欲しいなら Orca のエージェント設定(`agentCmdOverrides`、CLI からの設定コマンドは無い)に
   起動コマンドを登録してもらう — MCP 側でエージェント引数を組み込むフラグは無い。
-  dsh の既定登録コマンドは `dsh-tui .`(pane 実測)。非対話にするならブリッジを向ける:
-  `node <repo>\scripts\dsh-acp-worker.mjs`(**推奨**、README 参照)/ `node <repo>\scripts\dsh-headless-worker.mjs`。
+  dsh の既定登録コマンドは `dsh-tui .`(pane 実測)。worker にするには launcher を向ける:
+  `node <repo>\scripts\dsh-tui-launcher.mjs`(**既定・推奨**、README 参照)/ ACP 機能が要るなら
+  `node <repo>\scripts\dsh-acp-worker.mjs` / `node <repo>\scripts\dsh-headless-worker.mjs`。
 - **`dsh --profile acp` は ACP の JSON-RPC stdio サーバー**。Orca のターミナル注入を直接向けると
   `-32700 Parse error` が pane に出て始まらない(実測)。必ずブリッジを挟む。ブリッジは
   `session/request_permission` を `allow_once` で機械応答してよい — **claude / codex の承認停止が
@@ -93,12 +95,34 @@ docs/
 - **dsh は agent hooks を持つ**(2026-10-06 以降、`orca agent hooks status` で `installed`)。
   旧記録の「dsh は stdin を 1 バイトも受け取れない / dispatch が `agent_readiness` で failed」は
   hooks 導入前の話。報告は `worker_done` 優先、拒否されたら `task-update` に落ちる。
-- **`agentCmdOverrides` で起動コマンドを差し替えた worker は `agent_readiness` を通れない**(2026-10-08 実測)。
-  原因は hooks ではなく **launch token**: 登録コマンドの codex は `dispatch.launch_token_hash` が入り
-  `state: ready / stage: input_accepted`、ブリッジを向いた dsh は token が空で
-  `agent_readiness` 失敗(`terminal_handle_stale` / `timeout`)。pane env の token は hooks 側に届くが
-  dispatch 側が照合に使えない。**よって dsh worker の報告は `task-update --status completed` が本体**
-  (`success` は無効。`consumer_fenced` なら自分の terminal だけ `run-use --id <run>` で 1 回再バインド)。
+- **pane に生きたプロセスが立っていない dsh は `agent_readiness` を通れない**(2026-10-08 実測)。
+  原因は hooks ではなく **launch token の照合**: 登録コマンドの codex / claude は `dispatch.launch_token_hash` が入り
+  `state: ready / stage: input_accepted`、`dsh-tui .` を直接起動する / 既存 pane を `--terminal` で指定する
+  状態では token が空で `agent_readiness` 失敗(`terminal_handle_stale` / `timeout`)。
+  pane env の token は hooks 側に届く(`last-status.json` の dsh 行と `authorityCommitments`)が
+  dispatch 側が照合に使えない。**launcher(下)で解消した**。readiness が落ちる間の報告は
+  `task-update` の事後報告になる(`success` は無効。`consumer_fenced` なら自分の terminal だけ
+  `run-use --id <run>` で 1 回再バインド)。
+- **dsh-tui は注入を受け付けられる**(実測: `dst .` pane へ `terminal send` → pwsh 実行して応答)。
+  dsh が動かない原因ではない。readiness が gate するので **dispatch 経由の注入が届かない**だけ。
+  `agentCmdOverrides` は `terminal create --command "dsh-tui ."` も差し替える(`dst` 経由は無関係)。
+- **ブリッジは起動直後に dsh-tui を先読みで起動し、並行して dispatch を照合する**(2026-10-08 実測)。
+  対話 pane はそのまま TUI で作業でき、worker pane は照合が当たった時点で TUI を殺して worker モードに入る
+  (`DSH_ACP_LOOKUP_MS` 既定 180 秒。worker の dispatch が見えるのは readiness 失敗後 ~110 秒、
+  worker-start 完了 ~170 秒の窓がある)。`ORCA_AGENT_LAUNCH_TOKEN` は**対話 pane にも入る**ので
+  判別に使わない(ログのみ)。殺した TUI のマウス追跡 CSI が stdin に漏れるので、
+  代替画面/追跡を解除して 1 秒ぶん stdin を drain してから注入を受ける(実測でノイズターン発生)。
+  **この状態で `agent_readiness` を通過した**(実測: `state=ready / stage=input_accepted` → `completed`)。
+  対話で dsh-tui だけ使いたい人の正解はブリッジを通さない **`dst .`**(エイリアス)。
+- **dsh worker の既定は launcher(`scripts/dsh-tui-launcher.mjs`)**(2026-10-08 実測)。dsh-tui を起動して
+  終了を待つだけの最小 launcher を `agentCmdOverrides.dsh` に向けると `state: ready / stage: input_accepted`
+  (~15 秒)で通過し、注入が TUI に入り、ワークが完走して `worker_done` で settlement される
+  (実測: `poll#3 completed` / provenance `worker_report`)。**ACP ブリッジは必須ではない**
+  (ブリッジの残る価値は permission 機械応答・MCP 注入・マルチターンセッション・モデル指定)。
+  対話で dsh-tui だけ使いたい人の正解はブリッジ/launcher を通さない **`dst .`**(エイリアス)。
+- **報告の本体は `worker_done`**。dispatch 生存中の `task-update --status completed` は CLI が拒否する
+  (実測: "cannot move to completed while supervised Dispatch … is active")。`task-update` は
+  dispatch が無い / 落ちた後の事後報告専用。
 - **dsh の LLM はローカルゲートウェイへ焼ける**(key 不要)。手宣言ルートで `apiKeyEnv` を省くと
   pi-ai が `No API key for provider` で落とすので、`headers: {Authorization: Bearer local}` で
   通す(pi-ai の `getClientApiKey` が非空 authorization を `"unused"` として採用する)。
