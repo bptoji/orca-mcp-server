@@ -1,7 +1,7 @@
 {
   "name": "orca-mcp",
   "version": "1.0.0",
-  "description": "Orca CLI をラップする MCP サーバー(status / delegate / task-status / message)",
+  "description": "コーディングのゴールを Commander エージェントと supervised なマルチエージェントワーカーへ委譲する、Orca CLI のオーケストレーションゲートウェイ(submit / poll / result / resolve gate / cancel)",
   "main": "dist/index.js",
   "type": "module",
   "bin": {
@@ -22,7 +22,11 @@
     "mcp",
     "modelcontextprotocol",
     "orca",
-    "orchestration"
+    "orchestration",
+    "commander",
+    "multi-agent",
+    "supervised-workers",
+    "task-dag"
   ],
   "author": "",
   "license": "ISC",

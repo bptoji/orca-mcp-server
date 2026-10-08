@@ -9,6 +9,8 @@ import {
   listAgentsInputSchema,
   listWorktreesInputSchema,
   messageInputSchema,
+  readinessInputSchema,
+  resolveGateInputSchema,
   sendMessageInputSchema,
 } from "../src/orca/schemas.js";
 
@@ -42,18 +44,43 @@ describe("getTaskStatusInputSchema", () => {
 });
 
 describe("delegateTaskInputSchema", () => {
-  it("spec だけ必須(低レベルな target 指定は全て任意)", () => {
+  it("spec だけ必須(低レベルな target 指定は公開していない)", () => {
     expect(delegateTaskInputSchema.safeParse({}).success).toBe(false);
     expect(delegateTaskInputSchema.safeParse({ spec: "README を更新" }).success).toBe(true);
   });
 
-  it("agent の既定は codex", () => {
-    expect(delegateTaskInputSchema.parse({ spec: "a" }).agent).toBe("codex");
+  it("commanderAgent の既定は codex", () => {
+    expect(delegateTaskInputSchema.parse({ spec: "a" }).commanderAgent).toBe("codex");
+    expect(delegateTaskInputSchema.parse({ spec: "a", commanderAgent: "claude" }).commanderAgent).toBe("claude");
+  });
+
+  it("constraints は文字列配列(1 本の prompt は受け付けない)", () => {
+    expect(delegateTaskInputSchema.safeParse({ spec: "a", constraints: ["既存APIを変更しない"] }).success).toBe(true);
+    expect(delegateTaskInputSchema.safeParse({ spec: "a", constraints: [] }).success).toBe(true);
+    expect(delegateTaskInputSchema.safeParse({ spec: "a", constraints: "テストを追加する" }).success).toBe(false);
+    expect(delegateTaskInputSchema.safeParse({ spec: "a", constraints: [1] }).success).toBe(false);
   });
 
   it("deps は文字列配列", () => {
     expect(delegateTaskInputSchema.safeParse({ spec: "a", deps: ["t1", "t2"] }).success).toBe(true);
     expect(delegateTaskInputSchema.safeParse({ spec: "a", deps: [1] }).success).toBe(false);
+  });
+
+  it("terminal / worktree / prompt / agent は公開していない(strictObject で拒否)", () => {
+    for (const key of ["terminal", "worktree", "prompt", "agent"]) {
+      expect(delegateTaskInputSchema.safeParse({ spec: "a", [key]: "x" }).success).toBe(false);
+    }
+  });
+});
+
+describe("resolveGateInputSchema", () => {
+  it("gateId / resolution / run が必須(gate は Run バインドスコープ)", () => {
+    expect(resolveGateInputSchema.safeParse({}).success).toBe(false);
+    expect(resolveGateInputSchema.safeParse({ gateId: "g1", resolution: "approve" }).success).toBe(false);
+    expect(resolveGateInputSchema.safeParse({ gateId: "", resolution: "approve", run: "r1" }).success).toBe(false);
+    expect(
+      resolveGateInputSchema.safeParse({ gateId: "g1", resolution: "approve", run: "r1" }).success,
+    ).toBe(true);
   });
 });
 
@@ -62,6 +89,20 @@ describe("getTaskResultInputSchema", () => {
     expect(getTaskResultInputSchema.safeParse({}).success).toBe(false);
     expect(getTaskResultInputSchema.safeParse({ taskId: "t1", outputLimit: 40 }).success).toBe(true);
     expect(getTaskResultInputSchema.safeParse({ taskId: "t1", outputLimit: 201 }).success).toBe(false);
+  });
+
+  it("includeChildren の既定は false(既定で応答を膨らませない)", () => {
+    expect(getTaskResultInputSchema.parse({ taskId: "t1" }).includeChildren).toBe(false);
+    expect(getTaskResultInputSchema.parse({ taskId: "t1", includeChildren: true }).includeChildren).toBe(true);
+  });
+});
+
+describe("readinessInputSchema", () => {
+  it("全て任意(commanderAgent は省略できる)", () => {
+    expect(readinessInputSchema.safeParse({}).success).toBe(true);
+    expect(readinessInputSchema.safeParse({ commanderAgent: "codex" }).success).toBe(true);
+    expect(readinessInputSchema.safeParse({ commanderAgent: "" }).success).toBe(false);
+    expect(readinessInputSchema.safeParse({ agent: "codex" }).success).toBe(false);
   });
 });
 
@@ -135,6 +176,16 @@ describe("cancelTaskInputSchema", () => {
   it("mode は stop / abandon のみ", () => {
     expect(cancelTaskInputSchema.safeParse({ taskId: "t1", mode: "abandon" }).success).toBe(true);
     expect(cancelTaskInputSchema.safeParse({ taskId: "t1", mode: "nuke" }).success).toBe(false);
+  });
+
+  it("cascade の既定は true(既定で子孫まで止める)", () => {
+    expect(cancelTaskInputSchema.parse({ taskId: "t1" }).cascade).toBe(true);
+    expect(cancelTaskInputSchema.parse({ taskId: "t1", cascade: false }).cascade).toBe(false);
+  });
+
+  it("strict なので未知のキー(terminal / force など)は拒否する", () => {
+    expect(cancelTaskInputSchema.safeParse({ taskId: "t1", terminal: "term_1" }).success).toBe(false);
+    expect(cancelTaskInputSchema.safeParse({ taskId: "t1", force: true }).success).toBe(false);
   });
 });
 

@@ -17,8 +17,8 @@ export const TASK_RESULT_TOOL_NAME = "orca_get_task_result";
  * 非同期 Job API(submit / poll / result)を登録する。
  *
  * 設計上の約束: 1 回の MCP 呼び出しでワーカーの完了を待たない。
- * delegate_task は task-create + dispatch までを済ませて `{ taskId, state }` を即返し、
- * 完了の監視は呼び出し側の poll に委ねる。
+ * delegate_task は run-create → task-create(Commander 用 spec) → worker-start までを
+ * 済ませて `{ taskId, state }` を即返し、完了の監視は呼び出し側の poll に委ねる。
  */
 export function registerJobTools(server: McpServer, client: OrcaClient): void {
   server.registerTool(
@@ -26,7 +26,7 @@ export function registerJobTools(server: McpServer, client: OrcaClient): void {
     {
       title: "Orca Delegate Task",
       description:
-        "タスクを委譲する(非同期 submit)。内部で run-create(未指定時) → task-create → worktree create --agent(既定 codex) → dispatch を行い、ワーカーの完了を待たずに { taskId, state: \"running\" } を返す。worktree / terminal を指定すれば既存環境へ、terminal 未指定の新規起動なら新しい worktree にエージェントを立てる。dispatch だけ失敗した場合はタスクを作成済みのまま state: \"queued\" + warnings を返す。",
+        "ゴールを Commander Agent に委譲する(非同期 submit / Commander API)。内部で run-create(run 未指定時) → task-create(固定の Commander 指示 + goal + repo + constraints を spec に焼く) → worker-start --worktree new-child --agent <commanderAgent>(既定 codex) を行い、Commander の完了を待たずに { taskId, state: \"running\", commander: true } を返す。Commander がゴールを分解して supervised worker へ差配するので、利用者が個々のワーカーやターミナルを直接指定することはない(terminal / worktree は受け付けない)。worker-start だけ失敗してもタスクは生き、state: \"queued\" + warnings を返す(queued は放置しても進まない)。repo は repo セレクタで渡すこと — id:<repoId> / path:<repo home> は解決できるが、worktree の displayName や worktree path は repo_not_found になる(現在の worktree の repoId は orca worktree current --json の result.worktree.repoId)。",
       inputSchema: delegateTaskInputSchema,
       annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
     },
@@ -35,14 +35,12 @@ export function registerJobTools(server: McpServer, client: OrcaClient): void {
         delegateTask(client, {
           spec: input.spec,
           title: input.title,
-          agent: input.agent,
-          worktree: input.worktree,
-          terminal: input.terminal,
+          commanderAgent: input.commanderAgent,
           repo: input.repo,
           run: input.run,
           deps: input.deps,
           parent: input.parent,
-          prompt: input.prompt,
+          constraints: input.constraints,
         }),
       ),
   );
@@ -52,7 +50,7 @@ export function registerJobTools(server: McpServer, client: OrcaClient): void {
     {
       title: "Orca Get Task Status",
       description:
-        "委譲したタスクの現在状態を正規化して返す(非同期 poll)。内部で task-list / dispatch-show / worker-list / gate-list を読むだけで、何も変更しない。state は queued / running / blocked / completed / failed / cancelled、phase は queued / starting / implementation / decision_gate / settling / finished。生の status は rawStatus に残す。",
+        "委譲したタスクの現在状態を正規化して返す(非同期 poll)。内部で task-list / dispatch-show / worker-list / gate-list を読むだけで、何も変更しない。state は queued / running / blocked / completed / failed / cancelled、phase は queued / starting / implementation / decision_gate / settling / finished。commander は Commander 自身の worker、children は Commander が task-create で分解した**直接の子タスク**(direct children、`parent_id` が対象タスクと一致するもの)とその worker(state 付き)なので、1 回の poll で配下の進捗が見える。孫以降(deep DAG)は children に現れない(子タスク自身の poll で見る)。gates が pending のときは orca_resolve_gate で承認/却下できる。生の status は rawStatus に残す。",
       inputSchema: getTaskStatusInputSchema,
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
@@ -65,7 +63,7 @@ export function registerJobTools(server: McpServer, client: OrcaClient): void {
     {
       title: "Orca Get Task Result",
       description:
-        "タスクの成果とワーカー出力を読む(非同期 result)。内部で task-list / dispatch-show / worker-read を読むだけで、何も変更しない。worker 出力は 1 件あたり既定 40 行・最大 4000 文字に切り詰める。",
+        "タスクの成果とワーカー出力を読む(非同期 result)。内部で task-list / dispatch-show / worker-read を読むだけで、何も変更しない。worker 出力は 1 件あたり既定 40 行・最大 4000 文字に切り詰める。既定では Commander 自身の成果と出力だけを返し、includeChildren: true で**直接の子タスク**(direct children)の result と出力(子 10 件・worker-read 8 件まで)を集約する。孫以降は集約しない(その子自身の result で見る)。",
       inputSchema: getTaskResultInputSchema,
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
@@ -75,6 +73,7 @@ export function registerJobTools(server: McpServer, client: OrcaClient): void {
           taskId: input.taskId,
           run: input.run,
           outputLimit: input.outputLimit,
+          includeChildren: input.includeChildren,
         }),
       ),
   );

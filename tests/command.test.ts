@@ -136,6 +136,18 @@ describe("runOrca (execFile ベース)", () => {
     expect(result.orcaError?.data).toEqual({ nextSteps: ["run-create"] });
   });
 
+  it("非ゼロ終了 + ok:true エンベロープ → transport 成功として data を返す(worker-start の readiness 失敗 receipt)", async () => {
+    // 実測: worker-start は agent_readiness 失敗時に ok:true の receipt を出して終了コード 1 で抜ける。
+    // 終了コードではなくエンベロープを意味論の主人として扱う(AGENTS.md)。
+    const script =
+      "process.stdout.write(JSON.stringify({ok:true,result:{state:'failed',stage:'agent_readiness',lastError:'timeout'}})); process.exit(1)";
+    const result = await fakeRun(script);
+    expect(result.ok).toBe(true);
+    expect(result.exitCode).toBe(1);
+    expect(result.error).toBeUndefined();
+    expect(result.data).toMatchObject({ ok: true });
+  });
+
   it("終了コード 0 + ok:false エンベロープ → ok: true のまま orcaError に理由を載せる", async () => {
     const script =
       "process.stdout.write(JSON.stringify({ok:false,error:{code:'worktree_not_found',message:'nope'}}))";

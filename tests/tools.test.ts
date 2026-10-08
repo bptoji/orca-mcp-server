@@ -15,7 +15,8 @@ import {
   TASK_RESULT_TOOL_NAME,
   TASK_STATUS_TOOL_NAME,
 } from "../src/tools/job.js";
-import { CANCEL_TASK_TOOL_NAME, SEND_MESSAGE_TOOL_NAME } from "../src/tools/intervene.js";
+import { CANCEL_TASK_TOOL_NAME, RESOLVE_GATE_TOOL_NAME, SEND_MESSAGE_TOOL_NAME } from "../src/tools/intervene.js";
+import { READINESS_TOOL_NAME, evaluateReadiness } from "../src/tools/readiness.js";
 
 // SDK 内部の登録テーブルにアクセスするための薄い型(スモークテスト用)。
 interface RegisteredToolsAccess {
@@ -33,6 +34,7 @@ function createStubClient() {
     };
   const stub = {
     status: record("status"),
+    skillsInstalled: record("skillsInstalled"),
     worktreeList: record("worktreeList"),
     worktreeShow: record("worktreeShow"),
     worktreePs: record("worktreePs"),
@@ -41,6 +43,8 @@ function createStubClient() {
     taskUpdate: record("taskUpdate"),
     dispatch: record("dispatch"),
     dispatchShow: record("dispatchShow"),
+    workerStart: record("workerStart"),
+    gateResolve: record("gateResolve"),
     send: record("send"),
     check: record("check"),
     reply: record("reply"),
@@ -52,7 +56,7 @@ function createStubClient() {
 }
 
 describe("createServer", () => {
-  it("Job API 3 + 介入 2 + 観測 read-only 4 が登録されている", () => {
+  it("Job API 3 + 介入 3 + 観測 read-only 5 が登録されている", () => {
     const { stub } = createStubClient();
     const server = createServer(stub);
     expect(server).toBeInstanceOf(McpServer);
@@ -66,7 +70,9 @@ describe("createServer", () => {
         TASK_RESULT_TOOL_NAME,
         SEND_MESSAGE_TOOL_NAME,
         CANCEL_TASK_TOOL_NAME,
+        RESOLVE_GATE_TOOL_NAME,
         STATUS_TOOL_NAME,
+        READINESS_TOOL_NAME,
         LIST_WORKTREES_TOOL_NAME,
         GET_WORKTREE_TOOL_NAME,
         LIST_AGENTS_TOOL_NAME,
@@ -88,13 +94,17 @@ describe("createServer", () => {
       "orca_terminal_send",
       "orca_terminal_create",
       "orca_worker_stop",
+      "orca_worker_start",
       "orca_task_update",
+      "orca_gate_create",
+      "orca_run_use",
+      "orca_skills_install",
     ]) {
       expect(registered).not.toContain(hidden);
     }
   });
 
-  it("変更系ツールの annotations: submit と cancel は destructive、send は非破壊", () => {
+  it("変更系ツールの annotations: submit と cancel は destructive、send / resolve_gate は非破壊", () => {
     const { stub } = createStubClient();
     const tools = (createServer(stub) as unknown as RegisteredToolsAccess)._registeredTools;
     const annotationsOf = (name: string) =>
@@ -111,7 +121,12 @@ describe("createServer", () => {
       readOnlyHint: false,
       destructiveHint: false,
     });
+    expect(annotationsOf(RESOLVE_GATE_TOOL_NAME)).toMatchObject({
+      readOnlyHint: false,
+      destructiveHint: false,
+    });
     expect(annotationsOf(TASK_STATUS_TOOL_NAME)).toMatchObject({ readOnlyHint: true });
+    expect(annotationsOf(READINESS_TOOL_NAME)).toMatchObject({ readOnlyHint: true });
   });
 
   it("サーバー名とバージョン", () => {
@@ -197,6 +212,121 @@ describe("flattenAgents", () => {
       idle: 1,
       waiting: 1,
     });
+  });
+});
+
+describe("evaluateReadiness", () => {
+  const readyStatus: JsonObject = {
+    ok: true,
+    result: {
+      app: { running: true },
+      runtime: { state: "ready", reachable: true, appVersion: "1.4.220", capabilities: ["orchestration.contract.v1"] },
+    },
+  };
+  const skillsWithOrchestration: JsonObject = {
+    ok: true,
+    result: { skills: [{ name: "orchestration" }, { name: "orca-cli" }] },
+  };
+
+  it("ランタイム / orchestration / skill が揃っていれば ready", () => {
+    const view = evaluateReadiness(readyStatus, skillsWithOrchestration);
+    expect(view["ready"]).toBe(true);
+    expect(view["missing"]).toEqual([]);
+    expect(view["nextAction"]).toBe("delegate 可能");
+    expect(view["checks"]).toHaveLength(3);
+  });
+
+  it("orchestration skill が無いと missing と nextAction にインストールコマンド", () => {
+    const view = evaluateReadiness(readyStatus, { ok: true, result: { skills: [{ name: "orca-cli" }] } });
+    expect(view["ready"]).toBe(false);
+    expect(view["missing"]).toEqual(["orchestration skill installed"]);
+    expect(view["nextAction"]).toContain("orca skills install --skill orchestration");
+  });
+
+  it("ランタイム未起動を missing に並べ、実行コマンドを nextAction で促す(自動では何もしない)", () => {
+    const view = evaluateReadiness(
+      { ok: true, result: { app: { running: false }, runtime: { state: "stopped", capabilities: [] } } },
+      new Error("runtime_unavailable"),
+    );
+    expect(view["ready"]).toBe(false);
+    expect(view["missing"]).toEqual([
+      "orca runtime",
+      "orchestration enabled",
+      "orchestration skill installed",
+    ]);
+    expect(view["nextAction"]).toContain("orca open");
+    // skills installed が失敗したことは check の detail としてそのまま見える(隠さない)
+    expect(JSON.stringify(view)).toContain("runtime_unavailable");
+  });
+
+  it("commanderAgent が skill を読めない場合は missing に出し、そのエージェント向けのコマンドを促す", () => {
+    const claudeOnly: JsonObject = {
+      ok: true,
+      result: { skills: [{ name: "orchestration", providers: ["agent-skills", "claude"] }] },
+    };
+    const view = evaluateReadiness(readyStatus, claudeOnly, "codex");
+    expect(view["ready"]).toBe(false);
+    expect(view["missing"]).toEqual(["orchestration available to codex"]);
+    expect(view["nextAction"]).toContain("orca skills install --skill orchestration --agent codex");
+    expect(JSON.stringify(view["checks"])).toContain("agent-skills, claude");
+  });
+
+  it("commanderAgent が providers に含まれていれば ready", () => {
+    const claudeOnly: JsonObject = {
+      ok: true,
+      result: { skills: [{ name: "orchestration", providers: ["agent-skills", "claude"] }] },
+    };
+    expect(evaluateReadiness(readyStatus, claudeOnly, "claude")["ready"]).toBe(true);
+  });
+
+  it("providers 列挙が無い古い CLI では落とさない(判定不能を ok に寄せる)", () => {
+    const noProviders: JsonObject = { ok: true, result: { skills: [{ name: "orchestration" }] } };
+    const view = evaluateReadiness(readyStatus, noProviders, "codex");
+    expect(view["ready"]).toBe(true);
+    expect(view["missing"]).toEqual([]);
+    expect(JSON.stringify(view["checks"])).toContain("判定不能");
+  });
+
+  it("dsh は共有 skills root を読むので providers 列挙に無くても落とさない", () => {
+    const claudeOnly: JsonObject = {
+      ok: true,
+      result: { skills: [{ name: "orchestration", providers: ["agent-skills", "claude", "codex"] }] },
+    };
+    const view = evaluateReadiness(readyStatus, claudeOnly, "dsh");
+    expect(view["ready"]).toBe(true);
+    expect(view["missing"]).toEqual([]);
+    expect(JSON.stringify(view["checks"])).toContain("共有 skills root");
+  });
+
+  it("dsh で skill が無いときは共有 skills root の確認を促す(--agent dsh を勧めない)", () => {
+    const noOrchestration: JsonObject = { ok: true, result: { skills: [{ name: "orca-cli" }] } };
+    const view = evaluateReadiness(readyStatus, noOrchestration, "dsh");
+    expect(view["ready"]).toBe(false);
+    expect(view["missing"]).toContain("orchestration available to dsh");
+    expect(view["nextAction"]).toContain("~/.agents/skills/orchestration/SKILL.md");
+    expect(view["nextAction"]).not.toContain("--agent dsh");
+  });
+
+  it("同じ skill 名の複数行を union して判定する(共有 root 行 + provider 宛て行)", () => {
+    // 実機で codex 宛ての導入後に providers が 2 行へ分かれた。1 行目だけ見ると false negative。
+    const splitRows: JsonObject = {
+      ok: true,
+      result: {
+        skills: [
+          { name: "orchestration", providers: ["agent-skills", "claude"] },
+          { name: "orchestration", providers: ["codex"] },
+        ],
+      },
+    };
+    expect(evaluateReadiness(readyStatus, splitRows, "codex")["ready"]).toBe(true);
+    expect(evaluateReadiness(readyStatus, splitRows, "claude")["ready"]).toBe(true);
+    expect(evaluateReadiness(readyStatus, splitRows, "cursor")["ready"]).toBe(false);
+  });
+
+  it("commanderAgent 指定時は checks に 4 項目目が並ぶ", () => {
+    const view = evaluateReadiness(readyStatus, skillsWithOrchestration, "codex");
+    expect(view["checks"]).toHaveLength(4);
+    expect(view["commanderAgent"]).toBe("codex");
   });
 });
 

@@ -1,6 +1,8 @@
 # AGENTS.md — orca-mcp
 
 このリポジトリは **Orca CLI をラップする MCP サーバー** です。
+目的は **コーディングのゴールを Commander エージェントと supervised なマルチエージェントワーカーへ
+委譲する、Orca CLI のオーケストレーションゲートウェイ**(`package.json` の description と同じ)。
 TypeScript (ESM) + `@modelcontextprotocol/server` (SDK v2) + zod v4 + vitest で構成されます。
 
 ## コマンド
@@ -23,18 +25,25 @@ src/
   orca/
     command.ts      # orca CLI を子プロセスで実行する最下層(runOrca / buildArgs / OrcaCommandError)
     client.ts       # OrcaClient: コマンド単位の型付きメソッド。runner 注入可能(テストでモック)
-    job.ts          # 非同期 Job API の内部モデル(正規化 + delegateTask / getTaskStatus / getTaskResult)
+    job.ts          # 非同期 Job API の内部モデル(正規化 + delegateTask / getTaskStatus / getTaskResult / sendMessage / cancelTask / resolveGate)
     schemas.ts      # 各ツールの zod inputSchema
   tools/
     result.ts       # 共通の CallToolResult ヘルパー(textResult / errorResult / resultOf)
     job.ts          # orca_delegate_task / orca_get_task_status / orca_get_task_result
-    intervene.ts    # orca_send_message / orca_cancel_task(変更系コマンドはここに集約)
+    intervene.ts    # orca_send_message / orca_resolve_gate / orca_cancel_task(変更系コマンドはここに集約)
     status.ts       # orca_status          … status
+    readiness.ts    # orca_readiness       … status + skills installed の前提チェック(インストールはしない)
     worktrees.ts    # orca_list_worktrees  … worktree list / orca_get_worktree … worktree show
     agents.ts       # orca_list_agents     … worktree ps の agents[] を平坦化
     delegate.ts     # orca_delegate        … task-create + dispatch(未登録の足場)
     message.ts      # orca_message         … send / check / reply / inbox(未登録の足場)
 tests/              # vitest。子プロセスを実際に起動しない(モック runner / 偽 client)
+scripts/
+  e2e.mjs           # 実ランタイム E2E(stdio でサーバーを起動し submit→poll→gate→result→cancel)
+  dsh-acp-worker.mjs      # Orca 注入 → ACP session/prompt に載せ直すブリッジ(推奨・マルチターン)
+  dsh-headless-worker.mjs # Orca 注入 → dsh --profile headless の argv に載せ直すブリッジ(1 タスク 1 プロセス)
+docs/
+  templates/acp-cordis.patch.example.yml  # dsh acp プロファイル用パッチのテンプレ(IP 等は置かない)
 ```
 
 ## 公開 API の設計 — 非同期 Job API(最優先の設計約束)
@@ -45,16 +54,70 @@ tests/              # vitest。子プロセスを実際に起動しない(モッ
 
 | ツール | 役割 | 内部コマンド |
 | --- | --- | --- |
-| `orca_delegate_task` | submit | run-create(未指定時) → task-create → worktree create --agent → dispatch |
-| `orca_get_task_status` | poll | task-list / dispatch-show / worker-list / gate-list |
-| `orca_get_task_result` | result | task-list / dispatch-show / worker-read |
+| `orca_delegate_task` | submit(**Commander 専用**) | run-create(未指定時) → task-create(固定 Commander 指示 + goal + repo + constraints) → worker-start `--worktree new-child --agent <commanderAgent>` |
+| `orca_get_task_status` | poll | task-list / dispatch-show / worker-list / gate-list(子タスクは task-list の `parent_id` から拾う) |
+| `orca_get_task_result` | result | task-list / dispatch-show / worker-read(`includeChildren: true` で子タスクの result と出力も集約) |
 | `orca_send_message` | intervene(非破壊) | `orchestration send`(必要なら run-use でバインド切替) |
-| `orca_cancel_task` | intervene(破壊的) | worker-stop/abandon → `task-update --status failed` |
+| `orca_resolve_gate` | intervene(非破壊 / Human-in-the-loop) | gate-list → `orchestration gate-resolve`(必要なら run-use でバインド切替) |
+| `orca_cancel_task` | intervene(破壊的 / 既定 cascade) | 子孫を**子から順**に worker-stop/abandon → `task-update --status failed` |
 | `orca_status` | 観測 | `orca status --json` |
+| `orca_readiness` | 観測 | `orca status --json` + `orca skills installed --json`(`commanderAgent` で providers まで見る) |
 | `orca_list_worktrees` | 観測 | `orca worktree list --json` |
 | `orca_get_worktree` | 観測 | `orca worktree show --json` |
 | `orca_list_agents` | 観測 | `orca worktree ps --json` |
 | `orca_delegate` / `orca_message` | 未登録(足場) | 低レベルすぎるため公開しない |
+
+### `orca_delegate_task` は Commander API だけ(意味を 2 通りにしない)
+
+- 公開 schema は `spec / title / commanderAgent / constraints / repo / run / deps / parent` のみ。
+  `z.strictObject` なので `terminal` / `worktree` / `prompt` / `agent` は **拒否される**。
+- このツールは常に Commander を起動する。既存 terminal / worktree への直接 dispatch が必要なら
+  内部用の `tools/delegate.ts` を使う(公開しない)。
+- `prompt` という語は使わない。Commander へ課する制約は `constraints: string[]` で、
+  `COMMANDER_PROMPT` の Constraints 欄に箇条書きで焼く。
+- `COMMANDER_PROMPT` には「orchestration を変更する前に `orca skills get orchestration --full` を
+  読み、記憶した CLI 構文を使わない」という Orca 公式の推奨を固定で焼く。
+- 作業ワーカーの選択は Commander 側。MCP 側の語彙は `commanderAgent`(= どの Commander を起動するか)。
+- **`commanderAgent` は Orca 側で設定されたエージェント名のみ**(`worker-start --agent` の制約)。
+  実機で `dsh` は dsh-tui(対話)が起動して dispatch `failed`、`"dsh headless"` は `agent_unconfigured`。
+  非対話の Commander が欲しいなら Orca のエージェント設定(`agentCmdOverrides`、CLI からの設定コマンドは無い)に
+  起動コマンドを登録してもらう — MCP 側でエージェント引数を組み込むフラグは無い。
+  dsh の既定登録コマンドは `dsh-tui .`(pane 実測)。非対話にするならブリッジを向ける:
+  `node <repo>\scripts\dsh-acp-worker.mjs`(**推奨**、README 参照)/ `node <repo>\scripts\dsh-headless-worker.mjs`。
+- **`dsh --profile acp` は ACP の JSON-RPC stdio サーバー**。Orca のターミナル注入を直接向けると
+  `-32700 Parse error` が pane に出て始まらない(実測)。必ずブリッジを挟む。ブリッジは
+  `session/request_permission` を `allow_once` で機械応答してよい — **claude / codex の承認停止が
+  dsh では発生しない**という唯一の利点がある。応答は
+  `{ outcome: { outcome: "selected", optionId } }` / `{ outcome: { outcome: "cancelled" } }`。
+  `{ selected: … }` は拒否扱いで tool が `failed` になる(実測)。
+- **dsh は agent hooks を持つ**(2026-10-06 以降、`orca agent hooks status` で `installed`)。
+  旧記録の「dsh は stdin を 1 バイトも受け取れない / dispatch が `agent_readiness` で failed」は
+  hooks 導入前の話。報告は `worker_done` 優先、拒否されたら `task-update` に落ちる。
+- **`agentCmdOverrides` で起動コマンドを差し替えた worker は `agent_readiness` を通れない**(2026-10-08 実測)。
+  原因は hooks ではなく **launch token**: 登録コマンドの codex は `dispatch.launch_token_hash` が入り
+  `state: ready / stage: input_accepted`、ブリッジを向いた dsh は token が空で
+  `agent_readiness` 失敗(`terminal_handle_stale` / `timeout`)。pane env の token は hooks 側に届くが
+  dispatch 側が照合に使えない。**よって dsh worker の報告は `task-update --status completed` が本体**
+  (`success` は無効。`consumer_fenced` なら自分の terminal だけ `run-use --id <run>` で 1 回再バインド)。
+- **dsh の LLM はローカルゲートウェイへ焼ける**(key 不要)。手宣言ルートで `apiKeyEnv` を省くと
+  pi-ai が `No API key for provider` で落とすので、`headers: {Authorization: Bearer local}` で
+  通す(pi-ai の `getClientApiKey` が非空 authorization を `"unused"` として採用する)。
+- **エージェント側の承認プロンプトが E2E の最大の停止点**(claude / codex とも実測)。
+  `orca terminal send` は承認プロンプトへの入力を `agent_prompt_blocked` で拒否するため、
+  MCP 側・自動化側から解除できない(人間が UI で答える)。E2E を通すならエージェント側の許可設定を
+  先に緩める(Claude: `Bash(orca:*)` allow / Codex: 下記)。
+- **codex の承認は `--approve-for-me` で解く**(2026-10-08 実測・本運用)。`agentDefaultArgs.codex` に設定すると
+  承認要求が workspace-write sandbox の自動レビューへ流れて停止しない。`approval_policy="never"` +
+  `sandbox_mode="workspace-write"` は**逆効果**(コマンドが自動拒否され「blocked by policy」)。
+  `--dangerously-bypass-approvals-and-sandbox` は通るが sandbox を完全に外す最終手段。
+  `~/.codex/config.toml` の変更は不要(実行後に復元した)。
+- **`repo` は repo セレクタ**(E2E 実機確認): `id:<repoId>` / `path:<repo home>` は解決できるが、
+  worktree の displayName(`name:weever`)や worktree path は `repo_not_found`。repoId は
+  `orca worktree current --json` の `result.worktree.repoId`。
+- **`worker-start` だけ transport timeout を 180 秒**(`WORKER_START_TIMEOUT_MS`)。worktree 作成 +
+  setup hook + エージェント起動 + 初ターン観測まで同期で走るため、既定 30 秒では SIGKILL される(実測)。
+- `queued`(worker-start 失敗)は放置しても進まない。`nextActionHint` が「delegate し直す / cancel する」を
+  明示する(worker / dispatch が 0 件のとき)。
 
 ### 非同期の決まり
 
@@ -62,38 +125,76 @@ tests/              # vitest。子プロセスを実際に起動しない(モッ
   `{ taskId, state: "running" }` を返して終わる。30 分ブロックする同期委譲は作らない。
 - 完了の監視は呼び出し側の poll。poll は常に短時間で返す(タイムアウトは子プロセス側のみ)。
 - submit は**部分成功を返せる**: task-create まで成功したらタスクは生き、
-  dispatch 失敗は `state: "queued"` + `warnings` で伝える(例外にしてタスクを消さない)。
+  worker-start 失敗は `state: "queued"` + `warnings` で伝える(例外にしてタスクを消さない)。
 - 状態は正規化する(`queued/running/blocked/completed/failed/cancelled`)。CLI 生の値は
-  `rawStatus` に残す。phase は worker/gate から推定し、根拠が無ければ `starting` に寄せる。
+  `rawStatus` に残す。phase は worker/gate から推定し、根拠が無ければ `starting` に寄せる
+  (推定には Commander 配下の child worker も含める)。
+- poll は **Commander の配下を見せる**: `children` に**直接の子タスク**(`parent_id` 一致、最大 20 件)と
+  その worker の `state` を入れる。子タスクを見るために追加の orca コマンドを足しにいかない
+  (task-list 1 回で揃う)。打ち切りは `childCount`(実件数)/ `returnedChildCount` / `childrenTruncated` で正直に伝える。
+  **孫以降は `children` に出さない**(その子の poll で見る)。deep chain より並列を Commander Prompt で推奨しているので
+  ツール説明に "direct children" と明記する。
+- **cancel はジョブ単位(cascade 既定 true)**: 親 Commander だけ止めて子 Worker を走らせたままにしない。
+  `collectDescendants` で子孫を post-order(子から順)に並べ、`worker fence → task failed` を各タスクに適用する。
+  **2 段階(preflight → mutation)**: 全 target の dispatch を読み切ってから叩く。上限超過(子孫 12 件 /
+  1 タスクあたり dispatch 3 件)は**何も変更する前に** `cancel_scope_too_large` /
+  `cancel_dispatch_scope_too_large` で断る — silent slice は「一部しか止めていないのに `cancelled: true`」の
+  元凶(post-order 末尾の root 漏れ、4 件目の dispatch 生存)。終端状態の子は触らない。
+  子タスクの確定失敗は `warnings` に留める。
+- **Commander(root)の fence 失敗は cancel 成功にしない**: 対象タスクの fence に 1 件でも失敗したら
+  `cancel_incomplete`(`state: "partial"` / `cancelled: false` / `fullyStopped: false`)で**対象 task は更新しない**。
+  「論理 cancel」と「実プロセス停止」のズレを放置しないため。成功応答には `fullyStopped`(fence 全成功か)を載せる。
+- **result の子集約は明示されたときだけ**: `orca_get_task_result` の既定は Commander だけ。
+  `includeChildren: true` で子 10 件・worker-read 8 件まで(応答サイズと CLI 呼び出し数の抑制)。
+  子行に `dispatch_id` があれば dispatch-show を足しにいかない。
+- `outcome` は `worker_done` 専用: 缺失は `outcome_required`、他種別への付与は `outcome_not_allowed`、
+  `dispatchId` 欠けは `dispatch_id_required` で CLI へ叩き合う前に弾く(`--outcome` を client が渡さないと
+  CLI 側で worker_done が通らない。CLI は dispatchId も要求する)。
 - ジョブ層の語彙は `JobError`(`task_not_found` / `task_id_missing` / `run_create_failed` /
-  `outcome_required` / `cancel_incomplete`)。CLI 側の語彙(`run_required` など)はそのまま転送する。
+  `outcome_required` / `outcome_not_allowed` / `dispatch_id_required` / `cancel_incomplete` /
+  `cancel_scope_too_large` / `cancel_dispatch_scope_too_large` / `gate_not_found`)。
+  CLI 側の語彙(`run_required` など)はそのまま転送する。
+- `state: "cancelled"` は **MCP 側の論理状態**(CLI に native status が無い)。実体は
+  `status: failed` + `result: "cancelled: <reason>"`。README にその旨を 1 行書く。
+- poll は worker の `projection.attention.requiresAction` を `attentionRequired` / `attentionNotes`
+  (行には `attentionCategories`)として出す。ゲートが pending でないのに止まる典型はエージェント側の
+  ツール承認プロンプト(E2E 実測)。Commander Prompt には「答えられない承認待ちで止めない / 新しい Run を
+  作らない(Run ownership、子 task は `--parent` 自分の task)」を固定で焼く。
 - 出力は既定で切り詰める(`specPreview` 200 字、worker 出力 4000 字、agents の prompt 200 字)。
 
 ## 登録ツール(現状)
 
-`createServer()` は上記 9 個だけを登録する。`delegate.ts` / `message.ts` は足場として
+`createServer()` は上記 11 個だけを登録する。`delegate.ts` / `message.ts` は足場として
 ファイルを残す(テストは生かす)。登録を外したツールのファイルは削除しない。
 
 読み取り・poll 系の決まり:
 
 - 観測ツールの `annotations` は `{ readOnlyHint: true, openWorldHint: false }` 固定。
   `orca_delegate_task` / `orca_cancel_task` は `readOnlyHint: false` + `destructiveHint: true`、
-  `orca_send_message` は `readOnlyHint: false` + `destructiveHint: false`。
+  `orca_send_message` / `orca_resolve_gate` は `readOnlyHint: false` + `destructiveHint: false`。
 - 大きな欄は既定で省略する(`orca_list_agents` は `prompt` を 200 文字で切り詰め、
   `lastAssistantMessage` は `full: true` のときだけ)。
 - 1 ハンドラーで複数の orca コマンドを呼んでよいのは **poll / result の読み集め**
   (`task-list` + `dispatch-show` + `worker-list` + `gate-list`)、submit の既定フロー、
-  そして **介入ツール(`orca_send_message` / `orca_cancel_task`)だけ**。
-  poll / result / 観測ツールが変更系コマンド(task-update / worker-stop / run-use)を呼ぶことは禁止。
+  観測の `orca_readiness`(`status` + `skills installed`)、
+  そして **介入ツール(`orca_send_message` / `orca_resolve_gate` / `orca_cancel_task`)だけ**。
+  poll / result / 観測ツールが変更系コマンド(task-update / worker-stop / gate-resolve / run-use)を呼ぶことは禁止。
 - poll の応答に生の JSON をそのまま入れず、正規化した上で `rawStatus` 等の生値を添える。
 
 ### Run バインドと `consumer_fenced`
 
 orca CLI は **呼び出し元ターミナルを 1 つの Run にバインド**する。バインドと違う Run に
-対して `task-update` / `send` などをすると `consumer_fenced` で拒否される
+対して `task-update` / `send` / `gate-resolve` などをすると `consumer_fenced` で拒否される
 (メッセージにバインド中の Run ID が入る)。`runMutation()` がそのときだけ
 `run-use --id <run>` でバインドを切り替えて **1 回だけ**再試行する。それ以外で
 `run-use` を勝手に呼ばないこと(呼び出し元の pane の状態が変わるため)。
+
+- **バインドはプロセス共有の状態**。並行リクエストが `run-use` を交互に叩くと、A が切り替えた
+  バインドを B が書き換えて A の再試行が別 Run に届く。`runMutation()` は `MutationQueue` で
+  **変更系を 1 本に直列化**し、`run-use` + 再試行の並びを他リクエストと挟まない。
+  読み取り(task-list / worker-list など)はロックしない。
+- `gate-create` / `gate-resolve` には `--run` が無い(Run スコープはバインドで決まる)。
+  なので `orca_resolve_gate` の `run` は必須で、`gate-list --run <run>` で対象を読んでから叩く。
 
 ## 決まりごと
 
@@ -122,6 +223,10 @@ orca CLI は **呼び出し元ターミナルを 1 つの Run にバインド**�
 - **transport と CLI の意味は別軸で持つ。** `error` は終了コード等の分類、`orcaError` は
   stdout の `ok:false` エンベロープが運ぶ CLI 側の理由(`run_required` など)。
   終了コード 0 でも `ok:false` は入り得る(`ok: true` のまま `orcaError` だけ載せる)。
+  **逆も実測**: `worker-start` は agent_readiness 失敗時に **ok:true の receipt を出して終了コード 1**
+  で抜ける。stdout が `ok:true` エンベロープなら transport 成功として `data` を返し、
+  `exitCode` だけ診断値として残す(`isOkEnvelope`)。終了コードを主人にすると
+  receipt が丸ごと `non_zero_exit` になり delegate が queued に落とす(E2E 実測)。
 - 例外化はクライアント層(`OrcaClient.call`)だけが行う。ツール層は
   `OrcaCommandError.code` を応答に載せて返す。このとき **`orcaError` があれば transport の
   code より優先する**(モデルに `non_zero_exit` より `run_required` を伝える)。
@@ -139,6 +244,8 @@ orca CLI は **呼び出し元ターミナルを 1 つの Run にバインド**�
   引数組み立ては純粋な配列操作(`buildArgs`)に保ち、プロセス起動は `command.ts` の
   `execFile` に集約する(他ファイルで `spawn` / `exec` を使わない)。
 - バイナリパスは `ORCA_BIN` 環境変数で上書き可能(既定: PATH 上の `orca`)。
+- **リポジトリの文章は日本語で書く**(README・AGENTS.md・`package.json` の description・
+  ツールの title/description・テスト名)。`keywords` のような検索タグは英語のままにする。
 - ESM なので相対 import は `.js` 拡張子付き(`import { x } from "./client.js"`)。
   型のみ import は `import type`(`verbatimModuleSyntax`)。
 - テストは orca ランタイム不要。`CommandRunner` の注入点を使うこと。
@@ -147,3 +254,7 @@ orca CLI は **呼び出し元ターミナルを 1 つの Run にバインド**�
 
 - 大半のコマンドは起動中の Orca ランタイムを必要とします(未起動なら `orca open`)。
 - コマンド仕様の確認は `orca --help` / `orca orchestration <cmd> --help` / `orca agent-context --json`。
+- **公開サイトの掲載は CLI バージョンに追いつかないことがある。** `worker-abandon` は実機 1.4.220 の
+  `orca orchestration --help` に存在する("Fence a worker without claiming its process stopped"、
+  資源を残しプロセス/filesystem に触らない)が、公式ドキュメントの掲載有無は別軸。
+  新しいコマンドを公開 API に載せる前に**実機で `--help` を確認**し、README にはその根拠を書く。

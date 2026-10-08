@@ -14,6 +14,7 @@ coverage/
 .tmp-*
 *.tmp
 scratch/
+e2e-transcript.json
 
 # --- ログ ---
 *.log
