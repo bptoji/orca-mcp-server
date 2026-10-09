@@ -10,6 +10,13 @@ import { registerStatusTool } from "./tools/status.js";
 import { registerGetWorktreeTool, registerListWorktreesTool } from "./tools/worktrees.js";
 import { registerListAgentsTool } from "./tools/agents.js";
 import { registerReadinessTool } from "./tools/readiness.js";
+import {
+  TransportConfigError,
+  resolveTransportConfig,
+  startUpRefusal,
+  transportWarnings,
+} from "./server/config.js";
+import { startHttpServer } from "./server/http.js";
 // 未登録の足場(低レベルすぎる API を外部に出さない): tools/delegate.ts / tools/message.ts
 
 export const SERVER_NAME = "orca-mcp";
@@ -43,6 +50,45 @@ function isMainModule(): boolean {
 }
 
 if (isMainModule()) {
+  startFromEnv();
+}
+
+/**
+ * 既定は stdio(既存の起動経路を変えない)。`ORCA_MCP_TRANSPORT=http` のときだけ HTTP で立つ。
+ * 設定の解釈・起動可否の判定は src/server/config.js の純粋関数にあり、ここでは配線だけ行う。
+ */
+function startFromEnv(): void {
+  let config;
+  try {
+    config = resolveTransportConfig();
+  } catch (error) {
+    if (error instanceof TransportConfigError) {
+      console.error(`[${SERVER_NAME}] ${error.code}: ${error.message}`);
+      process.exit(1);
+      return;
+    }
+    throw error;
+  }
+
+  if (config.transport === "stdio") {
+    startStdio();
+    return;
+  }
+
+  const refusal = startUpRefusal(config);
+  if (refusal !== null) {
+    console.error(`[${SERVER_NAME}] ${refusal.code}: ${refusal.message}`);
+    process.exit(1);
+    return;
+  }
+  for (const warning of transportWarnings(config)) {
+    console.error(`[${SERVER_NAME}] ${warning}`);
+  }
+
+  void startHttp(config);
+}
+
+function startStdio(): void {
   const handle = serveStdio(() => createServer(), {
     onerror: (error) => {
       // stdout は MCP ワイヤー専用。診断は stderr へ出すこと。
@@ -54,5 +100,21 @@ if (isMainModule()) {
     process.on(signal, () => {
       void handle.close().finally(() => process.exit(0));
     });
+  }
+}
+
+async function startHttp(config: ReturnType<typeof resolveTransportConfig>): Promise<void> {
+  try {
+    // 1 リクエスト 1 サーバー。context は使わないが factory の形に合わせる。
+    const handle = await startHttpServer({ config, createServer: () => createServer() });
+    for (const signal of ["SIGINT", "SIGTERM"] as const) {
+      process.on(signal, () => {
+        void handle.close().finally(() => process.exit(0));
+      });
+    }
+  } catch (error) {
+    // listen 失敗(port 占有 / bind 不可)は起動失敗として終わる。
+    console.error(`[${SERVER_NAME}] http_start_failed: ${(error as Error).message}`);
+    process.exit(1);
   }
 }

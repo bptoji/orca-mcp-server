@@ -76,6 +76,55 @@ npm test          # vitest(orca ランタイム不要の単体テスト)
 macOS / Linux では `"args": ["/home/<your-user>/<repo-dir>/orca-mcp/dist/index.js"]` のように絶対パスで指定します。
 ビルドに依存したくない開発中は `"command": "npx"` + `"args": ["tsx", "src/index.ts"]` でも動きます。
 
+### 別 PC から使う(HTTP トランスポート)
+
+既定は **stdio** です。HTTP で立つのは `ORCA_MCP_TRANSPORT=http` を設定したときだけなので、
+既存の登録(上の `command` / `args`)はそのまま使えます。
+
+| 環境変数 | 既定 | 内容 |
+| --- | --- | --- |
+| `ORCA_MCP_TRANSPORT` | `stdio` | `stdio` / `http` |
+| `ORCA_MCP_HTTP_HOST` | `127.0.0.1` | listen 先(`http` のときだけ参照。IPv6 は `::1` の表記で渡す) |
+| `ORCA_MCP_HTTP_PORT` | `8765` | listen port(`0` で空きポート) |
+| `ORCA_MCP_AUTH_TOKEN` | 未設定 | 設定したときだけ `Authorization: Bearer` を検証 |
+| `ORCA_MCP_ALLOWED_HOSTS` | `localhost,127.0.0.1,[::1]` | `Host` ヘッダーの許可リスト(カンマ区切り) |
+| `ORCA_MCP_ALLOWED_ORIGINS` | `localhost,127.0.0.1,[::1]` | `Origin` ヘッダーの許可リスト(カンマ区切り) |
+
+```bash
+npm run build
+ORCA_MCP_TRANSPORT=http ORCA_MCP_AUTH_TOKEN=$(openssl rand -hex 32) node dist/index.js
+```
+
+エンドポイントは `/mcp` です。
+
+```json
+{
+  "mcpServers": {
+    "orca": {
+      "type": "http",
+      "url": "http://127.0.0.1:8765/mcp",
+      "headers": { "Authorization": "Bearer <token>" }
+    }
+  }
+}
+```
+
+**別 PC からは `ssh -L` で中継するのを推奨します**(サーバーはループバック専用のままにできます)。
+
+```bash
+ssh -L 8765:127.0.0.1:8765 <server>
+```
+
+クライアントは自分の `127.0.0.1:8765` へ繋ぐので、`Host` は `127.0.0.1` のままで**許可リストの追加は不要**です。
+WireGuard / Tailscale を使う場合はトンネル側の IP を `ORCA_MCP_ALLOWED_HOSTS` に足します。
+
+`ORCA_MCP_HTTP_HOST` を `0.0.0.0` や特定 NIC IP に直接 bind する構成は**非推奨**です(plain HTTP を LAN にさらす)。
+使うなら TLS proxy か VPN の内側で使い、次の点を揃えてください。
+
+- `ORCA_MCP_AUTH_TOKEN` は**必須**(未設定だと起動しません)
+- `ORCA_MCP_ALLOWED_HOSTS` に**到達に使うホスト名 / IP を列挙**(入っていない `Host` は 403)
+- Windows では該当 port の**受信ファイアウォールルール**が必要
+
 ### 頼む前のチェック
 
 頼む前に `orca_readiness` を実行してください。**何もインストールしません**(勝手に skill を配らない)。
@@ -431,6 +480,15 @@ poll を打ち切る前に数回待ってください。**launcher 運用では�
 | `gate_not_found` | その Run に gate が無い | `run` を対象 Run に直す(`gate-list` は Run バインドスコープ) |
 | `orca 起動失敗: orca CLI が見つかりませんでした` | PATH / `ORCA_BIN` | PATH を確認するか `ORCA_BIN` にバイナリパスを指定 |
 | MCP クライアントに接続されない | 未ビルド / stdio 設定 | `npm run build` 後に `npm run dev` で手動起動して確認 |
+| `http_token_required` で起動しない | `ORCA_MCP_HTTP_HOST` がループバック外で `ORCA_MCP_AUTH_TOKEN` が未設定 | トークンを設定するか、`ORCA_MCP_HTTP_HOST` を `127.0.0.1` にして `ssh -L` で中継する |
+| HTTP で 401 | `Authorization` の欠落 / トークン不一致 / `Bearer` 以外の scheme | クライアントの `Authorization: Bearer <token>` がサーバーの `ORCA_MCP_AUTH_TOKEN` と一致するか確認 |
+| HTTP で 403 `Invalid Host` | `Host` が `ORCA_MCP_ALLOWED_HOSTS` に無い | 到達に使うホスト名 / IP を列挙する(`ssh -L` なら `127.0.0.1` のままで通る) |
+| HTTP で 403 `Invalid Origin` | ブラウザ発の `Origin` が `ORCA_MCP_ALLOWED_ORIGINS` に無い | 許可リストへ追加する(`Origin` を出さないクライアントは対象外) |
+| HTTP で 413 | 要求 body が 4 MiB 超 | 大きな内容は task 参照などの小さなセレクタで渡す(413 のあと接続が切れることがあります) |
+| HTTP で 415 | `Content-Type` が `application/json` でない | `Content-Type: application/json` を付けて送る |
+| HTTP で 500 | サーバー内部で例外(サーバーは生きたまま続く) | stderr の `[http] request_failed:` を確認してリトライ |
+| HTTP で 405(GET / DELETE) | stateless 構成は session 操作を受け付けない | `POST` の JSON-RPC を使う(想定どおりの挙動) |
+| `transport_invalid` / `port_invalid` / `host_invalid` | 環境変数の値が不正 | `ORCA_MCP_TRANSPORT` は `stdio` / `http`、port は 0〜65535 の整数、host は空にしない |
 
 ---
 
@@ -450,12 +508,16 @@ poll を打ち切る前に数回待ってください。**launcher 運用では�
 ```
 orca-mcp/
 ├─ src/
-│  ├─ index.ts          # エントリ(createServer + stdio 接続)
+│  ├─ index.ts          # エントリ(createServer + stdio / http の分岐)
 │  ├─ orca/
 │  │  ├─ command.ts     # 子プロセス実行の最下層(--json 付与・JSON パース・タイムアウト)
 │  │  ├─ client.ts      # 型付き orca CLI クライアント(runner 注入可能)
 │  │  ├─ job.ts         # 非同期 Job API の内部モデル(正規化 + submit/poll/result)
 │  │  └─ schemas.ts     # ツール入力の zod スキーマ
+│  ├─ server/
+│  │  ├─ config.ts      # 環境変数の解釈(純粋関数)+ 起動可否の判定
+│  │  ├─ auth.ts        # 静的トークンの OAuthTokenVerifier(SDK の gate に差し込む)
+│  │  └─ http.ts        # node:http + Host / Origin / Bearer gate + toNodeHandler
 │  └─ tools/
 │     ├─ result.ts      # 共通の CallToolResult ヘルパー(text / isError)
 │     ├─ job.ts         # orca_delegate_task / orca_get_task_status / orca_get_task_result
@@ -472,7 +534,9 @@ orca-mcp/
 │  ├─ copilot-launcher.mjs    # copilot worker 用: COPILOT_ALLOW_ALL=true を設定して copilot を起動する最小 launcher
 │  ├─ dsh-acp-worker.mjs      # Orca 注入 → ACP session/prompt に載せ直すブリッジ
 │  └─ dsh-headless-worker.mjs # 注入 → dsh --profile headless の argv に載せ直すブリッジ(旧経路)
-├─ docs/templates/acp-cordis.patch.example.yml   # ACP 用ローカル LLM ルーティングのテンプレ
+├─ docs/
+│  ├─ templates/acp-cordis.patch.example.yml   # ACP 用ローカル LLM ルーティングのテンプレ
+│  └─ design/streamable-http-transport.md      # HTTP トランスポートの設計案
 ├─ tests/               # orca ランタイム不要の単体テスト(job.test.ts は偽 client)
 ├─ AGENTS.md            # エージェント向け開発規約
 ├─ package.json
