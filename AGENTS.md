@@ -21,12 +21,16 @@ TypeScript (ESM) + `@modelcontextprotocol/server` (SDK v2) + zod v4 + vitest で
 
 ```
 src/
-  index.ts          # MCP サーバーのエントリ。createServer() で全ツールを登録し stdio で接続
+  index.ts          # MCP サーバーのエントリ。createServer() で全ツールを登録し stdio / http を分岐
   orca/
     command.ts      # orca CLI を子プロセスで実行する最下層(runOrca / buildArgs / OrcaCommandError)
     client.ts       # OrcaClient: コマンド単位の型付きメソッド。runner 注入可能(テストでモック)
     job.ts          # 非同期 Job API の内部モデル(正規化 + delegateTask / getTaskStatus / getTaskResult / sendMessage / cancelTask / resolveGate)
     schemas.ts      # 各ツールの zod inputSchema
+  server/
+    config.ts       # 環境変数の解釈(純粋関数)+ 起動可否の判定(ループバック外 + トークン無しは拒否)
+    auth.ts         # 静的トークンの OAuthTokenVerifier(SDK の requireBearerAuth に差し込む)
+    http.ts         # node:http + Host / Origin / Bearer gate + toNodeHandler(createMcpHandler(...))
   tools/
     result.ts       # 共通の CallToolResult ヘルパー(textResult / errorResult / resultOf)
     job.ts          # orca_delegate_task / orca_get_task_status / orca_get_task_result
@@ -46,6 +50,7 @@ scripts/
   dsh-headless-worker.mjs # Orca 注入 → dsh --profile headless の argv に載せ直すブリッジ(1 タスク 1 プロセス)
 docs/
   templates/acp-cordis.patch.example.yml  # dsh acp プロファイル用パッチのテンプレ(IP 等は置かない)
+  design/streamable-http-transport.md     # HTTP トランスポートの設計案(実装前にレビューした案)
 ```
 
 ## 公開 API の設計 — 非同期 Job API(最優先の設計約束)
@@ -277,6 +282,39 @@ orca CLI は **呼び出し元ターミナルを 1 つの Run にバインド**�
   読み取り(task-list / worker-list など)はロックしない。
 - `gate-create` / `gate-resolve` には `--run` が無い(Run スコープはバインドで決まる)。
   なので `orca_resolve_gate` の `run` は必須で、`gate-list --run <run>` で対象を読んでから叩く。
+
+## HTTP トランスポートの決まり(2026-10-08 実装・実測)
+
+既定は **stdio**。`ORCA_MCP_TRANSPORT=http` のときだけ HTTP で立つ(既存の登録経路・挙動は不変)。
+
+- **stateless 既定**。`createMcpHandler((ctx) => createServer())` で **1 リクエスト 1 個の `McpServer`**。
+  `Mcp-Session-Id` / session map / transport map は作らない。単一 transport を複数クライアントで共有しない
+  (server/transport を共有する形はクロスクライアントの応答漏洩になる — SDK の GHSA-345p-7cg4-v4c7 が同じ型)。
+  2025 世代の legacy 経路は SDK 既定の `legacy: "stateless"` に任せる(**GET / DELETE は 405**)。
+- **Node ↔ Web Standard の変換を書かない**。`@modelcontextprotocol/node` の `toNodeHandler` を使う
+  (SSE の backpressure と 4 MiB 上限の 413 を処理してくれる)。`http.ts` の責務は
+  「サーバー生成 + gate 合成 + 起動 / 停止」に留める。
+- **401 / 403 を自前で組み立てない**。Bearer は `requireBearerAuth` / `verifyBearerToken` +
+  `bearerAuthChallengeResponse`(`WWW-Authenticate` 付き)。`Host` / `Origin` は node 形の guard
+  (`hostHeaderValidation` / `originValidation`)が **自分で 403 を回答する**ので、
+  `false` を返したらそのリクエストには一切触らないこと。
+- **静的トークンの `AuthInfo.expiresAt` は検証時刻 + 3600 秒**。SDK は `expiresAt` 未設定の token を拒否する。
+  起動時刻から計算すると長時間起動で自分自身の token が失効する(実装前に気づいた罠)。
+- **ループバック外 + トークン無しは listen 前に起動を拒否する**(`http_token_required`)。警告では足りない。
+  `0.0.0.0` / 特定 NIC IP への direct bind は非推奨(`ssh -L` / TLS proxy / VPN の内側で使う)。
+- **`Host` 許可リストは bind 先と連動する**。特定 NIC IP に bind すると、その IP で叩くクライアントの
+  `Host` が許可リストに無いと 403 で全滅する(`missingHostnames` が起動前に警告する)。
+  `ssh -L` 経由なら `Host` は `127.0.0.1` のままなので既定の localhost 系で通る。
+- 実測した応答: 4 MiB 超過は **413**(`handler` に到達しない)/ `Host` 不正は **403** `Invalid Host` /
+  `Origin` 不正は **403** `Invalid Origin`(`Origin` を出さないクライアントは通る)/
+  `Bearer` 以外の scheme と不一致は **401**(`bearer` の大小文字は問わない)/
+  `close()` 後は connection refused / 2 クライアント同時で応答が混ざらない(id と本文が対応)。
+- **`127.0.0.1` bind は LAN から到達しない**(実測: loopback は 200、LAN IP は接続拒否)。
+  別 PC からは `ssh -L 8765:127.0.0.1:8765` が第一選択。
+- 新規依存 `@modelcontextprotocol/node`(`^2.1.1`、peer は `@modelcontextprotocol/server: ^2.3.0`、
+  内包に `hono` / `@hono/node-server`)。`npm install` が dev 依存を省略する環境では `npm install --include=dev`
+  が要る(`npm config get omit` が `dev` の環境で `npm install <pkg>` をすると vitest が消えた実測あり)。
+- 設計案は `docs/design/streamable-http-transport.md`。
 
 ## 決まりごと
 
