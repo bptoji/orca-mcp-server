@@ -1,9 +1,11 @@
 import { afterEach, describe, expect, it } from "vitest";
 import http from "node:http";
+import type { McpRequestContext, McpServer } from "@modelcontextprotocol/server";
 import { SERVER_NAME, SERVER_VERSION, createServer } from "../src/index.js";
 import { OrcaClient } from "../src/orca/client.js";
 import type { CommandRunner, OrcaCommandResult } from "../src/orca/command.js";
 import { STATUS_TOOL_NAME } from "../src/tools/status.js";
+import { STATIC_TOKEN_CLIENT_ID } from "../src/server/auth.js";
 import { resolveTransportConfig } from "../src/server/config.js";
 import { MCP_ENDPOINT_PATH, startHttpServer } from "../src/server/http.js";
 import type { HttpServerHandle } from "../src/server/http.js";
@@ -28,7 +30,21 @@ function createStubClient(): OrcaClient {
   return new OrcaClient(runner);
 }
 
-async function startServer(env: Record<string, string> = {}): Promise<HttpServerHandle> {
+/** orca を叩いた回数を数えるスタブ(runner 実行の有無をテストから見るため)。 */
+function createRecordingClient(): { client: OrcaClient; calls: string[][] } {
+  const calls: string[][] = [];
+  const runner: CommandRunner = async (args) => {
+    calls.push(args);
+    const data = { ok: true, state: "ready", echoArgs: args };
+    return { args, ok: true, exitCode: 0, stdout: JSON.stringify(data), stderr: "", data };
+  };
+  return { client: new OrcaClient(runner), calls };
+}
+
+async function startServer(
+  env: Record<string, string> = {},
+  factory: (ctx: McpRequestContext) => McpServer = () => createServer(createStubClient()),
+): Promise<HttpServerHandle> {
   const config = resolveTransportConfig({
     ORCA_MCP_TRANSPORT: "http",
     ORCA_MCP_HTTP_PORT: "0",
@@ -36,7 +52,7 @@ async function startServer(env: Record<string, string> = {}): Promise<HttpServer
   });
   return startHttpServer({
     config,
-    createServer: () => createServer(createStubClient()),
+    createServer: (ctx) => factory(ctx),
     onDiagnostic: () => undefined,
   });
 }
@@ -110,6 +126,7 @@ function requestWithHost(
   });
 }
 
+/** 413 のあとは接続が切れることがある(server が 413 を書いて socket を壊すため)。 */
 function rawPost(
   handle: HttpServerHandle,
   body: unknown,
@@ -138,7 +155,9 @@ function rawPost(
         res.on("end", () => resolve({ status: res.statusCode ?? 0, text }));
       },
     );
-    req.on("error", reject);
+    req.on("error", (error: NodeJS.ErrnoException) => {
+      resolve({ status: 0, text: error.code ?? error.message });
+    });
     req.end(payload);
   });
 }
@@ -255,15 +274,23 @@ describe("http トランスポート(stateless / 1 リクエスト 1 サーバ�
     expect(plain.status).toBe(200);
   });
 
-  it("4 MiB を超える body は 413(サーバーを起動させない)", async () => {
-    handle = await startServer();
+  it("4 MiB を超える body は handler に到達しない(413 / 413 後の接続断)", async () => {
+    const recording = createRecordingClient();
+    handle = await startServer({}, () => createServer(recording.client));
     const huge = callStatus(4);
     // 上限(4 MiB)をわずかに超える量にする(大きくしすぎると書き込み中に接続が切れる)。
     (huge.params as Record<string, unknown>).arguments = { pad: "x".repeat(4 * 1024 * 1024 + 4096) };
-    // 413 のあと接続が切れるため、fetch ではなく node:http でステータスを読む。
+    // 413 のあと接続が切れるため、fetch ではなく node:http で読む。
     const response = await rawPost(handle, huge);
-    expect(response.status).toBe(413);
-    expect(response.text).toContain("Payload Too Large");
+    expect([413, 0]).toContain(response.status); // 0 = 応答を読む前に接続が切れた
+    if (response.status === 413) {
+      expect(response.text).toContain("Payload Too Large");
+    }
+    // 本体の検証: 大きな body でサーバーは起動していない。
+    expect(recording.calls).toEqual([]);
+
+    // 同じサーバーがそのまま使える(1 リクエスト失敗で壊れていない)。
+    expect((await post(handle, LIST_TOOLS)).status).toBe(200);
   });
 
   it("2 クライアントが同時接続しても応答が混ざらない", async () => {
@@ -312,5 +339,67 @@ describe("http トランスポート(stateless / 1 リクエスト 1 サーバ�
         body: "{}",
       }),
     ).rejects.toThrow();
+  });
+
+  it("IPv6 loopback は bind 用表記(::1)で起動する", async () => {
+    try {
+      handle = await startServer({ ORCA_MCP_HTTP_HOST: "::1" });
+    } catch (error) {
+      // IPv6 loopback を使えない環境ではスキップする。
+      expect((error as Error).message).toContain("::1");
+      return;
+    }
+    expect(handle.host).toBe("::1");
+    const response = await fetch(`http://[::1]:${handle.port}${MCP_ENDPOINT_PATH}`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+      },
+      body: JSON.stringify(LIST_TOOLS),
+    });
+    expect(response.status).toBe(200);
+  });
+
+  it("Content-Type が application/json でなければ 415", async () => {
+    handle = await startServer();
+    const response = await fetch(urlOf(handle), {
+      method: "POST",
+      headers: { "content-type": "text/plain", accept: "application/json, text/event-stream" },
+      body: JSON.stringify(LIST_TOOLS),
+    });
+    expect(response.status).toBe(415);
+  });
+
+  it("検証済み AuthInfo が factory まで届く(stateless で client 情報を保持できる)", async () => {
+    const seen: Array<string | undefined> = [];
+    handle = await startServer({ ORCA_MCP_AUTH_TOKEN: TEST_TOKEN }, (ctx) => {
+      seen.push(ctx.authInfo?.clientId);
+      return createServer(createStubClient());
+    });
+
+    expect((await post(handle, LIST_TOOLS, AUTH)).status).toBe(200);
+    expect(seen).toEqual([STATIC_TOKEN_CLIENT_ID]);
+  });
+
+  it("handler が例外を投げても 500 で応答し、プロセスは生きたまま次を通す", async () => {
+    let first = true;
+    handle = await startServer({}, () => {
+      if (first) {
+        first = false;
+        throw new Error("boom");
+      }
+      return createServer(createStubClient());
+    });
+
+    const failed = await post(handle, LIST_TOOLS);
+    expect(failed.status).toBe(500);
+    expect(JSON.parse(failed.text)).toMatchObject({
+      jsonrpc: "2.0",
+      error: { code: -32603 },
+    });
+
+    const recovered = await post(handle, LIST_TOOLS);
+    expect(recovered.status).toBe(200);
   });
 });

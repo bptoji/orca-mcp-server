@@ -105,7 +105,8 @@ function startStdio(): void {
 
 async function startHttp(config: ReturnType<typeof resolveTransportConfig>): Promise<void> {
   try {
-    const handle = await startHttpServer({ config, createServer });
+    // 1 リクエスト 1 サーバー。context は使わないが factory の形に合わせる。
+    const handle = await startHttpServer({ config, createServer: () => createServer() });
     for (const signal of ["SIGINT", "SIGTERM"] as const) {
       process.on(signal, () => {
         void handle.close().finally(() => process.exit(0));

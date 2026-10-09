@@ -14,7 +14,8 @@ import {
   isLoopbackHost,
   isUnspecifiedHost,
   missingHostnames,
-  normalizeHostname,
+  normalizeAllowedHostname,
+  normalizeListenHost,
   requiredHostnames,
   resolveTransportConfig,
   startUpRefusal,
@@ -57,13 +58,21 @@ describe("既定は stdio(既存の起動経路を変えない)", () => {
 });
 
 describe("host / port の解釈", () => {
-  it("host を正規化する(大小文字・IPv6 の括弧)", () => {
-    expect(normalizeHostname("LocalHost")).toBe("localhost");
-    expect(normalizeHostname("::1")).toBe("[::1]");
-    expect(normalizeHostname("[::1]")).toBe("[::1]");
-    expect(normalizeHostname("192.168.1.20")).toBe("192.168.1.20");
-    const config = resolveTransportConfig({ [HTTP_HOST_ENV]: "::1" });
-    expect(config.host).toBe("[::1]");
+  it("host を正規化する(bind 用は括弧なし、許可リスト用は括弧付き)", () => {
+    expect(normalizeListenHost("LocalHost")).toBe("localhost");
+    expect(normalizeListenHost("::1")).toBe("::1");
+    expect(normalizeListenHost("[::1]")).toBe("::1");
+    expect(normalizeListenHost("192.168.1.20")).toBe("192.168.1.20");
+    expect(normalizeAllowedHostname("::1")).toBe("[::1]");
+    expect(normalizeAllowedHostname("[::1]")).toBe("[::1]");
+    expect(normalizeAllowedHostname("127.0.0.1")).toBe("127.0.0.1");
+  });
+
+  it("IPv6 loopback は bind 用に括弧を付けない(listen は ::1 を要求する)", () => {
+    expect(resolveTransportConfig({ [HTTP_HOST_ENV]: "::1" }).host).toBe("::1");
+    expect(resolveTransportConfig({ [HTTP_HOST_ENV]: "[::1]" }).host).toBe("::1");
+    // 許可リスト側は括弧付き(`Host: [::1]` と突き合わせる表記)。
+    expect(requiredHostnames(resolveTransportConfig({ [HTTP_HOST_ENV]: "::1" }))).toEqual([]);
   });
 
   it("port は 0 を受け付ける(テストで空きポートを割り当てる)", () => {
@@ -95,7 +104,7 @@ describe("host / port の解釈", () => {
 });
 
 describe("許可リストの解釈", () => {
-  it("カンマ区切りを正規化して重複を落とす", () => {
+  it("許可リスト表記に揃えて重複を落とす", () => {
     const config = resolveTransportConfig({
       [ALLOWED_HOSTS_ENV]: " LocalHost , 127.0.0.1 , localhost , 192.168.1.20 ",
       [ALLOWED_ORIGINS_ENV]: "192.168.1.20",
@@ -104,7 +113,7 @@ describe("許可リストの解釈", () => {
     expect(config.allowedOrigins).toEqual(["192.168.1.20"]);
   });
 
-  it("IPv6 を許可リスト表記に揃える", () => {
+  it("許可リストの IPv6 は括弧付き", () => {
     const config = resolveTransportConfig({ [ALLOWED_HOSTS_ENV]: "::1,example.local" });
     expect(config.allowedHosts).toEqual(["[::1]", "example.local"]);
   });

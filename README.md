@@ -84,7 +84,7 @@ macOS / Linux では `"args": ["/home/<your-user>/<repo-dir>/orca-mcp/dist/index
 | 環境変数 | 既定 | 内容 |
 | --- | --- | --- |
 | `ORCA_MCP_TRANSPORT` | `stdio` | `stdio` / `http` |
-| `ORCA_MCP_HTTP_HOST` | `127.0.0.1` | listen 先(`http` のときだけ参照) |
+| `ORCA_MCP_HTTP_HOST` | `127.0.0.1` | listen 先(`http` のときだけ参照。IPv6 は `::1` の表記で渡す) |
 | `ORCA_MCP_HTTP_PORT` | `8765` | listen port(`0` で空きポート) |
 | `ORCA_MCP_AUTH_TOKEN` | 未設定 | 設定したときだけ `Authorization: Bearer` を検証 |
 | `ORCA_MCP_ALLOWED_HOSTS` | `localhost,127.0.0.1,[::1]` | `Host` ヘッダーの許可リスト(カンマ区切り) |
@@ -484,7 +484,9 @@ poll を打ち切る前に数回待ってください。**launcher 運用では�
 | HTTP で 401 | `Authorization` の欠落 / トークン不一致 / `Bearer` 以外の scheme | クライアントの `Authorization: Bearer <token>` がサーバーの `ORCA_MCP_AUTH_TOKEN` と一致するか確認 |
 | HTTP で 403 `Invalid Host` | `Host` が `ORCA_MCP_ALLOWED_HOSTS` に無い | 到達に使うホスト名 / IP を列挙する(`ssh -L` なら `127.0.0.1` のままで通る) |
 | HTTP で 403 `Invalid Origin` | ブラウザ発の `Origin` が `ORCA_MCP_ALLOWED_ORIGINS` に無い | 許可リストへ追加する(`Origin` を出さないクライアントは対象外) |
-| HTTP で 413 | 要求 body が 4 MiB 超 | 大きな内容は task 参照などの小さなセレクタで渡す |
+| HTTP で 413 | 要求 body が 4 MiB 超 | 大きな内容は task 参照などの小さなセレクタで渡す(413 のあと接続が切れることがあります) |
+| HTTP で 415 | `Content-Type` が `application/json` でない | `Content-Type: application/json` を付けて送る |
+| HTTP で 500 | サーバー内部で例外(サーバーは生きたまま続く) | stderr の `[http] request_failed:` を確認してリトライ |
 | HTTP で 405(GET / DELETE) | stateless 構成は session 操作を受け付けない | `POST` の JSON-RPC を使う(想定どおりの挙動) |
 | `transport_invalid` / `port_invalid` / `host_invalid` | 環境変数の値が不正 | `ORCA_MCP_TRANSPORT` は `stdio` / `http`、port は 0〜65535 の整数、host は空にしない |
 

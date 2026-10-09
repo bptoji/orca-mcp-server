@@ -29,7 +29,7 @@ src/
     schemas.ts      # 各ツールの zod inputSchema
   server/
     config.ts       # 環境変数の解釈(純粋関数)+ 起動可否の判定(ループバック外 + トークン無しは拒否)
-    auth.ts         # 静的トークンの OAuthTokenVerifier(SDK の requireBearerAuth に差し込む)
+    auth.ts         # 静的トークンの OAuthTokenVerifier(SDK の verifyBearerToken に差し込む)
     http.ts         # node:http + Host / Origin / Bearer gate + toNodeHandler(createMcpHandler(...))
   tools/
     result.ts       # 共通の CallToolResult ヘルパー(textResult / errorResult / resultOf)
@@ -305,6 +305,18 @@ orca CLI は **呼び出し元ターミナルを 1 つの Run にバインド**�
 - **`Host` 許可リストは bind 先と連動する**。特定 NIC IP に bind すると、その IP で叩くクライアントの
   `Host` が許可リストに無いと 403 で全滅する(`missingHostnames` が起動前に警告する)。
   `ssh -L` 経由なら `Host` は `127.0.0.1` のままなので既定の localhost 系で通る。
+- **bind 用アドレスと `Host` 許可リスト用 hostname は別の表記**。`normalizeListenHost` は括弧を外す
+  (`[::1]` → `::1`)、`normalizeAllowedHostname` は括弧を付ける(`::1` → `[::1]`)。
+  `config.host` は **bind 用(`::1`)**、`allowedHosts` / `allowedOrigins` は **許可リスト用(括弧付き)**。
+  `server.listen(0, "[::1]")` は Linux の getaddrinfo で `ENOTFOUND`(実測: Windows の Node 24 は通す)。
+- **gate は routing より前**(`404` より先に Host → Origin → Bearer)。通さないリクエストに 404 を返さない。
+- **リクエスト境界で例外を拾う**(`serve()` の `.catch()`)。未処理の promise 失敗はプロセスを殺す。
+  応答未送信なら `500` + JSON-RPC `-32603`、送信済みなら `res.destroy()`。診断は stderr、プロセスは生き続ける。
+- `Content-Type` が `application/json` でない要求は **415**(SDK 側が返す)。
+- **413 のあと接続が切れることがある**(server が 413 を書いて socket を壊す → `ECONNRESET`)。
+  テストはステータス固定にせず「**handler に到達しない**(`orca` が 1 回も叩かれない)+ 同じサーバーが使える」で検証する。
+- 検証済み `AuthInfo` は factory まで届く(`createMcpHandler` の context 経由)。stateless でも client 情報を
+  リクエスト単位で使える。
 - 実測した応答: 4 MiB 超過は **413**(`handler` に到達しない)/ `Host` 不正は **403** `Invalid Host` /
   `Origin` 不正は **403** `Invalid Origin`(`Origin` を出さないクライアントは通る)/
   `Bearer` 以外の scheme と不一致は **401**(`bearer` の大小文字は問わない)/

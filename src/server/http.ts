@@ -15,7 +15,7 @@ import {
   createMcpHandler,
   verifyBearerToken,
 } from "@modelcontextprotocol/server";
-import type { AuthInfo, McpServer } from "@modelcontextprotocol/server";
+import type { AuthInfo, McpRequestContext, McpServer } from "@modelcontextprotocol/server";
 import { hostHeaderValidation, originValidation, toNodeHandler } from "@modelcontextprotocol/node";
 import { StaticTokenVerifier } from "./auth.js";
 import type { TransportConfig } from "./config.js";
@@ -33,8 +33,8 @@ function notFoundBody(path: string): string {
 
 export interface HttpServerOptions {
   readonly config: TransportConfig;
-  /** リクエストごとに新しい `McpServer` を作る factory(stateless の要)。 */
-  readonly createServer: () => McpServer;
+  /** リクエストごとに新しい `McpServer` を作る factory(stateless の要)。リクエスト context を受け取る。 */
+  readonly createServer: (ctx: McpRequestContext) => McpServer;
   /** 診断出力(stderr へ出す想定。既定は `console.error`)。 */
   readonly onDiagnostic?: (message: string) => void;
   /** 要求 body の上限(バイト)。既定は SDK の 4 MiB。 */
@@ -81,7 +81,7 @@ export async function startHttpServer(options: HttpServerOptions): Promise<HttpS
   const diagnostic = options.onDiagnostic ?? ((message: string) => console.error(message));
   const maxRequestBodySize = options.maxRequestBodySize ?? DEFAULT_MAX_REQUEST_BODY_SIZE;
 
-  const handler = createMcpHandler(() => createServer(), {
+  const handler = createMcpHandler((ctx) => createServer(ctx), {
     // 既定の 'stateless'(GET / DELETE は 405)。session map を作らない構成そのものにする。
     legacy: "stateless",
     maxRequestBodySize,
@@ -98,17 +98,31 @@ export async function startHttpServer(options: HttpServerOptions): Promise<HttpS
   const verifier = config.authToken === null ? null : new StaticTokenVerifier(config.authToken);
 
   const server = http.createServer((req, res) => {
-    void serve(req, res);
+    serve(req, res);
   });
 
-  async function serve(rawReq: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+  function serve(rawReq: http.IncomingMessage, res: http.ServerResponse): void {
+    // 1 リクエストの失敗でプロセスを止めない(未処理の promise 失敗は process を殺す)。
+    void handle(rawReq, res).catch((error: unknown) => {
+      diagnostic(`[http] request_failed: ${(error as Error).message ?? String(error)}`);
+      if (res.headersSent) {
+        res.destroy();
+        return;
+      }
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          error: { code: -32603, message: "Internal server error" },
+          id: null,
+        }),
+      );
+    });
+  }
+
+  async function handle(rawReq: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     const req = rawReq as NodeRequest;
-    const path = endpointOf(req);
-    if (path !== MCP_ENDPOINT_PATH) {
-      res.writeHead(404, { "Content-Type": "application/json" });
-      res.end(notFoundBody(path ?? req.url ?? ""));
-      return;
-    }
+    // gate は routing より前に置く(通さないリクエストに 404 などの情報を与えない)。
     // guard は拒否応答を自分で書く。false のときはこれ以上触らない。
     if (!hostGate(req, res)) {
       return;
@@ -124,6 +138,12 @@ export async function startHttpServer(options: HttpServerOptions): Promise<HttpS
         return;
       }
     }
+    const path = endpointOf(req);
+    if (path !== MCP_ENDPOINT_PATH) {
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(notFoundBody(path ?? req.url ?? ""));
+      return;
+    }
     await nodeHandler(req, res);
   }
 
@@ -137,7 +157,9 @@ export async function startHttpServer(options: HttpServerOptions): Promise<HttpS
 
   const address = server.address();
   const port = typeof address === "object" && address !== null ? address.port : config.port;
-  diagnostic(`[http] listening on http://${config.host}:${port}${MCP_ENDPOINT_PATH}`);
+  // 表示用は URL 表記(IPv6 は括弧を戻す)。bind 用は `config.host` のまま。
+  const displayHost = config.host.includes(":") ? `[${config.host}]` : config.host;
+  diagnostic(`[http] listening on http://${displayHost}:${port}${MCP_ENDPOINT_PATH}`);
 
   async function close(): Promise<void> {
     // 進行中の exchange を止めて per-request instance を閉じる。

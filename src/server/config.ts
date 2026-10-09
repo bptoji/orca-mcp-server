@@ -62,22 +62,34 @@ function trimToNull(value: string | undefined): string | null {
   return trimmed.length === 0 ? null : trimmed;
 }
 
-/** IPv6 を SDK の許可リスト表記(`[::1]`)に揃える。 */
-export function normalizeHostname(host: string): string {
+/**
+ * `server.listen()` に渡すアドレス表記へ正規化する(IPv6 の括弧は**取外す**)。
+ * `listen(0, "[::1]")` は Linux の getaddrinfo で `ENOTFOUND` になる(実測: Windows の Node 24 は許す)。
+ */
+export function normalizeListenHost(host: string): string {
   const value = host.trim().toLowerCase();
   if (value.startsWith("[") && value.endsWith("]")) {
-    return value;
+    return value.slice(1, -1);
   }
+  return value;
+}
+
+/**
+ * `Host` / `Origin` の許可リストに使う hostname 表記へ正規化する(IPv6 は**括弧付き**)。
+ * SDK の `validateHostHeader` は `Host` から `[::1]` を取り出すため、こちら側の表記に揃える。
+ */
+export function normalizeAllowedHostname(host: string): string {
+  const value = normalizeListenHost(host);
   if (value.includes(":")) {
     return `[${value}]`;
   }
   return value;
 }
 
-/** `127.0.0.0/8`・`localhost`・`::1` をループバックとみなす。 */
+/** `127.0.0.0/8`・`localhost`・`::1` をループバックとみなす(bind 用表記・許可リスト表記の両方を受ける)。 */
 export function isLoopbackHost(host: string): boolean {
-  const value = normalizeHostname(host);
-  if (value === "localhost" || value === "[::1]") {
+  const value = normalizeListenHost(host);
+  if (value === "localhost" || value === "::1") {
     return true;
   }
   return value.startsWith("127.");
@@ -85,8 +97,8 @@ export function isLoopbackHost(host: string): boolean {
 
 /** `0.0.0.0` / `::` は「全 NIC」。特定 NIC 指定より攻撃面が広い。 */
 export function isUnspecifiedHost(host: string): boolean {
-  const value = normalizeHostname(host);
-  return value === "0.0.0.0" || value === "[::]" || value === "::" || value === "*";
+  const value = normalizeListenHost(host);
+  return value === "0.0.0.0" || value === "::" || value === "*";
 }
 
 function parseHostList(raw: string | undefined, envName: string): string[] {
@@ -96,7 +108,7 @@ function parseHostList(raw: string | undefined, envName: string): string[] {
   }
   const items = value
     .split(",")
-    .map((part) => normalizeHostname(part))
+    .map((part) => normalizeAllowedHostname(part))
     .filter((part) => part.length > 0);
   if (items.length === 0) {
     throw new TransportConfigError("allowed_hosts_invalid", `${envName} が空です`);
@@ -129,7 +141,7 @@ export function resolveTransportConfig(env: NodeJS.ProcessEnv = process.env): Tr
     throw new TransportConfigError("host_invalid", `${HTTP_HOST_ENV} が空です`);
   }
   if (rawHost !== null) {
-    const normalized = normalizeHostname(rawHost);
+    const normalized = normalizeListenHost(rawHost);
     if (normalized.length === 0 || /\s/.test(normalized)) {
       throw new TransportConfigError("host_invalid", `${HTTP_HOST_ENV} が不正です: ${rawHost}`);
     }
@@ -165,12 +177,12 @@ export function requiredHostnames(config: TransportConfig): string[] {
   if (isLoopbackHost(config.host) || isUnspecifiedHost(config.host)) {
     return [];
   }
-  return [normalizeHostname(config.host)];
+  return [normalizeAllowedHostname(config.host)];
 }
 
 /** 許可リストの不足を起動前に検出する(起動してから全リクエストが 403 になる状態を作らない)。 */
 export function missingHostnames(config: TransportConfig): string[] {
-  const allowed = new Set(config.allowedHosts.map((host) => normalizeHostname(host)));
+  const allowed = new Set(config.allowedHosts.map((host) => normalizeAllowedHostname(host)));
   return requiredHostnames(config).filter((host) => !allowed.has(host));
 }
 

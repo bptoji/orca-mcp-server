@@ -4,7 +4,7 @@
  */
 
 import { timingSafeEqual } from "node:crypto";
-import { OAuthError, OAuthErrorCode, requireBearerAuth } from "@modelcontextprotocol/server";
+import { OAuthError, OAuthErrorCode } from "@modelcontextprotocol/server";
 import type { AuthInfo, OAuthTokenVerifier } from "@modelcontextprotocol/server";
 
 /** 静的トークンに付ける client id(認可基盤が無いことを正直に表す固定値)。 */
@@ -57,12 +57,4 @@ export class StaticTokenVerifier implements OAuthTokenVerifier {
       expiresAt: Math.floor(Date.now() / 1000) + this.#ttlSeconds,
     };
   }
-}
-
-/**
- * `Authorization: Bearer <token>` を要求する gate。
- * 戻り値は検証済み `AuthInfo`、またはそのまま返せる拒否 `Response`。
- */
-export function bearerAuthGate(token: string): (request: Request) => Promise<AuthInfo | Response> {
-  return requireBearerAuth({ verifier: new StaticTokenVerifier(token) });
 }
