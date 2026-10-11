@@ -52,6 +52,11 @@ agent hooks の通知から作る projection で、画面の描画とは別経�
 - **ハッシュの比較は呼び出し側の責務**。MCP は stateless(poll は短時間で返す約束 / HTTP も stateless)なので
   前回値を持たない。呼び出し側は poll ごとに `outputHash` を覚え、同じ値が続いたら人間に通知する。
   比較の手間を肩代わりする `previousOutputHash` 入力(`outputChanged` を返す)は、運用で必要になってから足す(未実装)。
+- Orca が `requiresAction` を立てない承認プロンプトもある(実機実測: git 承認で `activity: waiting` / attention 空)。
+  そのため **`activity: "waiting"` の worker も候補**にし、`worker-read` の末尾が承認プロンプトらしい
+  (`looksLikePrompt`)ときだけ `agent_prompt` を出す。プロンプトらしくなければ何も出さない
+  (Commander が子の完了待ちで waiting のときの誤検知を避ける)。
+
 - `looksLikePrompt` が `false` で hash が変化し続けるなら動作中、`true` なら pane で人間が答える。
 
 ### phase

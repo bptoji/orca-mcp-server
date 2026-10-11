@@ -1058,6 +1058,44 @@ describe("getTaskStatus(poll) — Commander の配下", () => {
     expect(first["activity"]).toBe("waiting");
   });
 
+  it("Orca が attention を立てなくても、waiting で出力末尾が承認プロンプトなら agent_prompt にする", async () => {
+    const make = (text: string) =>
+      createFakeClient({
+        taskList: { ok: true, result: { tasks: [{ id: "task_cmd", status: "dispatched" }] } },
+        dispatchShow: { ok: true, result: { dispatches: [{ dispatchId: "disp_1" }] } },
+        workerList: {
+          ok: true,
+          result: {
+            workers: [
+              {
+                dispatchId: "disp_1",
+                taskId: "task_cmd",
+                workerState: "ready",
+                projection: {
+                  outcome: "in_progress",
+                  stage: { activity: "waiting" },
+                  attention: { requiresAction: false, categories: [] },
+                },
+              },
+            ],
+          },
+        },
+        workerRead: { ok: true, result: { text, source: "terminal" } },
+      });
+    const prompt = await getTaskStatus(
+      make("git status; git branch\n Do you want to proceed?\n ❯ 1. Yes\n   2. No").client,
+      { taskId: "task_cmd" },
+    );
+    const reasons = prompt["blockedReasons"] as JsonObject[];
+    expect(reasons.map((reason) => reason["kind"])).toEqual(["agent_prompt"]);
+    expect((reasons[0]?.["detail"] as JsonObject)["looksLikePrompt"]).toBe(true);
+    expect(prompt["attentionRequired"]).toBe(true);
+
+    const idle = await getTaskStatus(make("✻ 子タスクの完了を待っています").client, { taskId: "task_cmd" });
+    expect(idle["blockedReasons"]).toEqual([]);
+    expect(idle["attentionRequired"]).toBe(false);
+  });
+
   it("要 attention の worker は agent_prompt として出力末尾を返す", async () => {
     const worker = {
       dispatchId: "disp_1",

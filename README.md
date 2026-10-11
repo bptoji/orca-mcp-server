@@ -260,6 +260,8 @@ orca_get_task_result({ taskId: "task_abc123", includeChildren: true })
   MCP からは解除不可。`looksLikePrompt` は文言からの推定。`outputHash` は呼び出し側が前回値と比べて動作中かを判定する)/
   `unknown`(根拠なし)。`nextAction` は最優先の kind に合わせて案内します。
   `agent_prompt` の出力取得(`worker-read`)だけが追加の読み取りで、失敗しても `warnings` に残して poll は返ります。
+  Orca が attention を立てない承認プロンプトもあるため、`activity: waiting` の worker も出力末尾を読み、
+  プロンプトらしいときだけ `agent_prompt`(と `attentionRequired: true`)にします。
 - `children` は Commander が分解した**直接の子タスク**(`parent_id` 一致)とその worker。
   `childCount` は実件数、`returnedChildCount` が返した件数(上限 20)、`childrenTruncated` で打ち切りを伝えます。
   **孫以降は出ません**(その子の poll / result で見る)。

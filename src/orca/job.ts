@@ -413,18 +413,23 @@ export async function collectBlockedReasons(
     }
   }
 
-  // 終端(completed / failed)や exited の worker に残った attention は拾わない
-  const attention = input.workers.filter(
-    (worker) =>
-      worker["requiresAttention"] === true &&
-      worker["status"] !== "completed" &&
-      worker["status"] !== "failed" &&
-      worker["liveness"] !== "exited",
-  );
+  // 終端(completed / failed)や exited の worker に残った attention は拾わない。
+  // Orca が requiresAction を立てない承認プロンプトもあるので、activity が waiting の worker も候補にし、
+  // 出力末尾がプロンプトらしいときだけ採用する(flagged = Orca が attention を立てたもの)
+  const candidates = input.workers
+    .filter(
+      (worker) =>
+        worker["status"] !== "completed" &&
+        worker["status"] !== "failed" &&
+        worker["liveness"] !== "exited" &&
+        (worker["requiresAttention"] === true || worker["activity"] === "waiting"),
+    )
+    .sort((a, b) => Number(b["requiresAttention"] === true) - Number(a["requiresAttention"] === true));
   const gateFound = reasons.some((reason) => reason["kind"] === "gate");
-  if (attention.length > 0 && (input.state === "blocked" || !gateFound)) {
+  if (candidates.length > 0 && (input.state === "blocked" || !gateFound)) {
     let reads = 0;
-    for (const worker of attention) {
+    for (const worker of candidates) {
+      const flagged = worker["requiresAttention"] === true;
       const dispatchId = typeof worker["dispatchId"] === "string" ? (worker["dispatchId"] as string) : undefined;
       let output: string | null = null;
       if (dispatchId !== undefined && reads < MAX_ATTENTION_READS) {
@@ -438,6 +443,9 @@ export async function collectBlockedReasons(
             `worker ${dispatchId} の出力取得に失敗: ${error instanceof Error ? error.message : String(error)}`,
           );
         }
+      }
+      if (!flagged && (output === null || !looksLikeApprovalPrompt(output))) {
+        continue;
       }
       reasons.push({
         kind: "agent_prompt",
@@ -940,7 +948,9 @@ export async function getTaskStatus(client: OrcaClient, input: TaskStatusInput):
     workerReportPending,
     // worker が「要 attention」なら、ゲート以外の人間側停止(エージェントの承認プロンプトなど)の
     // 可能性がある。E2E で `orca skills get …` の承認待ち Commander が running のまま止まった。
-    attentionRequired: workers.some((row) => row["requiresAttention"] === true),
+    attentionRequired:
+      workers.some((row) => row["requiresAttention"] === true) ||
+      blockedReasons.some((reason) => reason["kind"] === "agent_prompt"),
     attentionNotes: workers
       .filter((row) => row["requiresAttention"] === true)
       .map(
