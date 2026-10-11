@@ -243,6 +243,11 @@ docs/
   CLI 側の語彙(`run_required` など)はそのまま転送する。
 - `state: "cancelled"` は **MCP 側の論理状態**(CLI に native status が無い)。実体は
   `status: failed` + `result: "cancelled: <reason>"`。README にその旨を 1 行書く。
+- poll の `blockedReasons[]`(設計: `docs/design/blocked-reasons.md`): `kind` は `gate / task_report /
+  agent_prompt / unknown`。`blocked` でも gate が無いことがある(Commander の blocked 報告 = `task-update` の `result`、
+  エージェントの承認プロンプト)ので、**`blocked` = `decision_gate` と決めつけない**。pending のゲートがあるときだけ
+  phase は `decision_gate`、無ければ `blocked`。gates は `gate-list --run` で全件取り、対象タスク + 直接の子タスクに絞る。
+  追加の読み取りは `agent_prompt` の `worker-read`(最大 2 worker)だけで、変更系は呼ばない。
 - poll は worker の `projection.attention.requiresAction` を `attentionRequired` / `attentionNotes`
   (行には `attentionCategories`)として出す。ゲートが pending でないのに止まる典型はエージェント側の
   ツール承認プロンプト(E2E 実測)。Commander Prompt には「答えられない承認待ちで止めない / 新しい Run を

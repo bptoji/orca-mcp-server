@@ -30,6 +30,7 @@ export type JobPhase =
   | "starting"
   | "implementation"
   | "decision_gate"
+  | "blocked"
   | "settling"
   | "finished"
   | "failed"
@@ -314,8 +315,12 @@ export function estimatePhase(state: JobState, workers: JsonObject[], gates: Jso
     const status = pickString(gate, ["status", "state"]);
     return status === undefined || status.toLowerCase() === "pending";
   });
-  if (state === "blocked" || pendingGates.length > 0) {
+  if (pendingGates.length > 0) {
     return "decision_gate";
+  }
+  // ゲートが無い blocked は人間の判断待ちとは限らない(Commander の blocked 報告など)
+  if (state === "blocked") {
+    return "blocked";
   }
   const statuses = workers.map((worker) => worker["status"]);
   const hasRunning = statuses.includes("running");
@@ -330,8 +335,119 @@ export function estimatePhase(state: JobState, workers: JsonObject[], gates: Jso
   return "starting";
 }
 
+export type BlockedKind = "gate" | "task_report" | "agent_prompt" | "unknown";
+
+const BLOCKED_HINTS: Record<BlockedKind, string> = {
+  gate: "判断ゲートが pending。blockedReasons の question / options を確認し、承認/却下は orca_resolve_gate({ gateId, resolution, run })",
+  task_report:
+    "Commander / 子タスクが blocked を報告している。blockedReasons の内容を読み、orca_send_message で指示するか orca_cancel_task で止める",
+  agent_prompt:
+    "エージェント側の承認プロンプトなどで止まっている可能性。MCP からは解除できないので、blockedReasons の出力を確認して人間が pane で答える",
+  unknown:
+    "blocked の理由が特定できない。orca_get_task_result と terminal の出力を確認する",
+};
+
+const BLOCKED_KIND_ORDER: BlockedKind[] = ["gate", "task_report", "agent_prompt", "unknown"];
+const MAX_REASON_TEXT = 2000;
+const MAX_ATTENTION_READS = 2;
+const ATTENTION_READ_LINES = 30;
+const ATTENTION_READ_CHARS = 1500;
+
+function isPendingGate(gate: JsonObject): boolean {
+  const status = pickString(gate, ["status", "state"]);
+  return status === undefined || status.toLowerCase() === "pending";
+}
+
+/**
+ * blocked の理由を kind 別に集める(読み取りのみ)。
+ * gate / task_report は task-list と gate-list の内容だけで決まる。agent_prompt は worker-read を足す。
+ */
+export async function collectBlockedReasons(
+  client: OrcaClient,
+  input: {
+    state: JobState;
+    tasks: JsonObject[];
+    gates: JsonObject[];
+    workers: JsonObject[];
+  },
+  warnings: string[],
+): Promise<JsonObject[]> {
+  const reasons: JsonObject[] = [];
+
+  for (const gate of input.gates.filter(isPendingGate)) {
+    reasons.push({
+      kind: "gate",
+      taskId: gate["taskId"] ?? null,
+      summary: gate["question"] ?? null,
+      detail: { gateId: gate["id"] ?? null, options: gate["options"] ?? null },
+    });
+  }
+
+  for (const task of input.tasks) {
+    if (mapTaskState(pickString(task, ["status", "state", "taskStatus"])) !== "blocked") {
+      continue;
+    }
+    const report = preview(typeof task["result"] === "string" ? task["result"].trim() : null, MAX_REASON_TEXT);
+    if (report !== null && report !== "") {
+      reasons.push({ kind: "task_report", taskId: pickString(task, ID_KEYS) ?? null, summary: report });
+    }
+  }
+
+  const attention = input.workers.filter((worker) => worker["requiresAttention"] === true);
+  const gateFound = reasons.some((reason) => reason["kind"] === "gate");
+  if (attention.length > 0 && (input.state === "blocked" || !gateFound)) {
+    let reads = 0;
+    for (const worker of attention) {
+      const dispatchId = typeof worker["dispatchId"] === "string" ? (worker["dispatchId"] as string) : undefined;
+      let output: string | null = null;
+      if (dispatchId !== undefined && reads < MAX_ATTENTION_READS) {
+        reads += 1;
+        try {
+          const read = unwrapResult(await client.workerRead({ dispatch: dispatchId, limit: ATTENTION_READ_LINES }));
+          const text = extractOutputText(read).text;
+          output = text === null ? null : text.length <= ATTENTION_READ_CHARS ? text : text.slice(-ATTENTION_READ_CHARS);
+        } catch (error) {
+          warnings.push(
+            `worker ${dispatchId} の出力取得に失敗: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      }
+      reasons.push({
+        kind: "agent_prompt",
+        taskId: worker["taskId"] ?? null,
+        summary: `worker ${dispatchId ?? "?"} が要 attention: categories=${JSON.stringify(worker["attentionCategories"] ?? [])}`,
+        detail: { dispatchId: dispatchId ?? null, outputTail: output },
+      });
+    }
+  }
+
+  const stuckChild = input.tasks.some(
+    (task) => mapTaskState(pickString(task, ["status", "state", "taskStatus"])) === "blocked",
+  );
+  if (reasons.length === 0 && (input.state === "blocked" || stuckChild)) {
+    reasons.push({
+      kind: "unknown",
+      taskId: null,
+      summary: "blocked だが gate / 報告 / attention のいずれも見つからない",
+    });
+  }
+  return reasons;
+}
+
+function primaryBlockedKind(reasons: JsonObject[]): BlockedKind | undefined {
+  return BLOCKED_KIND_ORDER.find((kind) => reasons.some((reason) => reason["kind"] === kind));
+}
+
 /** state に応じた次のアクション(呼び出し側が迷わないための手掛かり)。 */
-export function nextActionHint(state: JobState, phase: JobPhase, workerCount = 0): string {
+export function nextActionHint(
+  state: JobState,
+  phase: JobPhase,
+  workerCount = 0,
+  blockedKind?: BlockedKind,
+): string {
+  if (blockedKind !== undefined && (state === "blocked" || state === "running" || state === "unknown")) {
+    return BLOCKED_HINTS[blockedKind];
+  }
   switch (state) {
     case "queued":
       // dispatch が無い queued は「Commander が起動していない」= 放置しても進まない。
@@ -703,20 +819,35 @@ export async function getTaskStatus(client: OrcaClient, input: TaskStatusInput):
       (typeof worker["dispatchId"] === "string" && dispatchIds.has(worker["dispatchId"] as string)),
   );
 
-  const gatesPayload = await client.gateList({ task: input.taskId, run: input.run ?? runId ?? undefined });
-  const gates = extractGates(gatesPayload).map((gate) => ({
-    id: pickString(gate, ["gateId", "gate_id", "id"]) ?? null,
-    status: pickString(gate, ["status", "state"]) ?? null,
-    question: preview(gate["question"], 200),
-    options: gate["options"] ?? null,
-  }));
-
   const allChildTasks = findChildTasks(list, input.taskId);
   const childTasks = allChildTasks.slice(0, MAX_CHILDREN);
   const children = childTasks.map((child) =>
     toChildRow(child, allWorkers.filter((worker) => worker["taskId"] === pickString(child, ID_KEYS))),
   );
   const childWorkers = children.flatMap((child) => child["workers"] as JsonObject[]);
+
+  // --task で絞らず Run 全体を読み、対象タスクと直接の子タスクのゲートだけを残す
+  // (Commander の子タスクに付いたゲートも見せるため)
+  const scopeIds = new Set<string>([input.taskId]);
+  for (const child of childTasks) {
+    const childId = pickString(child, ID_KEYS);
+    if (childId !== undefined) {
+      scopeIds.add(childId);
+    }
+  }
+  const gatesPayload = await client.gateList({ run: input.run ?? runId ?? undefined });
+  const gates = extractGates(gatesPayload)
+    .filter((gate) => {
+      const gateTask = pickString(gate, ["task_id", "taskId"]);
+      return gateTask === undefined || scopeIds.has(gateTask);
+    })
+    .map((gate) => ({
+      id: pickString(gate, ["gateId", "gate_id", "id"]) ?? null,
+      taskId: pickString(gate, ["task_id", "taskId"]) ?? null,
+      status: pickString(gate, ["status", "state"]) ?? null,
+      question: preview(gate["question"], MAX_REASON_TEXT),
+      options: gate["options"] ?? null,
+    }));
 
   await enrichAgentNames(client, [...workers, ...childWorkers]);
 
@@ -730,6 +861,14 @@ export async function getTaskStatus(client: OrcaClient, input: TaskStatusInput):
       : null;
 
   const phase = estimatePhase(state, [...workers, ...childWorkers], gates);
+
+  const warnings: string[] = [];
+  const blockedReasons = await collectBlockedReasons(
+    client,
+    { state, tasks: [task, ...childTasks], gates, workers: [...workers, ...childWorkers] },
+    warnings,
+  );
+  const blockedKind = primaryBlockedKind(blockedReasons);
 
   // dsh 型の worker は launch token が記録されず dispatch が agent_readiness で死ぬが、
   // pane は注入された goal を完走し `task-update` で報告する(E2E 実測: failed → completed)。
@@ -758,7 +897,8 @@ export async function getTaskStatus(client: OrcaClient, input: TaskStatusInput):
     childrenTruncated: allChildTasks.length > children.length,
     children,
     gates,
-    dispatchIds: [...dispatchIds],
+    blockedReasons,
+    warnings,
     workerReportPending,
     // worker が「要 attention」なら、ゲート以外の人間側停止(エージェントの承認プロンプトなど)の
     // 可能性がある。E2E で `orca skills get …` の承認待ち Commander が running のまま止まった。
@@ -771,7 +911,7 @@ export async function getTaskStatus(client: OrcaClient, input: TaskStatusInput):
       ),
     createdAt: task["created_at"] ?? task["createdAt"] ?? null,
     completedAt: task["completed_at"] ?? task["completedAt"] ?? null,
-    nextAction: nextActionHint(state, phase, workers.length + childWorkers.length + dispatchIds.size),
+    nextAction: nextActionHint(state, phase, workers.length + childWorkers.length + dispatchIds.size, blockedKind),
     ...(workerReportPending
       ? {
           workerReportNote:

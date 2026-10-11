@@ -114,7 +114,7 @@ describe("estimatePhase", () => {
     ).toBe("implementation");
     expect(estimatePhase("running", [{ status: "completed", dispatchId: "d1" }], [])).toBe("settling");
     expect(estimatePhase("running", [], [{ status: "pending" }])).toBe("decision_gate");
-    expect(estimatePhase("blocked", [], [])).toBe("decision_gate");
+    expect(estimatePhase("blocked", [], [])).toBe("blocked");
     expect(estimatePhase("running", [], [])).toBe("starting");
   });
 });
@@ -549,7 +549,7 @@ describe("getTaskStatus(poll)", () => {
     expect(view["state"]).toBe("blocked");
     expect(view["phase"]).toBe("decision_gate");
     expect(view["gates"]).toEqual([
-      { id: "g1", status: "pending", question: null, options: null },
+      { id: "g1", taskId: null, status: "pending", question: null, options: null },
     ]);
   });
 
@@ -930,9 +930,96 @@ describe("getTaskStatus(poll) — Commander の配下", () => {
     const view = await getTaskStatus(client, { taskId: "task_cmd" });
     expect(view["phase"]).toBe("decision_gate");
     expect(view["gates"]).toEqual([
-      { id: "gate_1", status: "pending", question: "main へ merge してよい?", options: '["approve","reject"]' },
+      {
+        id: "gate_1",
+        taskId: "task_cmd",
+        status: "pending",
+        question: "main へ merge してよい?",
+        options: '["approve","reject"]',
+      },
+    ]);
+    expect(view["blockedReasons"]).toEqual([
+      {
+        kind: "gate",
+        taskId: "task_cmd",
+        summary: "main へ merge してよい?",
+        detail: { gateId: "gate_1", options: '["approve","reject"]' },
+      },
     ]);
     expect(view["nextAction"]).toContain("orca_resolve_gate");
+  });
+
+  it("子タスクのゲートは見え、無関係な task のゲートは除外される", async () => {
+    const { client } = createFakeClient({
+      taskList: {
+        ok: true,
+        result: {
+          tasks: [
+            { id: "task_cmd", status: "dispatched" },
+            { id: "task_child", parent_id: "task_cmd", status: "blocked" },
+            { id: "task_other", status: "blocked" },
+          ],
+        },
+      },
+      gateList: {
+        ok: true,
+        result: {
+          gates: [
+            { id: "gate_c", task_id: "task_child", question: "削除してよい?", status: "pending" },
+            { id: "gate_o", task_id: "task_other", question: "無関係", status: "pending" },
+          ],
+        },
+      },
+    });
+    const view = await getTaskStatus(client, { taskId: "task_cmd" });
+    expect((view["gates"] as JsonObject[]).map((gate) => gate["id"])).toEqual(["gate_c"]);
+    expect(view["phase"]).toBe("decision_gate");
+    expect(view["nextAction"]).toContain("orca_resolve_gate");
+  });
+
+  it("ゲートが無い blocked は task_report として result を返し、phase は blocked", async () => {
+    const { client } = createFakeClient({
+      taskList: {
+        ok: true,
+        result: {
+          tasks: [{ id: "task_cmd", status: "blocked", result: "Blocked: nested_worker_depth_exceeded" }],
+        },
+      },
+    });
+    const view = await getTaskStatus(client, { taskId: "task_cmd" });
+    expect(view["phase"]).toBe("blocked");
+    expect(view["blockedReasons"]).toEqual([
+      { kind: "task_report", taskId: "task_cmd", summary: "Blocked: nested_worker_depth_exceeded" },
+    ]);
+    expect(view["nextAction"]).toContain("blockedReasons");
+  });
+
+  it("根拠が無い blocked は unknown になる", async () => {
+    const { client } = createFakeClient({
+      taskList: { ok: true, result: { tasks: [{ id: "task_cmd", status: "blocked" }] } },
+    });
+    const view = await getTaskStatus(client, { taskId: "task_cmd" });
+    expect((view["blockedReasons"] as JsonObject[]).map((reason) => reason["kind"])).toEqual(["unknown"]);
+  });
+
+  it("要 attention の worker は agent_prompt として出力末尾を返す", async () => {
+    const worker = {
+      dispatchId: "disp_1",
+      taskId: "task_cmd",
+      workerState: "running",
+      projection: { attention: { requiresAction: true, categories: ["permission"] } },
+    };
+    const { client, calls } = createFakeClient({
+      taskList: { ok: true, result: { tasks: [{ id: "task_cmd", status: "dispatched" }] } },
+      dispatchShow: { ok: true, result: { dispatches: [{ dispatchId: "disp_1" }] } },
+      workerList: { ok: true, result: { workers: [worker] } },
+      workerRead: { ok: true, result: { text: "Allow this command? (y/n)", source: "terminal" } },
+    });
+    const view = await getTaskStatus(client, { taskId: "task_cmd" });
+    const reasons = view["blockedReasons"] as JsonObject[];
+    expect(reasons[0]?.["kind"]).toBe("agent_prompt");
+    expect(reasons[0]?.["detail"]).toEqual({ dispatchId: "disp_1", outputTail: "Allow this command? (y/n)" });
+    expect(calls.some((call) => call.startsWith("workerRead:"))).toBe(true);
   });
 });
 
