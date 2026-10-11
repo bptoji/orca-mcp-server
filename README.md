@@ -255,7 +255,8 @@ orca_get_task_result({ taskId: "task_abc123", includeChildren: true })
 - `gates` は対象タスクと**直接の子タスク**のゲート(`taskId` 付き、`question` は 2000 字まで)。
 - `blockedReasons[]` は止まっている理由(`{ kind, taskId, summary, detail? }`)。`kind` は
   `gate`(質問文 + `detail.gateId/options`)/ `task_report`(Commander・子タスクの blocked 報告 `result`)/
-  `agent_prompt`(要 attention の worker。`detail.outputTail` に出力末尾、MCP からは解除不可)/
+  `agent_prompt`(入力待ちの worker。`detail` に `outputTail` / `outputHash` / `looksLikePrompt` / `observedAt` / `activity`。
+  MCP からは解除不可。`looksLikePrompt` は文言からの推定。`outputHash` は呼び出し側が前回値と比べて動作中かを判定する)/
   `unknown`(根拠なし)。`nextAction` は最優先の kind に合わせて案内します。
   `agent_prompt` の出力取得(`worker-read`)だけが追加の読み取りで、失敗しても `warnings` に残して poll は返ります。
 - `children` は Commander が分解した**直接の子タスク**(`parent_id` 一致)とその worker。

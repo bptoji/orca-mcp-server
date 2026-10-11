@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { OrcaCommandError } from "./command.js";
 import {
   extractTasks,
@@ -283,6 +284,7 @@ export function toWorkerRow(worker: JsonObject): JsonObject {
     worktreeId: pickString(worker, ["worktreeId", "worktree_id"]) ?? null,
     activity: pickString(stage, ["activity"]) ?? null,
     liveness: pickString(liveness, ["verdict"]) ?? null,
+    observedAt: observedAtIso(isJsonObject(projection["evidence"]) ? projection["evidence"]["lastObservedAt"] : undefined),
   };
   if (typeof attention["requiresAction"] === "boolean") {
     row["requiresAttention"] = attention["requiresAction"];
@@ -342,7 +344,7 @@ const BLOCKED_HINTS: Record<BlockedKind, string> = {
   task_report:
     "Commander / 子タスクが blocked を報告している。blockedReasons の内容を読み、orca_send_message で指示するか orca_cancel_task で止める",
   agent_prompt:
-    "エージェント側の承認プロンプトなどで止まっている可能性。MCP からは解除できないので、blockedReasons の出力を確認して人間が pane で答える",
+    "エージェントが入力待ち(承認プロンプト、または Commander がターンを終えて待機中)。blockedReasons の detail.outputTail で内容を確認し、承認ならば pane で人間が答える(MCP からは解除できない)。待機中なら orca_send_message で指示するか、不要なら orca_cancel_task で止める",
   unknown:
     "blocked の理由が特定できない。orca_get_task_result と terminal の出力を確認する",
 };
@@ -352,6 +354,23 @@ const MAX_REASON_TEXT = 2000;
 const MAX_ATTENTION_READS = 2;
 const ATTENTION_READ_LINES = 30;
 const ATTENTION_READ_CHARS = 1500;
+
+const APPROVAL_PROMPT_PATTERN =
+  /do you want to proceed|requires approval|\(y\/n\)|\[y\/n\]|yes, and don.t ask again|allow (this|once)|❯\s*1\.\s*yes/i;
+
+/** 出力末尾が承認プロンプトらしいか(文言からの推定。確定情報ではない)。 */
+export function looksLikeApprovalPrompt(text: string): boolean {
+  return APPROVAL_PROMPT_PATTERN.test(text.split("\n").slice(-12).join("\n"));
+}
+
+/** 出力末尾のハッシュ。呼び出し側が前回値と比べて変化(= 動作中)を判定する。 */
+export function outputHashOf(text: string): string {
+  return createHash("sha256").update(text).digest("hex").slice(0, 16);
+}
+
+function observedAtIso(value: unknown): string | null {
+  return typeof value === "number" && Number.isFinite(value) ? new Date(value).toISOString() : null;
+}
 
 function isPendingGate(gate: JsonObject): boolean {
   const status = pickString(gate, ["status", "state"]);
@@ -393,7 +412,14 @@ export async function collectBlockedReasons(
     }
   }
 
-  const attention = input.workers.filter((worker) => worker["requiresAttention"] === true);
+  // 終端(completed / failed)や exited の worker に残った attention は拾わない
+  const attention = input.workers.filter(
+    (worker) =>
+      worker["requiresAttention"] === true &&
+      worker["status"] !== "completed" &&
+      worker["status"] !== "failed" &&
+      worker["liveness"] !== "exited",
+  );
   const gateFound = reasons.some((reason) => reason["kind"] === "gate");
   if (attention.length > 0 && (input.state === "blocked" || !gateFound)) {
     let reads = 0;
@@ -415,8 +441,15 @@ export async function collectBlockedReasons(
       reasons.push({
         kind: "agent_prompt",
         taskId: worker["taskId"] ?? null,
-        summary: `worker ${dispatchId ?? "?"} が要 attention: categories=${JSON.stringify(worker["attentionCategories"] ?? [])}`,
-        detail: { dispatchId: dispatchId ?? null, outputTail: output },
+        summary: `worker ${dispatchId ?? "?"} が入力待ち: categories=${JSON.stringify(worker["attentionCategories"] ?? [])}, activity=${worker["activity"] ?? "unknown"}`,
+        detail: {
+          dispatchId: dispatchId ?? null,
+          outputTail: output,
+          outputHash: output === null ? null : outputHashOf(output),
+          looksLikePrompt: output === null ? null : looksLikeApprovalPrompt(output),
+          observedAt: worker["observedAt"] ?? null,
+          activity: worker["activity"] ?? null,
+        },
       });
     }
   }

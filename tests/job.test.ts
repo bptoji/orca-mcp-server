@@ -5,6 +5,7 @@ import {
   cancelTask,
   collectDescendants,
   estimatePhase,
+  outputHashOf,
   extractBoundRun,
   findChildTasks,
   findTaskById,
@@ -1002,6 +1003,59 @@ describe("getTaskStatus(poll) — Commander の配下", () => {
     expect((view["blockedReasons"] as JsonObject[]).map((reason) => reason["kind"])).toEqual(["unknown"]);
   });
 
+  it("終端状態の worker に残った attention は agent_prompt にしない", async () => {
+    const worker = {
+      dispatchId: "disp_1",
+      taskId: "task_cmd",
+      workerState: "succeeded",
+      projection: { outcome: "succeeded", attention: { requiresAction: true, categories: ["input"] } },
+    };
+    const { client, calls } = createFakeClient({
+      taskList: { ok: true, result: { tasks: [{ id: "task_cmd", status: "dispatched" }] } },
+      dispatchShow: { ok: true, result: { dispatches: [{ dispatchId: "disp_1" }] } },
+      workerList: { ok: true, result: { workers: [worker] } },
+    });
+    const view = await getTaskStatus(client, { taskId: "task_cmd" });
+    expect(view["blockedReasons"]).toEqual([]);
+    expect(calls.some((call) => call.startsWith("workerRead:"))).toBe(false);
+  });
+
+  it("動作中の出力は looksLikePrompt: false で、hash は出力が変われば変わり、observedAt は ISO で返る", async () => {
+    const make = (text: string) =>
+      createFakeClient({
+        taskList: { ok: true, result: { tasks: [{ id: "task_cmd", status: "dispatched" }] } },
+        dispatchShow: { ok: true, result: { dispatches: [{ dispatchId: "disp_1" }] } },
+        workerList: {
+          ok: true,
+          result: {
+            workers: [
+              {
+                dispatchId: "disp_1",
+                taskId: "task_cmd",
+                workerState: "running",
+                projection: {
+                  attention: { requiresAction: true, categories: ["input"] },
+                  stage: { activity: "waiting" },
+                  evidence: { lastObservedAt: 1791721983181 },
+                },
+              },
+            ],
+          },
+        },
+        workerRead: { ok: true, result: { text, source: "terminal" } },
+      });
+    const detailOf = async (text: string) => {
+      const view = await getTaskStatus(make(text).client, { taskId: "task_cmd" });
+      return (view["blockedReasons"] as JsonObject[])[0]?.["detail"] as JsonObject;
+    };
+    const first = await detailOf("✻ Thinking…");
+    const second = await detailOf("✻ Thinking… (12s)");
+    expect(first["looksLikePrompt"]).toBe(false);
+    expect(first["outputHash"]).not.toBe(second["outputHash"]);
+    expect(first["observedAt"]).toBe(new Date(1791721983181).toISOString());
+    expect(first["activity"]).toBe("waiting");
+  });
+
   it("要 attention の worker は agent_prompt として出力末尾を返す", async () => {
     const worker = {
       dispatchId: "disp_1",
@@ -1018,7 +1072,14 @@ describe("getTaskStatus(poll) — Commander の配下", () => {
     const view = await getTaskStatus(client, { taskId: "task_cmd" });
     const reasons = view["blockedReasons"] as JsonObject[];
     expect(reasons[0]?.["kind"]).toBe("agent_prompt");
-    expect(reasons[0]?.["detail"]).toEqual({ dispatchId: "disp_1", outputTail: "Allow this command? (y/n)" });
+    expect(reasons[0]?.["detail"]).toEqual({
+      dispatchId: "disp_1",
+      outputTail: "Allow this command? (y/n)",
+      outputHash: outputHashOf("Allow this command? (y/n)"),
+      looksLikePrompt: true,
+      observedAt: null,
+      activity: null,
+    });
     expect(calls.some((call) => call.startsWith("workerRead:"))).toBe(true);
   });
 });
