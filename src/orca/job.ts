@@ -388,6 +388,7 @@ export async function collectBlockedReasons(
     tasks: JsonObject[];
     gates: JsonObject[];
     workers: JsonObject[];
+    rootTaskId: string;
   },
   warnings: string[],
 ): Promise<JsonObject[]> {
@@ -464,7 +465,11 @@ export async function collectBlockedReasons(
       summary: "blocked だが gate / 報告 / attention のいずれも見つからない",
     });
   }
-  return reasons;
+  // taskId が対象タスク(= Commander)なら commander、それ以外(子タスク)は child
+  return reasons.map((reason) => ({
+    ...reason,
+    role: reason["taskId"] === null || reason["taskId"] === input.rootTaskId ? "commander" : "child",
+  }));
 }
 
 function primaryBlockedKind(reasons: JsonObject[]): BlockedKind | undefined {
@@ -898,7 +903,7 @@ export async function getTaskStatus(client: OrcaClient, input: TaskStatusInput):
   const warnings: string[] = [];
   const blockedReasons = await collectBlockedReasons(
     client,
-    { state, tasks: [task, ...childTasks], gates, workers: [...workers, ...childWorkers] },
+    { state, tasks: [task, ...childTasks], gates, workers: [...workers, ...childWorkers], rootTaskId: input.taskId },
     warnings,
   );
   const blockedKind = primaryBlockedKind(blockedReasons);

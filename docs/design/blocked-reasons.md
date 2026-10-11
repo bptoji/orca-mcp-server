@@ -22,7 +22,7 @@
 ### `blockedReasons[]`
 
 出す条件: `blocked`、pending ゲート、worker の `requiresAttention` のいずれか。
-要素は `{ kind, taskId, summary, detail? }`。`kind` は次の優先順。
+要素は `{ kind, taskId, role, summary, detail? }`。`role` は `commander`(対象タスク = Commander)/ `child`(直接の子タスク)。`kind` は次の優先順。
 
 | kind | 条件 | summary / detail |
 | --- | --- | --- |

@@ -253,7 +253,8 @@ orca_get_task_result({ taskId: "task_abc123", includeChildren: true })
 - `phase`: `queued / starting / implementation / decision_gate / blocked / settling / finished`
   (`decision_gate` は pending のゲートがあるときだけ。ゲートが無い `blocked` は `blocked`)
 - `gates` は対象タスクと**直接の子タスク**のゲート(`taskId` 付き、`question` は 2000 字まで)。
-- `blockedReasons[]` は止まっている理由(`{ kind, taskId, summary, detail? }`)。`kind` は
+- `blockedReasons[]` は止まっている理由(`{ kind, taskId, role, summary, detail? }`)。`role` は `commander`(対象タスク自身 = Commander)/
+  `child`(直接の子タスク)で、どちらが止まっているかを示します。`kind` は
   `gate`(質問文 + `detail.gateId/options`)/ `task_report`(Commander・子タスクの blocked 報告 `result`)/
   `agent_prompt`(入力待ちの worker。`detail` に `outputTail` / `outputHash` / `looksLikePrompt` / `observedAt` / `activity`。
   MCP からは解除不可。`looksLikePrompt` は文言からの推定。`outputHash` は呼び出し側が前回値と比べて動作中かを判定する)/

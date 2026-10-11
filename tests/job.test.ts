@@ -943,6 +943,7 @@ describe("getTaskStatus(poll) — Commander の配下", () => {
       {
         kind: "gate",
         taskId: "task_cmd",
+        role: "commander",
         summary: "main へ merge してよい?",
         detail: { gateId: "gate_1", options: '["approve","reject"]' },
       },
@@ -974,6 +975,7 @@ describe("getTaskStatus(poll) — Commander の配下", () => {
     });
     const view = await getTaskStatus(client, { taskId: "task_cmd" });
     expect((view["gates"] as JsonObject[]).map((gate) => gate["id"])).toEqual(["gate_c"]);
+    expect((view["blockedReasons"] as JsonObject[]).map((reason) => reason["role"])).toEqual(["child"]);
     expect(view["phase"]).toBe("decision_gate");
     expect(view["nextAction"]).toContain("orca_resolve_gate");
   });
@@ -990,7 +992,7 @@ describe("getTaskStatus(poll) — Commander の配下", () => {
     const view = await getTaskStatus(client, { taskId: "task_cmd" });
     expect(view["phase"]).toBe("blocked");
     expect(view["blockedReasons"]).toEqual([
-      { kind: "task_report", taskId: "task_cmd", summary: "Blocked: nested_worker_depth_exceeded" },
+      { kind: "task_report", taskId: "task_cmd", role: "commander", summary: "Blocked: nested_worker_depth_exceeded" },
     ]);
     expect(view["nextAction"]).toContain("blockedReasons");
   });
@@ -1072,6 +1074,7 @@ describe("getTaskStatus(poll) — Commander の配下", () => {
     const view = await getTaskStatus(client, { taskId: "task_cmd" });
     const reasons = view["blockedReasons"] as JsonObject[];
     expect(reasons[0]?.["kind"]).toBe("agent_prompt");
+    expect(reasons[0]?.["role"]).toBe("commander");
     expect(reasons[0]?.["detail"]).toEqual({
       dispatchId: "disp_1",
       outputTail: "Allow this command? (y/n)",
