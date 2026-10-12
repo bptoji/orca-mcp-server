@@ -5,6 +5,8 @@ import {
   cancelTask,
   collectDescendants,
   estimatePhase,
+  extractApprovalPrompt,
+  outputHashOf,
   extractBoundRun,
   findChildTasks,
   findTaskById,
@@ -114,7 +116,7 @@ describe("estimatePhase", () => {
     ).toBe("implementation");
     expect(estimatePhase("running", [{ status: "completed", dispatchId: "d1" }], [])).toBe("settling");
     expect(estimatePhase("running", [], [{ status: "pending" }])).toBe("decision_gate");
-    expect(estimatePhase("blocked", [], [])).toBe("decision_gate");
+    expect(estimatePhase("blocked", [], [])).toBe("blocked");
     expect(estimatePhase("running", [], [])).toBe("starting");
   });
 });
@@ -549,7 +551,7 @@ describe("getTaskStatus(poll)", () => {
     expect(view["state"]).toBe("blocked");
     expect(view["phase"]).toBe("decision_gate");
     expect(view["gates"]).toEqual([
-      { id: "g1", status: "pending", question: null, options: null },
+      { id: "g1", taskId: null, status: "pending", question: null, options: null },
     ]);
   });
 
@@ -930,9 +932,230 @@ describe("getTaskStatus(poll) — Commander の配下", () => {
     const view = await getTaskStatus(client, { taskId: "task_cmd" });
     expect(view["phase"]).toBe("decision_gate");
     expect(view["gates"]).toEqual([
-      { id: "gate_1", status: "pending", question: "main へ merge してよい?", options: '["approve","reject"]' },
+      {
+        id: "gate_1",
+        taskId: "task_cmd",
+        status: "pending",
+        question: "main へ merge してよい?",
+        options: '["approve","reject"]',
+      },
+    ]);
+    expect(view["blockedReasons"]).toEqual([
+      {
+        kind: "gate",
+        taskId: "task_cmd",
+        role: "commander",
+        summary: "main へ merge してよい?",
+        detail: { gateId: "gate_1", options: '["approve","reject"]' },
+      },
     ]);
     expect(view["nextAction"]).toContain("orca_resolve_gate");
+  });
+
+  it("子タスクのゲートは見え、無関係な task のゲートは除外される", async () => {
+    const { client } = createFakeClient({
+      taskList: {
+        ok: true,
+        result: {
+          tasks: [
+            { id: "task_cmd", status: "dispatched" },
+            { id: "task_child", parent_id: "task_cmd", status: "blocked" },
+            { id: "task_other", status: "blocked" },
+          ],
+        },
+      },
+      gateList: {
+        ok: true,
+        result: {
+          gates: [
+            { id: "gate_c", task_id: "task_child", question: "削除してよい?", status: "pending" },
+            { id: "gate_o", task_id: "task_other", question: "無関係", status: "pending" },
+          ],
+        },
+      },
+    });
+    const view = await getTaskStatus(client, { taskId: "task_cmd" });
+    expect((view["gates"] as JsonObject[]).map((gate) => gate["id"])).toEqual(["gate_c"]);
+    expect((view["blockedReasons"] as JsonObject[]).map((reason) => reason["role"])).toEqual(["child"]);
+    expect(view["phase"]).toBe("decision_gate");
+    expect(view["nextAction"]).toContain("orca_resolve_gate");
+  });
+
+  it("ゲートが無い blocked は task_report として result を返し、phase は blocked", async () => {
+    const { client } = createFakeClient({
+      taskList: {
+        ok: true,
+        result: {
+          tasks: [{ id: "task_cmd", status: "blocked", result: "Blocked: nested_worker_depth_exceeded" }],
+        },
+      },
+    });
+    const view = await getTaskStatus(client, { taskId: "task_cmd" });
+    expect(view["phase"]).toBe("blocked");
+    expect(view["blockedReasons"]).toEqual([
+      { kind: "task_report", taskId: "task_cmd", role: "commander", summary: "Blocked: nested_worker_depth_exceeded" },
+    ]);
+    expect(view["nextAction"]).toContain("blockedReasons");
+  });
+
+  it("根拠が無い blocked は unknown になる", async () => {
+    const { client } = createFakeClient({
+      taskList: { ok: true, result: { tasks: [{ id: "task_cmd", status: "blocked" }] } },
+    });
+    const view = await getTaskStatus(client, { taskId: "task_cmd" });
+    expect((view["blockedReasons"] as JsonObject[]).map((reason) => reason["kind"])).toEqual(["unknown"]);
+  });
+
+  it("終端状態の worker に残った attention は agent_prompt にしない", async () => {
+    const worker = {
+      dispatchId: "disp_1",
+      taskId: "task_cmd",
+      workerState: "succeeded",
+      projection: { outcome: "succeeded", attention: { requiresAction: true, categories: ["input"] } },
+    };
+    const { client, calls } = createFakeClient({
+      taskList: { ok: true, result: { tasks: [{ id: "task_cmd", status: "dispatched" }] } },
+      dispatchShow: { ok: true, result: { dispatches: [{ dispatchId: "disp_1" }] } },
+      workerList: { ok: true, result: { workers: [worker] } },
+    });
+    const view = await getTaskStatus(client, { taskId: "task_cmd" });
+    expect(view["blockedReasons"]).toEqual([]);
+    expect(calls.some((call) => call.startsWith("workerRead:"))).toBe(false);
+  });
+
+  it("動作中の出力は looksLikePrompt: false で、hash は出力が変われば変わり、observedAt は ISO で返る", async () => {
+    const make = (text: string) =>
+      createFakeClient({
+        taskList: { ok: true, result: { tasks: [{ id: "task_cmd", status: "dispatched" }] } },
+        dispatchShow: { ok: true, result: { dispatches: [{ dispatchId: "disp_1" }] } },
+        workerList: {
+          ok: true,
+          result: {
+            workers: [
+              {
+                dispatchId: "disp_1",
+                taskId: "task_cmd",
+                workerState: "running",
+                projection: {
+                  attention: { requiresAction: true, categories: ["input"] },
+                  stage: { activity: "waiting" },
+                  evidence: { lastObservedAt: 1791721983181 },
+                },
+              },
+            ],
+          },
+        },
+        workerRead: { ok: true, result: { text, source: "terminal" } },
+      });
+    const detailOf = async (text: string) => {
+      const view = await getTaskStatus(make(text).client, { taskId: "task_cmd" });
+      return (view["blockedReasons"] as JsonObject[])[0]?.["detail"] as JsonObject;
+    };
+    const first = await detailOf("✻ Thinking…");
+    const second = await detailOf("✻ Thinking… (12s)");
+    expect(first["looksLikePrompt"]).toBe(false);
+    expect(first["outputHash"]).not.toBe(second["outputHash"]);
+    expect(first["observedAt"]).toBe(new Date(1791721983181).toISOString());
+    expect(first["activity"]).toBe("waiting");
+  });
+
+  it("Orca が attention を立てなくても、waiting で出力末尾が承認プロンプトなら agent_prompt にする", async () => {
+    const make = (text: string) =>
+      createFakeClient({
+        taskList: { ok: true, result: { tasks: [{ id: "task_cmd", status: "dispatched" }] } },
+        dispatchShow: { ok: true, result: { dispatches: [{ dispatchId: "disp_1" }] } },
+        workerList: {
+          ok: true,
+          result: {
+            workers: [
+              {
+                dispatchId: "disp_1",
+                taskId: "task_cmd",
+                workerState: "ready",
+                projection: {
+                  outcome: "in_progress",
+                  stage: { activity: "waiting" },
+                  attention: { requiresAction: false, categories: [] },
+                },
+              },
+            ],
+          },
+        },
+        workerRead: { ok: true, result: { text, source: "terminal" } },
+      });
+    const prompt = await getTaskStatus(
+      make("git status; git branch\n Do you want to proceed?\n ❯ 1. Yes\n   2. No").client,
+      { taskId: "task_cmd" },
+    );
+    const reasons = prompt["blockedReasons"] as JsonObject[];
+    expect(reasons.map((reason) => reason["kind"])).toEqual(["agent_prompt"]);
+    expect((reasons[0]?.["detail"] as JsonObject)["looksLikePrompt"]).toBe(true);
+    expect(prompt["attentionRequired"]).toBe(true);
+
+    const idle = await getTaskStatus(make("✻ 子タスクの完了を待っています").client, { taskId: "task_cmd" });
+    expect(idle["blockedReasons"]).toEqual([]);
+    expect(idle["attentionRequired"]).toBe(false);
+  });
+
+  it("要 attention の worker は agent_prompt として出力末尾を返す", async () => {
+    const worker = {
+      dispatchId: "disp_1",
+      taskId: "task_cmd",
+      workerState: "running",
+      projection: { attention: { requiresAction: true, categories: ["permission"] } },
+    };
+    const { client, calls } = createFakeClient({
+      taskList: { ok: true, result: { tasks: [{ id: "task_cmd", status: "dispatched" }] } },
+      dispatchShow: { ok: true, result: { dispatches: [{ dispatchId: "disp_1" }] } },
+      workerList: { ok: true, result: { workers: [worker] } },
+      workerRead: { ok: true, result: { text: "Allow this command? (y/n)", source: "terminal" } },
+    });
+    const view = await getTaskStatus(client, { taskId: "task_cmd" });
+    const reasons = view["blockedReasons"] as JsonObject[];
+    expect(reasons[0]?.["kind"]).toBe("agent_prompt");
+    expect(reasons[0]?.["role"]).toBe("commander");
+    expect(reasons[0]?.["detail"]).toEqual({
+      dispatchId: "disp_1",
+      outputTail: "Allow this command? (y/n)",
+      outputHash: outputHashOf("Allow this command? (y/n)"),
+      looksLikePrompt: true,
+      observedAt: null,
+      activity: null,
+    });
+    expect(calls.some((call) => call.startsWith("workerRead:") && call.includes('"source":"terminal"'))).toBe(true);
+  });
+});
+
+describe("extractApprovalPrompt", () => {
+  const bar = "─".repeat(40);
+  const dashed = "╌".repeat(40);
+
+  it("直前の実線区切りから承認依頼部分だけを切り出し、点線は短くする", () => {
+    const text = [
+      "  Completion boundary:",
+      "● Loading orchestration guide",
+      bar,
+      " PowerShell command",
+      dashed,
+      " orca skills get orchestration --full",
+      dashed,
+      " This command requires approval",
+      " Do you want to proceed?",
+      " ❯ 1. Yes",
+      "   3. No",
+    ].join("\n");
+    const prompt = extractApprovalPrompt(text) ?? "";
+    expect(prompt.startsWith("PowerShell command")).toBe(true);
+    expect(prompt).toContain("Do you want to proceed?");
+    expect(prompt).toContain("╌╌╌\n");
+    expect(prompt).not.toContain("Completion boundary");
+  });
+
+  it("実線が無ければ手前 8 行まで、プロンプトが無ければ null", () => {
+    const lines = Array.from({ length: 20 }, (_, i) => `line${i}`);
+    const prompt = extractApprovalPrompt([...lines, "Do you want to proceed?"].join("\n")) ?? "";
+    expect(prompt.split("\n")).toHaveLength(9);
+    expect(extractApprovalPrompt("普通の出力")).toBeNull();
   });
 });
 

@@ -49,6 +49,11 @@ MCP クライアント(Claude Code / Claude Desktop / dsh など)から使えま
 - Node.js **>= 20**(開発は v24 で検証)
 - PATH 上に `orca` CLI(または `ORCA_BIN` 環境変数でバイナリパスを指定)
 - 大半の操作は起動中の Orca ランタイムが必要(未起動なら `orca open`)
+- **MCP サーバー専用の Orca ターミナル**: orchestration コマンド(`run-create` など)は送信元ターミナルを要求する。
+  Orca アプリ上で専用ターミナルを 1 つ立て、**その pane 内で MCP サーバーを起動する**(pane が持つ
+  `ORCA_TERMINAL_HANDLE` を子プロセスの orca が継承する)。外部クライアントから起動する場合は、
+  専用ターミナルの handle を `ORCA_TERMINAL_HANDLE` として起動環境に渡す。他の pane の handle は使わない
+  (その pane の mailbox を操作してしまう)。ターミナルを閉じると handle は失効する。
 
 ### インストール
 
@@ -245,7 +250,18 @@ orca_get_task_result({ taskId: "task_abc123", includeChildren: true })
 - `state`: `queued / running / blocked / completed / failed / cancelled`(CLI 生の値は `rawStatus`)
   - **`cancelled` は MCP 側の論理状態**です。Orca 側の task は `status: failed` +
     `result: "cancelled: <reason>"` で記録されます(CLI に native の `cancelled` が無い)。
-- `phase`: `queued / starting / implementation / decision_gate / settling / finished`
+- `phase`: `queued / starting / implementation / decision_gate / blocked / settling / finished`
+  (`decision_gate` は pending のゲートがあるときだけ。ゲートが無い `blocked` は `blocked`)
+- `gates` は対象タスクと**直接の子タスク**のゲート(`taskId` 付き、`question` は 2000 字まで)。
+- `blockedReasons[]` は止まっている理由(`{ kind, taskId, role, summary, detail? }`)。`role` は `commander`(対象タスク自身 = Commander)/
+  `child`(直接の子タスク)で、どちらが止まっているかを示します。`kind` は
+  `gate`(質問文 + `detail.gateId/options`)/ `task_report`(Commander・子タスクの blocked 報告 `result`)/
+  `agent_prompt`(入力待ちの worker。`detail` に `outputTail` / `outputHash` / `looksLikePrompt` / `observedAt` / `activity`。
+  MCP からは解除不可。`looksLikePrompt` は文言からの推定。`outputHash` は呼び出し側が前回値と比べて動作中かを判定する)/
+  `unknown`(根拠なし)。`nextAction` は最優先の kind に合わせて案内します。
+  `agent_prompt` の出力取得(`worker-read`)だけが追加の読み取りで、失敗しても `warnings` に残して poll は返ります。
+  Orca が attention を立てない承認プロンプトもあるため、`activity: waiting` の worker も出力末尾を読み、
+  プロンプトらしいときだけ `agent_prompt`(と `attentionRequired: true`)にします。
 - `children` は Commander が分解した**直接の子タスク**(`parent_id` 一致)とその worker。
   `childCount` は実件数、`returnedChildCount` が返した件数(上限 20)、`childrenTruncated` で打ち切りを伝えます。
   **孫以降は出ません**(その子の poll / result で見る)。
@@ -470,7 +486,8 @@ poll を打ち切る前に数回待ってください。**launcher 運用では�
 | `nested_worker_depth_exceeded`(子 worker が起動しない) | Orca の **Nested worker depth** が既定 1。MCP が起動する Commander は既に depth 1 なので、その子は depth 2 で拒否される | Orca の Settings → Orchestration → "Nested worker depth" を 2 にする(既定 1 / 1 以上の整数)。`depth 2, max 1` がそのまま応答に出る |
 | `running` のまま progress が止まる | エージェントの**ツール承認プロンプト**で worker が停止 | `attentionNotes` をたどって pane を確認。codex は `--approve-for-me`、claude は `agentDefaultArgs.claude` の `--permission-mode acceptEdits --allowedTools Bash …` |
 | claude の worker が `dispatched` のまま動かない、pane に `Not logged in` | claude の auth 切れ(権限設定ではない) | Orca 側のアカウント紐づけ / pane で `/login` |
-| `blocked` / `phase: "decision_gate"` | 承認ゲート待ち | `orca_resolve_gate({ gateId, resolution, run })` で進める |
+| `blocked` / `phase: "decision_gate"` | 承認ゲート待ち | `blockedReasons` の `question` / `options` を読み、`orca_resolve_gate({ gateId, resolution, run })` で進める |
+| `blocked` / `phase: "blocked"`(`gates` が空) | ゲート以外の停止(Commander の blocked 報告、承認プロンプトなど) | `blockedReasons` の `kind` を確認(`task_report` は `orca_send_message` / cancel、`agent_prompt` は pane で人間が答える) |
 | `consumer_fenced` | 呼び出し元の Run バインドが対象と違う | 介入ツールは自動で `run-use` して 1 回だけ再試行します。worker 側なら自分の terminal を 1 回バインド |
 | `repo_not_found` | worktree の `name:` / worktree path を渡した | `id:<repoId>` か `path:<repo home>` を使う(repoId は `orca worktree current --json`) |
 | `outcome_required` / `dispatch_id_required` | `worker_done` に `outcome` / `dispatchId` が無い | 両方を付けて送り直す |
@@ -479,6 +496,7 @@ poll を打ち切る前に数回待ってください。**launcher 運用では�
 | cancel した task が `failed` に見える | `cancelled` は MCP 側の論理状態 | 実体は `status: failed` + `result: "cancelled: <reason>"`。想定どおり |
 | `gate_not_found` | その Run に gate が無い | `run` を対象 Run に直す(`gate-list` は Run バインドスコープ) |
 | `orca 起動失敗: orca CLI が見つかりませんでした` | PATH / `ORCA_BIN` | PATH を確認するか `ORCA_BIN` にバイナリパスを指定 |
+| `no_active_sender_terminal`(`run-create` など) | MCP サーバーが Orca ターミナルの外で起動され `ORCA_TERMINAL_HANDLE` が無い | 専用ターミナルの pane 内で起動する、または専用ターミナルの handle を `ORCA_TERMINAL_HANDLE` に設定して起動する |
 | MCP クライアントに接続されない | 未ビルド / stdio 設定 | `npm run build` 後に `npm run dev` で手動起動して確認 |
 | `http_token_required` で起動しない | `ORCA_MCP_HTTP_HOST` がループバック外で `ORCA_MCP_AUTH_TOKEN` が未設定 | トークンを設定するか、`ORCA_MCP_HTTP_HOST` を `127.0.0.1` にして `ssh -L` で中継する |
 | HTTP で 401 | `Authorization` の欠落 / トークン不一致 / `Bearer` 以外の scheme | クライアントの `Authorization: Bearer <token>` がサーバーの `ORCA_MCP_AUTH_TOKEN` と一致するか確認 |
