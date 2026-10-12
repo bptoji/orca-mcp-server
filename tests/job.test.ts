@@ -5,6 +5,7 @@ import {
   cancelTask,
   collectDescendants,
   estimatePhase,
+  extractApprovalPrompt,
   outputHashOf,
   extractBoundRun,
   findChildTasks,
@@ -1121,7 +1122,40 @@ describe("getTaskStatus(poll) — Commander の配下", () => {
       observedAt: null,
       activity: null,
     });
-    expect(calls.some((call) => call.startsWith("workerRead:"))).toBe(true);
+    expect(calls.some((call) => call.startsWith("workerRead:") && call.includes('"source":"terminal"'))).toBe(true);
+  });
+});
+
+describe("extractApprovalPrompt", () => {
+  const bar = "─".repeat(40);
+  const dashed = "╌".repeat(40);
+
+  it("直前の実線区切りから承認依頼部分だけを切り出し、点線は短くする", () => {
+    const text = [
+      "  Completion boundary:",
+      "● Loading orchestration guide",
+      bar,
+      " PowerShell command",
+      dashed,
+      " orca skills get orchestration --full",
+      dashed,
+      " This command requires approval",
+      " Do you want to proceed?",
+      " ❯ 1. Yes",
+      "   3. No",
+    ].join("\n");
+    const prompt = extractApprovalPrompt(text) ?? "";
+    expect(prompt.startsWith("PowerShell command")).toBe(true);
+    expect(prompt).toContain("Do you want to proceed?");
+    expect(prompt).toContain("╌╌╌\n");
+    expect(prompt).not.toContain("Completion boundary");
+  });
+
+  it("実線が無ければ手前 8 行まで、プロンプトが無ければ null", () => {
+    const lines = Array.from({ length: 20 }, (_, i) => `line${i}`);
+    const prompt = extractApprovalPrompt([...lines, "Do you want to proceed?"].join("\n")) ?? "";
+    expect(prompt.split("\n")).toHaveLength(9);
+    expect(extractApprovalPrompt("普通の出力")).toBeNull();
   });
 });
 

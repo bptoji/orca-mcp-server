@@ -363,6 +363,40 @@ export function looksLikeApprovalPrompt(text: string): boolean {
   return APPROVAL_PROMPT_PATTERN.test(text.split("\n").slice(-12).join("\n"));
 }
 
+const PROMPT_FALLBACK_LINES = 8;
+const PROMPT_LOOKBACK_LINES = 25;
+
+/**
+ * 出力末尾から承認依頼の部分だけを切り出す(無ければ null)。
+ * 最後に承認文言に当たる行を探し、直前の実線(─)の区切りまで遡る。区切りが無ければ手前 8 行。
+ * 点線(╌)の長い区切りは短くして返す。
+ */
+export function extractApprovalPrompt(text: string): string | null {
+  const lines = text.split("\n");
+  let hit = -1;
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    if (APPROVAL_PROMPT_PATTERN.test(lines[i] ?? "")) {
+      hit = i;
+      break;
+    }
+  }
+  if (hit < 0) {
+    return null;
+  }
+  let start = Math.max(0, hit - PROMPT_FALLBACK_LINES);
+  for (let i = hit; i >= Math.max(0, hit - PROMPT_LOOKBACK_LINES); i -= 1) {
+    if (/^\s*─{10,}\s*$/.test(lines[i] ?? "")) {
+      start = i + 1;
+      break;
+    }
+  }
+  return lines
+    .slice(start)
+    .map((line) => line.replace(/╌{4,}/g, "╌╌╌"))
+    .join("\n")
+    .trim();
+}
+
 /** 出力末尾のハッシュ。呼び出し側が前回値と比べて変化(= 動作中)を判定する。 */
 export function outputHashOf(text: string): string {
   return createHash("sha256").update(text).digest("hex").slice(0, 16);
@@ -435,7 +469,10 @@ export async function collectBlockedReasons(
       if (dispatchId !== undefined && reads < MAX_ATTENTION_READS) {
         reads += 1;
         try {
-          const read = unwrapResult(await client.workerRead({ dispatch: dispatchId, limit: ATTENTION_READ_LINES }));
+          // auto は transcript(構造化メッセージ)を返し、承認プロンプトの画面が含まれないので terminal を指定する
+          const read = unwrapResult(
+            await client.workerRead({ dispatch: dispatchId, source: "terminal", limit: ATTENTION_READ_LINES }),
+          );
           const text = extractOutputText(read).text;
           output = text === null ? null : text.length <= ATTENTION_READ_CHARS ? text : text.slice(-ATTENTION_READ_CHARS);
         } catch (error) {
@@ -453,7 +490,7 @@ export async function collectBlockedReasons(
         summary: `worker ${dispatchId ?? "?"} が入力待ち: categories=${JSON.stringify(worker["attentionCategories"] ?? [])}, activity=${worker["activity"] ?? "unknown"}`,
         detail: {
           dispatchId: dispatchId ?? null,
-          outputTail: output,
+          outputTail: output === null ? null : (extractApprovalPrompt(output) ?? output),
           outputHash: output === null ? null : outputHashOf(output),
           looksLikePrompt: output === null ? null : looksLikeApprovalPrompt(output),
           observedAt: worker["observedAt"] ?? null,
