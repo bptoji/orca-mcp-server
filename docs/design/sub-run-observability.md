@@ -249,3 +249,18 @@ review10 が「Fix 前に優先して修正すること」と挙げた 3 点へ�
   `page.hasMore: true` に対して `nextCursor` が無い応答は打ち切りとして warning に出す。
 - 打ち切りの worker scan を持つ cancel は `subRunWorkerScanComplete: false` + `fullyStopped: false`
   (`residualWorkers[]` に `scan_incomplete`)で返ることをテストで固定。
+
+## 10. review11 対応(2026-10-14、cancel の安全側判定)
+
+review11 は §1・§2 を「修正済み」と評価し、残る 3 点(優先度順)を挙げた。テストは 268 → **271**。
+
+| # | 指摘 | 対応 |
+|---|---|---|
+| 1 | `workerList` が使えないときに cancel が進み、完全成功を返せる経路が残っている | 探索の前提から「走れない」を除外しない。cascade + includeSubRuns の構成では **client に workerList / runList が無い**、**呼び出し元 Run が特定できず worker-list を読めない** も `cancel_discovery_incomplete` の理由にして変更ゼロ(逃げ道は `cascade: false` / `includeSubRuns: false`) |
+| 2 | gate の `taskId` 照合は任意の誤操作防止であり厳密な認可ではない | README・AGENTS.md・ツール説明・schema 説明に「`taskId` 省略時は点検しない / Run をまたぐ親子関係は検証しない」を明記 |
+| 3 | 異常系の回帰テスト | 追加: 呼び出し元 Run の worker-list がページ上限 → cancel 前に拒否(変更ゼロ)、`workerList` 不在の client で cascade cancel を断る(cascade: false は通す)、worker-list を読み直せる Run が無い cancel は `fullyStopped: false`。既存の fence 失敗テスト 3 件は探索前提(worker-list / run-list)を備えた client に更新 |
+
+- 停止後の読み直しも安全側に寄せた: 読み直せる Run が 1 つも無い場合は検証不能として `fullyStopped: false` + warning。
+- review11 の次段階の提案(実機 E2E で「sub-run 内の gate 検出 → 解決 → Commander 再開」と「sub-run を含む cancel」)は
+  §8-2 の E2E #3 が gate 検出・解決(taskId 付き)・cancel(fullyStopped: true)を実測済み。sub-run を作る goal での
+  発火検証は未実施(`cancel_discovery_incomplete` / `gate_task_mismatch` はユニットテストで固定)。

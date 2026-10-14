@@ -361,11 +361,14 @@ sub-run の worker を走りたままにした)。設計は `docs/design/sub-run
 - **停止後は worker-list を読み直す**(`residualLiveWorkers`)。生存 worker が 1 件でもあれば
   `residualWorkers[]` に載せて `fullyStopped: false`。探索を打ち切った場合も `fullyStopped: false`
   (読み直せない Run は `residualWorkers[]` に `status: "scan_incomplete"` を残す)。
+  **読み直せる Run が 1 つも無い**(呼び出し元 Run が特定できない)ときも検証不能なので `fullyStopped: false`。
 - **cancel は探索の前提が揃わなければ preflight で断る**(`cancel_discovery_incomplete`、変更ゼロ):
   呼び出し元 Run の worker-list が読めない / ページングを打ち切った / worker がいるのに Commander の
-  terminal handle が取れない / sub-run 探索の run-list が読めない。これらは warning に流すだけでは
+  terminal handle が取れない / sub-run 探索の run-list が読めない / **client に workerList・runList が無い /
+  呼び出し元 Run が特定できず worker-list を読めない**。これらは warning に流すだけでは
   「見落とした worker を走りたまま `cancelled: true`」になる(実装当初は worker-list 失敗が
-  `captureSubRuns` の結果で上書きされて消えていた)。逃げ道は `cascade: false` / `includeSubRuns: false`。
+  `captureSubRuns` の結果で上書きされて消えていた)。**「探索機能が走れないので止まらない」は安全側ではない**
+  (review11 §4)。逃げ道は `cascade: false` / `includeSubRuns: false`。
 - 集約の失敗(run-list 読めず / sub-run の task-list 読めず)は **poll / cancel / result を壊さず `warnings` だけ**添える。
   観測でしかないので cancel では対象を絞る(変更系を sub-run に増やさない)。
 - `run-list` / `run-show` は読み取り専用なので poll / result ハンドラーで呼んでよい(AGENTS.md の読み集めの範囲)。

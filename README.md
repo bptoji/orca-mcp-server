@@ -369,7 +369,9 @@ orca_cancel_task({ taskId: "task_abc123", reason: "方針変更" })   // cascade
   単一ユーザー / 信頼できるクライアント前提の認可を持っていません(HTTP で他 PC に公開する運用はトークン必須で、
   承認権限は運用側で確認してください)。自分の job のゲートだけを解決させたいときは `taskId`
   (通常は `orca_delegate_task` の `taskId`)を渡します — ゲートの task がその task またはその部分木に
-  属さなければ `gate_task_mismatch` で**何も変更せずに**拒否します(指定なしは点検しません)
+  属さなければ `gate_task_mismatch` で**何も変更せずに**拒否します(指定なしは点検しません)。
+  **これは厳密な Job 単位の認可ではなく、誤操作防止の任意チェック**です: `taskId` を省略すれば点検されず、
+  Run をまたぐ親子関係(呼び出し元 Run の task と sub-run の task など)はこの照合では検証できません
 - Commander Prompt は「承認ゲート無しでは merge / push / deploy をしない」と約束しています。
   **ゲートを解決する API がないとジョブは途中で詰まります**(blocked / decision_gate の `nextAction` が指します)
 - **cancel はジョブ単位**(既定 `cascade: true`)。Commander が分解した**子孫タスクとその worker を子から順**に
@@ -395,11 +397,15 @@ orca_cancel_task({ taskId: "task_abc123", reason: "方針変更" })   // cascade
   その 1 件でも `fullyStopped: false` にします(論理 cancel と実プロセス停止のズレを正直に出す)。
   探索を打ち切った場合(`subRunScanComplete: false` / `subRunsTruncated` / `subRunWorkerScanComplete: false`)も
   `fullyStopped: false` です。worker-list をページングで読み切れない Run は `residualWorkers[]` に
-  `status: "scan_incomplete"` を残します
+  `status: "scan_incomplete"` を残し、**読み直せる Run が 1 つも無い**(呼び出し元 Run が特定できない)ときも
+  検証不能なので `fullyStopped: false` にします
 - **探索の前提が揃わなければ cancel は何も変更しません**(`cancel_discovery_incomplete`)。
   sub-run を巻き込む cancel は、呼び出し元 Run の worker-list・sub-run 探索の run-list・Commander の
   terminal handle に依存します。これらが読めない / ページングを打ち切ったときにそのまま進めると、
   見落とした worker を走りたまま `cancelled: true` で返してしまうため、preflight で断ります。
+  対象は読み取りの失敗・打ち切り・handle 取得不能に加えて、**探索コマンド自体が使えない場合**
+  (client に worker-list / run-list がない、呼び出し元 Run が特定できない)も含みます —
+  「走れないので検査しない」を完全成功の経路にしないためです。
   `detail.discoveryFailures[]` に理由が出ます。sub-run を巻き込まずに止める逃げ道は
   `cascade: false` / `includeSubRuns: false`
 - `mode: "abandon"` は `orca orchestration worker-abandon`(資源を残しプロセスにも filesystem にも触らない)に対応します。
@@ -566,7 +572,7 @@ poll を打ち切る前に数回待ってください。**launcher 運用では�
 | `cancel_scope_too_large` / `cancel_dispatch_scope_too_large` | 子孫 12 件超 / 1 タスク 3 dispatch 超 | 何も変更していません。`cascade: false` か個別 cancel を選ぶ |
 | `cancel_ownership_unverified` | 所有が `verified` でない sub-run がある(来歴の pane key / incarnation が確認できない) | 何も変更していません。`detail.subRuns[]` の `ownership` / `verificationReasons` を確認し、`includeSubRuns: false` で本体だけ止めるか sub-run を Run 名指しで個別 cancel する |
 | cancel が `fullyStopped: false`(`cancelled: true`) | 停止後に読み直して worker が生存している / 探索を打ち切った | `residualWorkers[]` の task / dispatch を pane で確認。`subRunScanComplete` / `subRunsTruncated` / `subRunWorkerScanComplete` / `status: "scan_incomplete"` が未完のしるし |
-| `cancel_discovery_incomplete` | cancel の前提(worker-list / run-list / Commander の handle)が読めない・打ち切った | 何も変更していません。`detail.discoveryFailures[]` を確認。sub-run を巻き込まず止めるなら `cascade: false` / `includeSubRuns: false` |
+| `cancel_discovery_incomplete` | cancel の前提(worker-list / run-list / Commander の handle)が読めない・打ち切った・使えない(client に worker-list / run-list が無い、呼び出し元 Run が特定できない) | 何も変更していません。`detail.discoveryFailures[]` を確認。sub-run を巻き込まず止めるなら `cascade: false` / `includeSubRuns: false` |
 | poll の `subRunOwnershipComplete: false` | sub-run の来歴が確認できない(terminal list が読めない等) | 観測には出るが auto-cancel はしない。`subRuns[].ownership` を見て判断する |
 | cancel した task が `failed` に見える | `cancelled` は MCP 側の論理状態 | 実体は `status: failed` + `result: "cancelled: <reason>"`。想定どおり |
 | `gate_not_found` | その Run に gate が無い | `run` を対象 Run に直す(`gate-list` は Run バインドスコープ)。sub-run のゲートは `gates[].runId` の Run で見る |

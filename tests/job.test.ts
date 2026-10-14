@@ -204,6 +204,7 @@ function createFakeClient(options: {
   taskList?: JsonObject;
   dispatchShow?: JsonObject;
   workerList?: JsonObject;
+  runList?: JsonObject;
   gateList?: JsonObject;
   gateResolve?: JsonObject;
   workerRead?: JsonObject;
@@ -307,6 +308,10 @@ function createFakeClient(options: {
     runUse: async (runId: string) => {
       calls.push(`runUse:${runId}`);
       return { ok: true, result: { run: { id: runId } } };
+    },
+    runList: async (input: JsonObject) => {
+      calls.push(`runList:${JSON.stringify(input)}`);
+      return options.runList ?? { ok: true, result: { runs: [] } };
     },
   };
   return { client: client as unknown as OrcaClient, calls };
@@ -1660,6 +1665,21 @@ describe("cancelTask(介入)", () => {
     const client = {
       taskList: async () => runningTaskList,
       dispatchShow: async () => ({ ok: true, result: { dispatch: { id: "ctx_42e6925ec35f" } } }),
+      // cancel の探索前提(worker-list / run-list)は揃えた上で fence 失敗を再現する
+      workerList: async () => ({
+        ok: true,
+        result: {
+          workers: [
+            {
+              dispatchId: "ctx_42e6925ec35f",
+              taskId: "task_3208dcf22c18",
+              workerState: "in_progress",
+              agentTerminalHandle: "term_cmd",
+            },
+          ],
+        },
+      }),
+      runList: async () => ({ ok: true, result: { runs: [] } }),
       workerStop: async () => {
         throw new Error("release_unknown");
       },
@@ -1707,7 +1727,7 @@ describe("cancelTask(介入)", () => {
 
   it("task 行の id を dispatch id と取り違えない(worker-abandon を空打ちしない)", async () => {
     const { client, calls } = createFakeClient({
-      taskList: { ok: true, result: { tasks: [{ id: "task_695cee4c872d", status: "dispatched" }] } },
+      taskList: { ok: true, result: { tasks: [{ id: "task_695cee4c872d", status: "dispatched", run_id: "run_x" }] } },
       dispatchShow: { ok: true, result: { dispatch: null } },
     });
     const result = await cancelTask(client, { taskId: "task_695cee4c872d" });
@@ -1746,6 +1766,15 @@ describe("cancelTask(介入)", () => {
     const client = {
       taskList: async () => runningTaskList,
       dispatchShow: async () => ({ ok: true, result: { dispatch: { id: "ctx_1" } } }),
+      workerList: async () => ({
+        ok: true,
+        result: {
+          workers: [
+            { dispatchId: "ctx_1", taskId: "task_3208dcf22c18", workerState: "in_progress", agentTerminalHandle: "term_cmd" },
+          ],
+        },
+      }),
+      runList: async () => ({ ok: true, result: { runs: [] } }),
       workerStop: async () => ({ ok: true, result: { state: "stopped" } }),
       taskUpdate: async () => {
         throw new OrcaCommandError(
@@ -1931,11 +1960,12 @@ describe("cancelTask(cascade / 子孫への子から順)", () => {
       ok: true,
       result: {
         tasks: [
-          { id: "root", parent_id: null, status: "dispatched" },
+          { id: "root", parent_id: null, status: "dispatched", run_id: "run_x" },
           ...Array.from({ length: 20 }, (_, index) => ({
             id: `child_${index}`,
             parent_id: "root",
             status: "dispatched" as const,
+            run_id: "run_x",
           })),
         ],
       },
@@ -1962,11 +1992,12 @@ describe("cancelTask(cascade / 子孫への子から順)", () => {
       ok: true,
       result: {
         tasks: [
-          { id: "root", parent_id: null, status: "dispatched" },
+          { id: "root", parent_id: null, status: "dispatched", run_id: "run_x" },
           ...Array.from({ length: 11 }, (_, index) => ({
             id: `child_${index}`,
             parent_id: "root",
             status: "dispatched" as const,
+            run_id: "run_x",
           })),
         ],
       },
@@ -1994,6 +2025,8 @@ describe("runMutation(直列化)", () => {
           result: { tasks: [{ id: `task_${runId}`, run_id: runId, status: "dispatched" }] },
         }),
         dispatchShow: async () => ({ ok: true, result: { dispatch: null } }),
+        workerList: async () => ({ ok: true, result: { workers: [] } }),
+        runList: async () => ({ ok: true, result: { runs: [] } }),
         taskUpdate: async (input: JsonObject) => {
           attempts += 1;
           push(`taskUpdate:${JSON.stringify(input)}`);
@@ -2917,5 +2950,77 @@ describe("cancelTask — 所有検証・dispatch 重複・停止後の読み直�
     const subRunsOff = await cancelTask(client, { taskId: "task_cmd", run: "run_caller", includeSubRuns: false });
     expect(subRunsOff["cancelled"]).toBe(true);
     expect(calls.some((call) => call.startsWith("runList:"))).toBe(false);
+  });
+
+  it("workerList を持たない client では cascade cancel を安全側で断る(成功扱いしない)", async () => {
+    // review11 §4: 「探索機能が走れない」を完全成功の経路にしない。
+    const calls: string[] = [];
+    const client = {
+      taskList: async () => ({
+        ok: true,
+        result: { tasks: [{ id: "task_cmd", run_id: "run_caller", status: "dispatched", dispatch_id: "disp_cmd" }] },
+      }),
+      dispatchShow: async () => ({ ok: true, result: { dispatch: { id: "disp_cmd" } } }),
+      runList: async () => ({ ok: true, result: { runs: [] } }),
+      workerStop: async (dispatch: string) => {
+        calls.push(`workerStop:${dispatch}`);
+        return { ok: true, result: { state: "stopped" } };
+      },
+      taskUpdate: async (input: JsonObject) => {
+        calls.push(`taskUpdate:${JSON.stringify(input)}`);
+        return { ok: true, result: {} };
+      },
+    } as unknown as OrcaClient;
+
+    const error = await cancelTask(client, { taskId: "task_cmd", run: "run_caller" }).catch((e) => e);
+    expect(error).toBeInstanceOf(JobError);
+    expect((error as JobError).code).toBe("cancel_discovery_incomplete");
+    expect((((error as JobError).detail as JsonObject)["discoveryFailures"] as string[]).join("|")).toContain("workerList");
+    expect(calls).toEqual([]);
+
+    // 逃げ道(cascade: false)は従来どおり通す
+    const escape = await cancelTask(client, { taskId: "task_cmd", run: "run_caller", cascade: false });
+    expect(escape["cancelled"]).toBe(true);
+  });
+
+  it("呼び出し元 Run の worker-list がページ上限に到達したら cancel 前に拒否する(変更ゼロ)", async () => {
+    // review11 §5: worker 行を取りこぼしたまま「全部止めた」を返さない。
+    const { client, calls } = createSubRunClient();
+    let seen = 0;
+    client.workerList = (async (input: JsonObject) => {
+      const run = input["run"];
+      const rows =
+        run === "run_sub"
+          ? [
+              { dispatchId: "disp_a", taskId: "task_sub_a", workerState: "stopped", agentTerminalHandle: "term_wa" },
+              { dispatchId: "disp_b", taskId: "task_sub_b", workerState: "stopped", agentTerminalHandle: "term_wb" },
+            ]
+          : [{ dispatchId: "disp_cmd", taskId: "task_cmd", workerState: "stopped", agentTerminalHandle: "term_cmd" }];
+      if (run !== "run_caller") {
+        return { ok: true, result: { workers: rows } };
+      }
+      seen += 1;
+      // 呼び出し元 Run の worker-list が hasMore を出し続ける(毎回新しい cursor)
+      return { ok: true, result: { workers: rows, page: { hasMore: true, nextCursor: `caller_cursor_${seen}` } } };
+    }) as unknown as typeof client.workerList;
+
+    const error = await cancelTask(client, { taskId: "task_cmd", run: "run_caller" }).catch((e) => e);
+    expect(error).toBeInstanceOf(JobError);
+    expect((error as JobError).code).toBe("cancel_discovery_incomplete");
+    const failures = ((error as JobError).detail as JsonObject)["discoveryFailures"] as string[];
+    expect(failures.join("|")).toContain("呼び出し元 Run の worker-list を 3 ページで打ち切りました");
+    expect(calls.some((call) => call.startsWith("workerStop:"))).toBe(false);
+    expect(calls.some((call) => call.startsWith("taskUpdate:"))).toBe(false);
+  });
+
+  it("worker-list を読み直せる Run が無い cancel は fullyStopped: false で返す", async () => {
+    // run 名義が無い = 停止後の残存 worker を検証できない(review11 §4 の安全側)。
+    const { client } = createFakeClient({
+      taskList: { ok: true, result: { tasks: [{ id: "task_orphan", status: "dispatched", dispatch_id: "disp_orphan" }] } },
+    });
+    const result = await cancelTask(client, { taskId: "task_orphan", cascade: false });
+    expect(result["cancelled"]).toBe(true);
+    expect(result["fullyStopped"]).toBe(false);
+    expect((result["warnings"] as string[]).join("|")).toContain("worker-list を読み直せる Run");
   });
 });

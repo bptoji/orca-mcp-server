@@ -234,7 +234,8 @@ export const resolveGateInputSchema = z.strictObject({
     .describe(
       "任意: この解決が自分の job のものかを点検させる task ID(通常は orca_delegate_task の taskId)。" +
         "ゲートの task がこの task またはその部分木に属さない場合は gate_task_mismatch で拒否する(何も変更しない)。" +
-        "指定なしはゲートの所属 task を点検しない(gateId と run が合っていれば解決する)",
+        "指定なしはゲートの所属 task を点検しない(gateId と run が合っていれば解決する)。" +
+        "これは誤操作防止の任意チェックで、厳密な Job 単位の認可ではない(Run をまたぐ親子関係は検証しない)",
     ),
 });
 export type ResolveGateInputSchema = z.infer<typeof resolveGateInputSchema>;

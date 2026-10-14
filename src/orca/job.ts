@@ -1997,11 +1997,14 @@ export async function cancelTask(client: OrcaClient, input: CancelTaskInput): Pr
   if (cascade && input.includeSubRuns !== false) {
     const handles = commanderHandles(task, []);
     let callerWorkerRows: JsonObject[] = [];
-    // workerList が無い client(部分的な注入)では探索そのものを走らせない
-    // = 「読めなかった」ではなく「走れない」として、cancel を止めない。
-    const canScanWorkers = typeof client.workerList === "function";
-    try {
-      if (canScanWorkers && typeof runId === "string" && runId.length > 0) {
+    // review11 §4: 探索機能が無い / Run が特定できないときは「走れないので止まらない」ではなく
+    // **安全側で断る**(worker 一覧を読めない状態で fullyStopped: true を返さない)。
+    if (typeof client.workerList !== "function") {
+      discoveryFailures.push("client が workerList を持たず worker 一覧を読めない");
+    } else if (typeof runId !== "string" || runId.length === 0) {
+      discoveryFailures.push("呼び出し元 Run が特定できず worker-list を読めない");
+    } else {
+      try {
         const scan = await scanWorkerRows(client, runId);
         callerWorkerRows = scan.rows;
         if (!scan.complete) {
@@ -2009,17 +2012,20 @@ export async function cancelTask(client: OrcaClient, input: CancelTaskInput): Pr
             `呼び出し元 Run の worker-list を ${scan.pages} ページで打ち切りました(${SCAN_STOP_TEXT[scan.stopReason]})`,
           );
         }
+      } catch (error) {
+        discoveryFailures.push(`cancel の worker-list に失敗: ${failureLine(error)}`);
       }
       for (const row of callerWorkerRows.map(toWorkerRow)) {
         if (row["taskId"] === input.taskId && typeof row["terminalHandle"] === "string") {
           handles.push(row["terminalHandle"] as string);
         }
       }
-    } catch (error) {
-      discoveryFailures.push(`cancel の worker-list に失敗: ${failureLine(error)}`);
     }
     if (handles.length === 0 && callerWorkerRows.length > 0) {
       discoveryFailures.push("worker がいるのに Commander の terminal handle が取得できない(sub-run を照合できない)");
+    }
+    if (handles.length > 0 && typeof client.runList !== "function") {
+      discoveryFailures.push("client が runList を持たず sub-run を探索できない(「sub-run は無い」とは言えない)");
     }
     const capture = await captureSubRuns(client, {
       callerRunId: runId,
@@ -2229,10 +2235,18 @@ export async function cancelTask(client: OrcaClient, input: CancelTaskInput): Pr
   // P5(review9 §6): 停止後に worker を読み直し、残っている worker を正直に出す。
   // 探索を打ち切った(scanComplete: false / subRunsTruncated)場合は「全部止めた」と宣言しない。
   const cancelledTaskIds = new Set(tasks.map((row) => row["taskId"]).filter((id): id is string => typeof id === "string"));
-  const scanIncomplete = !subCapture.scanComplete || subCapture.subRunsTruncated || !subCapture.workerScanComplete;
-  const residual = await residualLiveWorkers(client, [runId, ...eligibleRunIds], cancelledTaskIds);
+  const residualRuns = [runId, ...eligibleRunIds];
+  // 読み直せる Run が 1 つも無い = 残存 worker を検証できない(review11 §4 の安全側)。
+  const residualUnverifiable = !residualRuns.some((run) => typeof run === "string" && run.length > 0);
+  const scanIncomplete =
+    !subCapture.scanComplete || subCapture.subRunsTruncated || !subCapture.workerScanComplete || residualUnverifiable;
+  const residual = await residualLiveWorkers(client, residualRuns, cancelledTaskIds);
   if (scanIncomplete) {
-    warnings.push("探索を打ち切ったため、stop の完了を保証できません(fullyStopped: false)");
+    warnings.push(
+      residualUnverifiable
+        ? "停止後に worker-list を読み直せる Run が特定できないため、stop の完了を保証できません(fullyStopped: false)"
+        : "探索を打ち切ったため、stop の完了を保証できません(fullyStopped: false)",
+    );
   }
   if (residual.length > 0) {
     warnings.push(`停止後に読み直したところ ${residual.length} 個の worker が生存しています(pane を確認してください)`);
