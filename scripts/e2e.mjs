@@ -216,24 +216,28 @@ const main = async () => {
     for (const gate of pendingGates) {
       // gate-resolve には --run が無いので「ゲートの所属 Run」を叩く(sub-run のゲートは呼び出し元 Run と違う)
       const gateRun = typeof gate.runId === "string" && gate.runId.length > 0 ? gate.runId : runId;
-      // taskId を渡すと「自分の job のゲートか」を MCP 側が点検する(gate_task_mismatch で変更前に拒否)
+      // taskId を渡すと「自分の job のゲートか」を MCP 側が点検する(gate_task_mismatch で変更前に拒否)。
+      // ただし sub-run のゲートは呼び出し元 Run の task 部分木に属さないので点検させない(review11 §3)。
+      const ownJobGate = gateRun === runId;
       const resolved = await call("orca_resolve_gate", {
         gateId: gate.id,
         resolution: "approve (e2e)",
         run: gateRun,
-        taskId,
+        ...(ownJobGate ? { taskId } : {}),
       });
-      log(`gate ${gate.id} → approve (e2e) run=${gateRun} taskId=${gate.taskId ?? null} isError=${resolved.isError}`);
+      log(
+        `gate ${gate.id} → approve (e2e) run=${gateRun} taskId=${ownJobGate ? taskId : "none(sub-run)"} isError=${resolved.isError}`,
+      );
       gatesResolved.push({
         gateId: gate.id,
         gateRun,
         callerRun: runId,
         gateTaskId: gate.taskId ?? null,
-        requestedTaskId: taskId,
+        requestedTaskId: ownJobGate ? taskId : null,
         question: gate.question ?? null,
         result: resolved.parsed,
       });
-      record("resolve_gate", { gateId: gate.id, gateRun, callerRun: runId, taskId, result: resolved.parsed });
+      record("resolve_gate", { gateId: gate.id, gateRun, callerRun: runId, taskId: ownJobGate ? taskId : null, result: resolved.parsed });
     }
 
     if (["completed", "failed", "cancelled"].includes(last?.state)) {

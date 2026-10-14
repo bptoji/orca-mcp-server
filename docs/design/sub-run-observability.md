@@ -24,6 +24,13 @@ Status: 実装済み(2026-10-13 / 起案時の設計は §7 のとおり是正�
 - unbound terminal では run-scoped コマンドが `run_required` で失敗し、エラー文が「Use orchestration run-create or run-use first.」と **run-create を筆頭に勧げる**。dsh の逸脱はほぼ構造的必然。
 - Run は `coordinator_handle`(作成者のターミナル handle)を持つ(`run-current --json` の `result.run.coordinator_handle`)。**sub-run 照合のキーとして使える**。
 
+続報(クローズまでの実測、2026-10-14):
+
+- Commander は sub-run 内に**自分の coordinator task**(例 `task_a9c5f6f06805`)も作成しており、**受信箱の実効宛先が sub-run 側に移動する**。呼び出し側から `run=<親run>` 宛の `send_message` は消費され続けた(capture #12)。
+- `--to dispatch:<id>` の検証が run 指定によって**両方向に矛盾して失敗**した: `run=親` → 「dispatch is in 子Run」(recipient_run_mismatch)、`run=子` → 「dispatch belongs to 親Run」(dispatch_run_mismatch)。**Orca send 検証のバグ候補**。唯一通ったのは `to=<term_handle>` 直指定。
+- worker_done は sub-run から**親 run へ正しく配送された**(lifecycle.action: completed)。報告経路は壊れない — 壊れるのは観測(§1 #2-5)と指令経路(inbox)。
+- 子6件の結末: 3 succeeded + 3 failed(Claude 401 / API 同時要求タイムアウト)。**Commander が失敗分を直接執筆して回収**し、全成果物をコミット済みで worker_done(succeeded)。gate は caller の「merge/push 不要」指示で却下解決 — ゲート文言に上流指示を反映する運用が機能した。
+
 ## 2. 設計方針(3点セット)
 
 観測の正しさは**ツール側で保証**し、プロンプトは「正しい手順 + 禁止 + 開示義務」を短く書く。自行解釈が起きても caller が壊れない状態を作る。
@@ -232,7 +239,7 @@ review10 §135 の「既存 pending Gate を変更せずに観測する E2E」�
 | E2E #3 の cancel ジョブ | `task_bb5c7d4f1b24` を cascade cancel | `cancelled: true` / `fullyStopped: true` / `residualWorkers: []` / `cancelErrorCode: null`(=`cancel_discovery_incomplete` は発火せず)、cancel 後 `state: failed` |
 
 - 新フィールドは result 応答にも出ている(`subRunScanComplete` / `subRunWorkerScanComplete` / `subRunOwnershipComplete`)。
-- 未発火の実機検証: `cancel_discovery_incomplete` / `gate_task_mismatch`(いずれもユニットテストで固定済み)。
+- 未発火の実機検証: `cancel_discovery_incomplete`(ユニットテストで固定)。`gate_task_mismatch` は §11 で実機発火を確認した。
   自 task への gate-create は `task_not_startable`(実測で 2 回目)なので、ゲートは子 task に作られる。
 
 ## 9. review10 対応(2026-10-14、cancel 周辺と gate の境界)
@@ -261,6 +268,30 @@ review11 は §1・§2 を「修正済み」と評価し、残る 3 点(優先�
 | 3 | 異常系の回帰テスト | 追加: 呼び出し元 Run の worker-list がページ上限 → cancel 前に拒否(変更ゼロ)、`workerList` 不在の client で cascade cancel を断る(cascade: false は通す)、worker-list を読み直せる Run が無い cancel は `fullyStopped: false`。既存の fence 失敗テスト 3 件は探索前提(worker-list / run-list)を備えた client に更新 |
 
 - 停止後の読み直しも安全側に寄せた: 読み直せる Run が 1 つも無い場合は検証不能として `fullyStopped: false` + warning。
-- review11 の次段階の提案(実機 E2E で「sub-run 内の gate 検出 → 解決 → Commander 再開」と「sub-run を含む cancel」)は
-  §8-2 の E2E #3 が gate 検出・解決(taskId 付き)・cancel(fullyStopped: true)を実測済み。sub-run を作る goal での
-  発火検証は未実施(`cancel_discovery_incomplete` / `gate_task_mismatch` はユニットテストで固定)。
+- review11 の次段階の提案(実機 E2E で「sub-run 内の gate 検出 → 解決 → Commander 再開」と「sub-run を含む cancel」)を
+  2026-10-14 に実機で回した。結果は §11。
+
+## 11. review11 対応後の実機 E2E(2026-10-14、sub-run を意図的に作る goal)
+
+goal: Commander に `run-create` で sub-run を作らせ、その Run 内に gate を配置させ、解決後に README へ追記させる
+(`task_b89398db9e90` / `run_33d5cf3391b1`、sub-run `run_98b5cc233180`、child `task_a6b0ca486935`、gate `gate_21c198d36a6a`)。
+
+| 観測 | 結果 |
+|---|---|
+| sub-run 発見 | poll#13 で `subRunsDiscovered: 1`、scan 2 p / 90 runs、`subRunWorkerScanComplete: true` |
+| 所有検証 | poll#13 は `subRunOwnershipComplete: false`(root 来歴が揃う前)→ poll#14 以降 `true`(`verified`)。cancel 対象の条件が実機で機能した |
+| sub-run の gate 検出 | poll#17 で `phase: decision_gate` / `gates: 1`、`gates[0].runId = run_98b5cc233180`(呼び出し元 Run と違う Run のゲートを拾った) |
+| gate 解決 | **`gate_task_mismatch` で連続拒否**。ゲートの task は sub-run 内の `task_a6b0ca486935` で、呼び出し元 Run の Commander task の部分木に属さない — review11 §3 の「Run をまたぐ親子は検証できない」が実機で出た |
+| sub-run を含む cancel | sub-run の child は `cancelled`(`run_98b5cc233180` 名義で確定)。Commander の `task-update` は `task_not_startable`("cannot move to failed while supervised Dispatch ctx_92e039fe1ec8 is active")で落ち `cancel_incomplete` |
+
+是正(テスト 271 → **272**):
+
+- **`worker-stop` の `stop_unknown` を停止成功に数えていた**: receipt は `state: "stop_unknown"` /
+  `processAction: "none"` なのに dispatch は active のまま。旧実装は fence 成功として `fullyStopped: true` と
+  報告し、後続の `task-update` が CLI に拒否された = 停止漏れを成功と報告していた。
+  `UNCONFIRMED_FENCE_STATES`(`stop_unknown / abandon_unknown / unknown / failed / error`、状態無しを含む)を
+  fence 失敗として数え、`cancel_incomplete`(`fullyStopped: false`)+ warning に落とすよう直した
+- **`gate_task_mismatch` のメッセージに sub-run の逃げ道を明記**(「sub-run のゲートは呼び出し元 Run の
+  task 部分木に属さないので taskId を外して解決する」)。README のトラブルシュートにも同じ根拠を追記
+- **`scripts/e2e.mjs` はゲートの所属 Run が呼び出し元 Run と違うとき `taskId` を渡さない**
+  (sub-run のゲートは点検させない)。ログには `taskId=none(sub-run)` を出す

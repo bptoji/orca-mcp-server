@@ -1698,6 +1698,42 @@ describe("cancelTask(介入)", () => {
     expect(detail["cancelledTasks"]).toEqual([]);
   });
 
+  it("worker-stop が stop_unknown を返したら停止成功に数えない(cancel_incomplete / fullyStopped: false)", async () => {
+    // 実測 2026-10-14: worker-stop は stop_unknown / processAction: none を返し得る。
+    // dispatch は active のままなので task-update は task_not_startable で落ち、
+    // 「fence 成功 + fullyStopped: true」は誤報になる。
+    const client = {
+      taskList: async () => runningTaskList,
+      dispatchShow: async () => ({ ok: true, result: { dispatch: { id: "ctx_42e6925ec35f" } } }),
+      workerList: async () => ({
+        ok: true,
+        result: {
+          workers: [
+            {
+              dispatchId: "ctx_42e6925ec35f",
+              taskId: "task_3208dcf22c18",
+              workerState: "in_progress",
+              agentTerminalHandle: "term_cmd",
+            },
+          ],
+        },
+      }),
+      runList: async () => ({ ok: true, result: { runs: [] } }),
+      workerStop: async () => ({ ok: true, result: { state: "stop_unknown", processAction: "none" } }),
+      taskUpdate: async () => ({ ok: true, result: {} }),
+    } as unknown as OrcaClient;
+
+    const error = await cancelTask(client, { taskId: "task_3208dcf22c18" }).catch((e) => e);
+    expect(error).toBeInstanceOf(JobError);
+    expect((error as JobError).code).toBe("cancel_incomplete");
+    const detail = (error as JobError).detail as JsonObject;
+    expect(detail["fullyStopped"]).toBe(false);
+    expect(detail["failedDispatches"]).toEqual(["ctx_42e6925ec35f"]);
+    expect(detail["cancelledTasks"]).toEqual([]);
+    // 停止を確定できないことを warning に出す
+    expect(JSON.stringify(detail)).toContain("ctx_42e6925ec35f");
+  });
+
   it("子タスクの worker-stop 失敗は warnings に記録し、cancel は進める(fullyStopped: false)", async () => {
     const family = {
       ok: true,

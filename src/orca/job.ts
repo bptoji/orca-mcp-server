@@ -1960,6 +1960,13 @@ async function dispatchIdsOf(client: OrcaClient, task: JsonObject, taskId: strin
 
 const TERMINAL_STATES: JobState[] = ["completed", "failed", "cancelled"];
 
+/**
+ * worker-stop / worker-abandon の receipt が「止まった」と言い切れない状態(実測 2026-10-14:
+ * `state: "stop_unknown"` / `processAction: "none"` で返し、dispatch は active のままだった)。
+ * これを成功として数えると fullyStopped: true の誤報になる。
+ */
+const UNCONFIRMED_FENCE_STATES = new Set(["stop_unknown", "abandon_unknown", "unknown", "failed", "error"]);
+
 export async function cancelTask(client: OrcaClient, input: CancelTaskInput): Promise<JsonObject> {
   const list = await client.taskList({ run: input.run, brief: false });
   const task = findTaskById(list, input.taskId);
@@ -2157,13 +2164,24 @@ export async function cancelTask(client: OrcaClient, input: CancelTaskInput): Pr
         const fencedResult = unwrapResult(
           mode === "abandon" ? await client.workerAbandon(dispatchId) : await client.workerStop(dispatchId),
         );
+        const resultState = pickString(fencedResult, ["state", "workerState", "status"]) ?? null;
         fenced.push({
           dispatchId,
           taskId: targetId,
           action: mode,
-          resultState: pickString(fencedResult, ["state", "workerState", "status"]) ?? null,
+          resultState,
           processAction: pickString(fencedResult, ["processAction", "process_action"]) ?? null,
         });
+        // 実測(review11 検証): worker-stop が stop_unknown / processAction: none を返すことがある。
+        // この場合 dispatch は active のままで、後続の task-update は task_not_startable で落ちる。
+        // 「fence できた」と数えると fullyStopped: true の誤報になるため、失敗として数える。
+        if (resultState === null || UNCONFIRMED_FENCE_STATES.has(resultState)) {
+          failedDispatches.push(dispatchId);
+          fenceFailures += 1;
+          warnings.push(
+            `dispatch ${dispatchId} の ${mode} は停止を確定していません(result: ${resultState ?? "状態無し"})。pane / worker を確認してください`,
+          );
+        }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         fenced.push({ dispatchId, taskId: targetId, action: mode, error: message });
@@ -2180,7 +2198,7 @@ export async function cancelTask(client: OrcaClient, input: CancelTaskInput): Pr
     if (targetId === input.taskId && failedDispatches.length > 0) {
       throw new JobError(
         "cancel_incomplete",
-        "Commander worker の停止に失敗したため、ジョブを完全にキャンセルできませんでした。対象 task は更新していません。",
+        "Commander worker の停止に失敗したため、ジョブを完全にキャンセルできませんでした。対象 task は更新していません。worker が stop_unknown を返した場合は dispatch が active のままなので、pane を確認して worker を止めてから再試行してください(停止を確定できないため task-update は task_not_startable で拒否されます)。",
         {
           taskId: targetId,
           runId,
@@ -2389,7 +2407,7 @@ export async function resolveGate(client: OrcaClient, input: ResolveGateInput): 
     if (gateTaskId === null || !related.has(gateTaskId)) {
       throw new JobError(
         "gate_task_mismatch",
-        `ゲート ${input.gateId} の task は ${gateTaskId ?? "無し"} で、指定した task ${input.taskId}(とその部分木)に属しません。何も変更していません。taskId の指定を外すか、poll の gates[].taskId を渡してください`,
+        `ゲート ${input.gateId} の task は ${gateTaskId ?? "無し"} で、指定した task ${input.taskId}(とその部分木)に属しません。何も変更していません。sub-run のゲートは呼び出し元 Run の task 部分木に属さないので taskId を外して解決してください(点検させたいなら poll の gates[].taskId を渡す)`,
         { gateId: input.gateId, gateTaskId, requestedTaskId: input.taskId, run: input.run },
       );
     }

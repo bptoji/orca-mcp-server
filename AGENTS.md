@@ -233,6 +233,12 @@ docs/
   `cancel_dispatch_scope_too_large` で断る — silent slice は「一部しか止めていないのに `cancelled: true`」の
   元凶(post-order 末尾の root 漏れ、4 件目の dispatch 生存)。終端状態の子は触らない。
   子タスクの確定失敗は `warnings` に留める。
+- **fence の receipt が停止を言い切れないときは失敗として数える**: `worker-stop` は
+  `state: "stop_unknown"` / `processAction: "none"` を返し得る(2026-10-14 実測)。成功として数えると
+  dispatch は active のままなのに `fullyStopped: true` の誤報になり、後続の `task-update` は
+  `task_not_startable`("cannot move to failed while supervised Dispatch … is active")で落ちる。
+  `UNCONFIRMED_FENCE_STATES`(`stop_unknown / abandon_unknown / unknown / failed / error`、状態無しを含む)は
+  fence 失敗として数え → `cancel_incomplete`(`fullyStopped: false`)。
 - **Commander(root)の fence 失敗は cancel 成功にしない**: 対象タスクの fence に 1 件でも失敗したら
   `cancel_incomplete`(`state: "partial"` / `cancelled: false` / `fullyStopped: false`)で**対象 task は更新しない**。
   「論理 cancel」と「実プロセス停止」のズレを放置しないため。成功応答には `fullyStopped`(fence 全成功か)を載せる。

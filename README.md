@@ -568,7 +568,7 @@ poll を打ち切る前に数回待ってください。**launcher 運用では�
 | poll の `childCount: 0` のまま Commander が進み、cancel でも worker が止まらない | Commander が自分の terminal で `run-create` を作り、仕事が **別の sub-run** に移った(`task-list` は Run スコープ) | 既定の sub-run 集約で拾います(`subRunsDiscovered` / `children[].sourceRunId`)。`orca_list_runs` で Run を直接見る。Commander Prompt に「既存 Run を使う / 深さ・circuit-break 回避の run-create は作らない / 作ったならマーカーと報告」を書き込んでいます |
 | `repo_not_found` | worktree の `name:` / worktree path を渡した | `id:<repoId>` か `path:<repo home>` を使う(repoId は `orca worktree current --json`) |
 | `outcome_required` / `dispatch_id_required` | `worker_done` に `outcome` / `dispatchId` が無い | 両方を付けて送り直す |
-| `cancel_incomplete`(`fullyStopped: false`) | Commander の worker を止められなかった | 対象 task は未更新。pane を確認して worker を止めてから cancel し直す |
+| `cancel_incomplete`(`fullyStopped: false`) | Commander の worker を止められなかった / worker-stop が `stop_unknown` を返して停止を確定できない | 対象 task は未更新。pane を確認して worker を止めてから cancel し直す(`stop_unknown` の間は dispatch が active なので `task-update` は `task_not_startable` で落ちます) |
 | `cancel_scope_too_large` / `cancel_dispatch_scope_too_large` | 子孫 12 件超 / 1 タスク 3 dispatch 超 | 何も変更していません。`cascade: false` か個別 cancel を選ぶ |
 | `cancel_ownership_unverified` | 所有が `verified` でない sub-run がある(来歴の pane key / incarnation が確認できない) | 何も変更していません。`detail.subRuns[]` の `ownership` / `verificationReasons` を確認し、`includeSubRuns: false` で本体だけ止めるか sub-run を Run 名指しで個別 cancel する |
 | cancel が `fullyStopped: false`(`cancelled: true`) | 停止後に読み直して worker が生存している / 探索を打ち切った | `residualWorkers[]` の task / dispatch を pane で確認。`subRunScanComplete` / `subRunsTruncated` / `subRunWorkerScanComplete` / `status: "scan_incomplete"` が未完のしるし |
@@ -577,7 +577,7 @@ poll を打ち切る前に数回待ってください。**launcher 運用では�
 | cancel した task が `failed` に見える | `cancelled` は MCP 側の論理状態 | 実体は `status: failed` + `result: "cancelled: <reason>"`。想定どおり |
 | `gate_not_found` | その Run に gate が無い | `run` を対象 Run に直す(`gate-list` は Run バインドスコープ)。sub-run のゲートは `gates[].runId` の Run で見る |
 | `gate_run_mismatch` | 渡した `run` とゲートの所属 Run が違う | 何も変更していません。poll の `gates[].runId` / `blockedReasons[].detail.runId` を `run` に渡す |
-| `gate_task_mismatch` | `taskId` を渡したのに、ゲートの task がその task(とその部分木)に属さない | 何も変更していません。`detail.gateTaskId` を確認し、そのゲートの所属 task を `taskId` に渡すか `taskId` を外す |
+| `gate_task_mismatch` | `taskId` を渡したのに、ゲートの task がその task(とその部分木)に属さない | 何も変更していません。`detail.gateTaskId` を確認し、そのゲートの所属 task を `taskId` に渡すか `taskId` を外す。**sub-run のゲートは呼び出し元 Run の task 部分木に属さないので `taskId` を渡さない**(実測: sub-run 内のゲート解決がこれで止まった) |
 | gate 解決が `run_required`("No Run is bound") | 呼び出し元ターミナルの Run バインドが空(pane の実体化で失われる) | `orca_resolve_gate` は `run` 名義で `run-use` して 1 回再試行するので通常は自動復旧します(実測で復旧)。外から `orca` を直接叩く場合は先に `orca orchestration run-use --id <ゲートの Run>` |
 | gate 解決が `runtime_error: Gate not found` | バインドが別 Run に動いた(同じターミナルで他のプロセスが `run-create` した 等) | 何も変更されていません。ゲートの Run を名指しで `run-use` した直後に**同じプロセスで**解決してください(バインドはターミナル共有の状態) |
 | `orca 起動失敗: orca CLI が見つかりませんでした` | PATH / `ORCA_BIN` | PATH を確認するか `ORCA_BIN` にバイナリパスを指定 |
