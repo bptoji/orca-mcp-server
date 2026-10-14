@@ -392,7 +392,8 @@ orca_cancel_task({ taskId: "task_abc123", reason: "方針変更" })   // cascade
   同一 dispatch は 1 回だけ叩きます(sub-run 集約と task ツリーが同じ dispatch を重ねて持つことがある)
 - **Commander の worker が止められなければ cancel 成功を返しません** — 対象タスクの fence に 1 件でも失敗したら
   `cancel_incomplete`(`state: "partial"`, `cancelled: false`, `fullyStopped: false`)で対象 task は更新しません。
-  成功応答の `fullyStopped` が「実プロセスを全部止められたか」です
+  成功応答の `fullyStopped` は「**全 dispatch が fence され、停止後に worker-list を読み直して生存 worker が
+  0 件**」という意味です(`mode: "abandon"` のときは下の注を参照)
 - **停止後に worker-list を読み直します**。まだ生きている worker は `residualWorkers[]` に載せ、
   その 1 件でも `fullyStopped: false` にします(論理 cancel と実プロセス停止のズレを正直に出す)。
   探索を打ち切った場合(`subRunScanComplete: false` / `subRunsTruncated` / `subRunWorkerScanComplete: false`)も
@@ -410,6 +411,13 @@ orca_cancel_task({ taskId: "task_abc123", reason: "方針変更" })   // cascade
   `cascade: false` / `includeSubRuns: false`
 - `mode: "abandon"` は `orca orchestration worker-abandon`(資源を残しプロセスにも filesystem にも触らない)に対応します。
   迷ったら `stop` を使ってください
+- **`mode: "abandon"` 時の `fullyStopped: true` は OS のエージェントプロセス終了を保証しません**。
+  `worker-abandon` は「プロセスが止まったと主張せずに worker を fence する」コマンドで、receipt は `abandoned` を返します。
+  MCP 側はそれを停止確定とみなすので、`fullyStopped: true` の意味は「**全 dispatch が fence され、worker-list の
+  読み直しで生存 worker が無かった**」までです。pane 上のプロセスが本当に消えたかは人間側で確認してください
+  (`stop` 版は `stop_unknown` を停止失敗として数えるので、`fullyStopped: true` は停止の確定を意味します)。
+  実測(2026-10-14): 同じ job に対して `stop` 版は `stop_unknown` → `cancel_incomplete`、`abandon` 版は
+  `cancelled: true` / `fullyStopped: true` / `residualWorkers: []`
 - worktree やターミナルの削除は行いません(後片付けは人間側の判断)
 
 ### 観測用 read-only

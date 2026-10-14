@@ -311,3 +311,12 @@ cancel は `fullyStopped: true` / `residualWorkers: []`)。Commander Prompt の�
 - **未実測**: 「taskId を渡さずに sub-run の gate を解決 → Commander が再開」は実機で踏めていない
   (`taskId` 無し解決自体は §8-2 の E2E #3 で実測済み。ユニットテストは両方向を固定)。
   sub-run を作らせる goal は Commander の判断に依存するため、再現性は低い
+
+## 12. review12 対応(2026-10-14、最終 Fix 判定前の 2 点)
+
+| # | 指摘 | 対応 |
+|---|---|---|
+| 1 | `cancel_scope_too_large` の detail に `subRunsDiscovered` が 2 回書かれている(ZIP 版) | 現 HEAD の `src/orca/job.ts` に重複は**存在しない**(出現は 4 件 = poll 応答 / `cancel_scope_too_large` detail / cancel 応答 / result 応答の各 1 件。`git log -S` で 286858f 以降ずっと 4 件)。隣接する重複キーも全走検で 0 件。TS は object 内の重複キーを 1117 で弾くので `npm run typecheck` の green が根拠になる |
+| 2 | `mode: "abandon"` 時の `fullyStopped` はプロセス終了を保証しない | README に「`fullyStopped` は全 dispatch が fence され、worker-list の読み直しで生存 worker が 0 件という意味」と、abandon 版は **OS のエージェントプロセス終了を保証しない**を明記。ツール説明と AGENTS.md にも同じ境界。将来分離するなら `allDispatchesFenced` / `processTerminationConfirmed`(review12 §2 の提案)が正しい |
+
+- 検証(review12 §3-4 の指示どおり Windows 実機): `npm run typecheck` / `npm test` / `npm run build` すべて PASS。

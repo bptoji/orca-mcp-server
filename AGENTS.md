@@ -241,6 +241,11 @@ docs/
   fence 失敗として数え → `cancel_incomplete`(`fullyStopped: false`)。
   **同じ job への `worker-abandon` は `abandoned` を返して完走した**(2026-10-14 実測: stop 版は
   `cancel_incomplete`、abandon 版は `cancelled: true` / `fullyStopped: true` / `residualWorkers: []`)。
+- **`fullyStopped` の意味を mode で混同しない**: `stop` 版は receipt の停止確定を要求するので
+  `fullyStopped: true` は「全 dispatch が fence され、worker-list の読み直しで生存 worker が無い」。
+  `abandon` 版は `worker-abandon` がプロセス停止を主張しないコマンドなので、同じ `fullyStopped: true`でも
+  **OS のエージェントプロセス終了は保証しない**(README に明記)。将来分けるなら
+  `allDispatchesFenced` / `processTerminationConfirmed` のような別軸のフィールドが正しい
 - **Commander(root)の fence 失敗は cancel 成功にしない**: 対象タスクの fence に 1 件でも失敗したら
   `cancel_incomplete`(`state: "partial"` / `cancelled: false` / `fullyStopped: false`)で**対象 task は更新しない**。
   「論理 cancel」と「実プロセス停止」のズレを放置しないため。成功応答には `fullyStopped`(fence 全成功か)を載せる。
