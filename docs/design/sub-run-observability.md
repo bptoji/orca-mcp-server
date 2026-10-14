@@ -220,6 +220,21 @@ review9 の「条件付き実装承認」(`orca-mcp_review9.txt` §2–§7)ど�
 - 残る未検証: sub-run を**作る** goal での verified 判定(検証 A が実データで確認済み)、
   `cancel_ownership_unverified` の実機発火(ユニットテストで固定)。
 
+### 8-2. review10 対応後の実機 E2E(2026-10-14、§9 の Fix 判定)
+
+review10 §135 の「既存 pending Gate を変更せずに観測する E2E」と「テスト専用 Gate を作成・解決する E2E」を走らせた。
+`gate_e3de81e4d0d4` は観測のみで一切解決していない。
+
+| 実行 | 内容 | 実測 |
+|---|---|---|
+| 観測 E2E(`scripts/observe-subrun.mjs`) | 既存ジョブ `task_15a13a6091a7 / run_52e3ee6a9aec` を read-only で観測(変更系コマンド 0 回) | 終了コード 0。`subRunWorkerScanComplete: true`(新フィールド)、`subRunScanPageCount 2` / `subRunScanRunCount 86`、`gates[0] = gate_8888c7461b08 resolved`、`warnings: []` |
+| E2E #3(`scripts/e2e.mjs`、gate 強制 goal) | submit → poll → gate 解決(taskId 付き)→ result → cancel | `task_c933ef99db6d / run_038410b6f8a1`。poll#22 で child `task_4a614dd1d2e3`、poll#23 で `phase: decision_gate` / `gate_fc673fa1c76a` を**呼び出し元 Run 内に**検出し `taskId` を渡して解決(`isError: false`)→ 子 completed → Commander completed(`provenance: worker_report`、`filesModified: ["README.md"]`)。`subRunScanComplete: true`(2 ページ / 88 件)、`subRunWorkerScanComplete: true` |
+| E2E #3 の cancel ジョブ | `task_bb5c7d4f1b24` を cascade cancel | `cancelled: true` / `fullyStopped: true` / `residualWorkers: []` / `cancelErrorCode: null`(=`cancel_discovery_incomplete` は発火せず)、cancel 後 `state: failed` |
+
+- 新フィールドは result 応答にも出ている(`subRunScanComplete` / `subRunWorkerScanComplete` / `subRunOwnershipComplete`)。
+- 未発火の実機検証: `cancel_discovery_incomplete` / `gate_task_mismatch`(いずれもユニットテストで固定済み)。
+  自 task への gate-create は `task_not_startable`(実測で 2 回目)なので、ゲートは子 task に作られる。
+
 ## 9. review10 対応(2026-10-14、cancel 周辺と gate の境界)
 
 review10 が「Fix 前に優先して修正すること」と挙げた 3 点への対応。テストは 262 → **268**。
