@@ -298,3 +298,16 @@ goal: Commander に `run-create` で sub-run を作らせ、その Run 内に ga
 - **`mode: "abandon"` は同じ job で完走した**(2026-10-14 実測): stop 版は `stop_unknown` → `cancel_incomplete`、
   abandon 版は `abandoned` → `cancelled: true` / `fullyStopped: true` / `residualWorkers: []`。
   `worker-abandon` はプロセス停止を主張しない fence なので、CLI が task 確定を拒否しない
+
+### 追試(2026-10-14、同じ goal で 2 本)
+
+`scripts/e2e.mjs` を taskId 条件付きに直して 2 本追試した(`task_89a981793dd4` / `task_06b94a58504d`)。
+**どちらも Commander は sub-run を作らなかった**(`subRunsDiscovered: 0` が全 poll、scan は 2 p / 91–94 runs で完走、
+cancel は `fullyStopped: true` / `residualWorkers: []`)。Commander Prompt の「新しい Run を作らない」指示が
+効いている形で、goal の指示より先に自 Run で仕事を進めている。
+
+- 実機で確定したものは上の表まで(sub-run 発見 / verified / sub-run gate 検出 / `gate_task_mismatch` 発火 /
+  sub-run 部分木の cancel)。
+- **未実測**: 「taskId を渡さずに sub-run の gate を解決 → Commander が再開」は実機で踏めていない
+  (`taskId` 無し解決自体は §8-2 の E2E #3 で実測済み。ユニットテストは両方向を固定)。
+  sub-run を作らせる goal は Commander の判断に依存するため、再現性は低い
