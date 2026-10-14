@@ -39,6 +39,7 @@ src/
     readiness.ts    # orca_readiness       … status + skills installed の前提チェック(インストールはしない)
     worktrees.ts    # orca_list_worktrees  … worktree list / orca_get_worktree … worktree show
     agents.ts       # orca_list_agents     … worktree ps の agents[] を平坦化
+    runs.ts         # orca_list_runs       … orchestration run-list / orca_get_run … run-show
     delegate.ts     # orca_delegate        … task-create + dispatch(未登録の足場)
     message.ts      # orca_message         … send / check / reply / inbox(未登録の足場)
 tests/              # vitest。子プロセスを実際に起動しない(モック runner / 偽 client)
@@ -51,6 +52,8 @@ scripts/
 docs/
   templates/acp-cordis.patch.example.yml  # dsh acp プロファイル用パッチのテンプレ(IP 等は置かない)
   design/streamable-http-transport.md     # HTTP トランスポートの設計案(実装前にレビューした案)
+  design/blocked-reasons.md               # poll の blockedReasons 設計(kind / role の意味)
+  design/sub-run-observability.md         # sub-run 観測・取消の実装計画(§7 に実測での是正記録)
 ```
 
 ## 公開 API の設計 — 非同期 Job API(最優先の設計約束)
@@ -62,8 +65,8 @@ docs/
 | ツール | 役割 | 内部コマンド |
 | --- | --- | --- |
 | `orca_delegate_task` | submit(**Commander 専用**) | run-create(未指定時) → task-create(固定 Commander 指示 + goal + repo + constraints) → worker-start `--worktree new-child --agent <commanderAgent>` |
-| `orca_get_task_status` | poll | task-list / dispatch-show / worker-list / gate-list(子タスクは task-list の `parent_id` から拾う) |
-| `orca_get_task_result` | result | task-list / dispatch-show / worker-read(`includeChildren: true` で子タスクの result と出力も集約) |
+| `orca_get_task_status` | poll | task-list / dispatch-show / worker-list / gate-list / **run-list**(sub-run 照合)(子タスクは task-list の `parent_id` + sub-run の root 照合で拾う) |
+| `orca_get_task_result` | result | task-list / dispatch-show / worker-read / **run-list**(`includeChildren: true` で子タスクの result と出力も集約) |
 | `orca_send_message` | intervene(非破壊) | `orchestration send`(必要なら run-use でバインド切替) |
 | `orca_resolve_gate` | intervene(非破壊 / Human-in-the-loop) | gate-list → `orchestration gate-resolve`(必要なら run-use でバインド切替) |
 | `orca_cancel_task` | intervene(破壊的 / 既定 cascade) | 子孫を**子から順**に worker-stop/abandon → `task-update --status failed` |
@@ -72,6 +75,8 @@ docs/
 | `orca_list_worktrees` | 観測 | `orca worktree list --json` |
 | `orca_get_worktree` | 観測 | `orca worktree show --json` |
 | `orca_list_agents` | 観測 | `orca worktree ps --json` |
+| `orca_list_runs` | 観測 | `orca orchestration run-list --json`(**run は poll / cancel の境界**。sub-run 発見の唯一の経路) |
+| `orca_get_run` | 観測 | `orca orchestration run-show --id --json` |
 | `orca_delegate` / `orca_message` | 未登録(足場) | 低レベルすぎるため公開しない |
 
 ### `orca_delegate_task` は Commander API だけ(意味を 2 通りにしない)
@@ -256,7 +261,7 @@ docs/
 
 ## 登録ツール(現状)
 
-`createServer()` は上記 11 個だけを登録する。`delegate.ts` / `message.ts` は足場として
+`createServer()` は上記 13 個だけを登録する。`delegate.ts` / `message.ts` は足場として
 ファイルを残す(テストは生かす)。登録を外したツールのファイルは削除しない。
 
 読み取り・poll 系の決まり:
@@ -267,7 +272,7 @@ docs/
 - 大きな欄は既定で省略する(`orca_list_agents` は `prompt` を 200 文字で切り詰め、
   `lastAssistantMessage` は `full: true` のときだけ)。
 - 1 ハンドラーで複数の orca コマンドを呼んでよいのは **poll / result の読み集め**
-  (`task-list` + `dispatch-show` + `worker-list` + `gate-list`)、submit の既定フロー、
+  (`task-list` + `dispatch-show` + `worker-list` + `gate-list` + `run-list`)、submit の既定フロー、
   観測の `orca_readiness`(`status` + `skills installed`)、
   そして **介入ツール(`orca_send_message` / `orca_resolve_gate` / `orca_cancel_task`)だけ**。
   poll / result / 観測ツールが変更系コマンド(task-update / worker-stop / gate-resolve / run-use)を呼ぶことは禁止。
@@ -287,6 +292,35 @@ orca CLI は **呼び出し元ターミナルを 1 つの Run にバインド**�
   読み取り(task-list / worker-list など)はロックしない。
 - `gate-create` / `gate-resolve` には `--run` が無い(Run スコープはバインドで決まる)。
   なので `orca_resolve_gate` の `run` は必須で、`gate-list --run <run>` で対象を読んでから叩く。
+
+### sub-run(Commander が別の Run を作ってしまう事故)の扱い
+
+`task-list` は **Run スコープ**で、Run には parent/child の系譜が無い。Commander が自分の terminal で
+`run-create` を叩くと、その sub-run 内の task / worker / gate は呼び出し元 Run の poll・cancel・result から
+**完全に invisible** になる(実測: `childCount: 0` のまま Commander が completed になり、cascade cancel が
+sub-run の worker を走りたままにした)。設計は `docs/design/sub-run-observability.md`、§7 に実測での是正記録がある。
+
+- **照合キーは `coordinator_handle` だけ**。sub-run の `coordinator_handle` はその Run を作った terminal の
+  handle なので、Commander の handle(タスクの `assignee_handle` + worker の `agentTerminalHandle`)と一致する。
+  `coordinator_handle` が `null` の Run は照合不能なので除外し、呼び出し元 Run 自身も除外する。
+  対象タスクの `created_at` より **24 分以上前**の Run は除外(terminal 再利用で古い Run が同じ handle を
+  持つリスク。task-list はローカル時刻、run-list は UTC なので厳密比較はしない)。照合は最大 `MAX_SUB_RUNS = 3`。
+- **sub-run 内の root は `parent_id` では特定できない**。実測では sub-run の子 6 件の `parent_id` は
+  sub-run 内で Commander が作った新しい root を指し、呼び出し元 Run の Commander task を指す行は無い。
+  root は「`parent_id` がその Run 内に無い + `created_by_terminal_handle` が Commander の handle」で選ぶ。
+- **探索を走らせる条件は worker / dispatch が 1 件以上あるとき**(queued で探索を走らせない)。
+  `childCount == 0` だけを条件にすると、親 Run にも sub-run にも子がある場合に sub-run が落ちる(実測)。
+- 集約は `includeSubRuns`(既定 true)で、poll / cancel / result すべてに効く。無効化は逃げ道として残す。
+  集約で出た子行には必ず `sourceRunId` を載せる(呼び出し元 Run の子と区別するため)。
+  `subRunsDiscovered` / `subRuns[]` を応答に載せ、**孫以降は `children` に出さない**(呼び出し元 Run の
+  direct children semantics を保つ)。
+- **cancel は sub-run の部分木を呼び出し元 Run の Commander より先に止める**(sub-run の worker が
+  Commander より生き残ると job が走り続ける)。上限 12 件は sub-run 込みの件数で判定する。
+  `task-update` は対象タスクの Run 名義で叩く(`runMutation` は既に Run 名義なので追加の引数で渡す)。
+- 集約の失敗(run-list 読めず / sub-run の task-list 読めず)は **poll / cancel / result を壊さず `warnings` だけ**添える。
+  観測でしかないので cancel では対象を絞る(変更系を sub-run に増やさない)。
+- `run-list` / `run-show` は読み取り専用なので poll / result ハンドラーで呼んでよい(AGENTS.md の読み集めの範囲)。
+  sub-run 集約で `run-use` 等の変更系を呼ぶことは禁止。
 
 ## HTTP トランスポートの決まり(2026-10-08 実装・実測)
 
@@ -391,6 +425,12 @@ orca CLI は **呼び出し元ターミナルを 1 つの Run にバインド**�
 
 - 大半のコマンドは起動中の Orca ランタイムを必要とします(未起動なら `orca open`)。
 - コマンド仕様の確認は `orca --help` / `orca orchestration <cmd> --help` / `orca agent-context --json`。
+- **`task-update` に `--spec` は無い**(実機 1.4.222 help 実測: `--id / --status / --result / --run /
+  --from / --retry-request` のみ)。なので delegate 後に spec へ値を焼き込む書き直しはできない。
+  `COMMANDER_PROMPT` へ注入できるのは `task-create` の前に決まる値(`{{runId}}`)だけ。
+- **`worker-start` には `--run` がある**(実測)。`gate-create` / `gate-resolve` には無い。
+  `run-list` は `--limit / --cursor`、`run-show` は `--id` を取る。`run-list` の `nextCursor` は
+  base64 の keyset(`{createdAt,id}`)で、help 文の「line cursor」とは実体が違う。
 - **公開サイトの掲載は CLI バージョンに追いつかないことがある。** `worker-abandon` は実機 1.4.220 の
   `orca orchestration --help` に存在する("Fence a worker without claiming its process stopped"、
   資源を残しプロセス/filesystem に触らない)が、公式ドキュメントの掲載有無は別軸。

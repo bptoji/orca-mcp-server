@@ -10,6 +10,7 @@ import {
   LIST_WORKTREES_TOOL_NAME,
 } from "../src/tools/worktrees.js";
 import { LIST_AGENTS_TOOL_NAME } from "../src/tools/agents.js";
+import { GET_RUN_TOOL_NAME, LIST_RUNS_TOOL_NAME, toRunRows } from "../src/tools/runs.js";
 import {
   DELEGATE_TASK_TOOL_NAME,
   TASK_RESULT_TOOL_NAME,
@@ -51,12 +52,14 @@ function createStubClient() {
     inbox: record("inbox"),
     runCreate: record("runCreate"),
     runCurrent: record("runCurrent"),
+    runList: record("runList"),
+    runShow: record("runShow"),
   };
   return { stub: stub as unknown as OrcaClient, calls };
 }
 
 describe("createServer", () => {
-  it("Job API 3 + 介入 3 + 観測 read-only 5 が登録されている", () => {
+  it("Job API 3 + 介入 3 + 観測 read-only 7 が登録されている", () => {
     const { stub } = createStubClient();
     const server = createServer(stub);
     expect(server).toBeInstanceOf(McpServer);
@@ -76,6 +79,8 @@ describe("createServer", () => {
         LIST_WORKTREES_TOOL_NAME,
         GET_WORKTREE_TOOL_NAME,
         LIST_AGENTS_TOOL_NAME,
+        LIST_RUNS_TOOL_NAME,
+        GET_RUN_TOOL_NAME,
       ].sort(),
     );
   });
@@ -352,8 +357,36 @@ describe("evaluateReadiness", () => {
   });
 });
 
-describe("runMessageAction", () => {
-  it("action ごとにクライアントメソッドへ転送する", async () => {
+describe("toRunRows — run 観測の正規化", () => {
+  it("run-list 応答を { runId, objective, coordinatorHandle, createdAt } に正規化する", () => {
+    const rows = toRunRows({
+      ok: true,
+      result: {
+        runs: [
+          { id: "run_8d1d20524d42", objective: "sub", coordinator_handle: "term_30746ff6", created_at: "2026-10-13T06:53:49Z" },
+          { id: "run_7652809742db", objective: "smoke", coordinator_handle: null, created_at: "2026-10-13T03:19:47Z" },
+        ],
+        nextCursor: "eyJpZCI6MX0",
+      },
+    });
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toMatchObject({
+      runId: "run_8d1d20524d42",
+      objective: "sub",
+      coordinatorHandle: "term_30746ff6",
+      createdAt: "2026-10-13T06:53:49Z",
+    });
+    expect(rows[1]?.["coordinatorHandle"]).toBeNull();
+  });
+
+  it("run-show 応答(result.run 単一)も 1 行に揃える", () => {
+    expect(toRunRows({ ok: true, result: { run: { id: "run_a", objective: "goal" } } })).toMatchObject([
+      { runId: "run_a", objective: "goal" },
+    ]);
+  });
+});
+
+describe("runMessageAction", () => {  it("action ごとにクライアントメソッドへ転送する", async () => {
     const { stub, calls } = createStubClient();
 
     await runMessageAction(stub, { action: "send", subject: "hi", body: "b" });

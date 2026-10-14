@@ -49,7 +49,7 @@ export function registerInterveneTools(server: McpServer, client: OrcaClient): v
     {
       title: "Orca Cancel Task",
       description:
-        "委譲ジョブをキャンセルする。内部では orca CLI の手順どおり、対象タスクの dispatch を worker-stop(または mode=abandon なら worker-abandon)で fence してから `task-update --status failed --result cancelled` を呼ぶ。既定 cascade: true で、Commander が分解した**子孫タスクとその worker を子から順**に止める(cascade の由来)。まず全対象の dispatch を読み切る preflight を行い、子孫 12 件超は cancel_scope_too_large、1 タスク 3 dispatch 超は cancel_dispatch_scope_too_large で**何も変更する前に**断る。Commander の fence に 1 件でも失敗すれば cancel_incomplete(state: partial / cancelled: false)で対象 task は更新しない。成功応答の fullyStopped は「全 worker を止められたか」を意味する。完了済み・キャンセル済みのタスクには何もしない(冪等)。worktree やターミナルの削除は行わない。",
+        "委譲ジョブをキャンセルする。内部では orca CLI の手順どおり、対象タスクの dispatch を worker-stop(または mode=abandon なら worker-abandon)で fence してから `task-update --status failed --result cancelled` を呼ぶ。既定 cascade: true で、Commander が分解した**子孫タスクとその worker を子から順**に止める(cascade の由来)。まず全対象の dispatch を読み切る preflight を行い、子孫 12 件超は cancel_scope_too_large、1 タスク 3 dispatch 超は cancel_dispatch_scope_too_large で**何も変更する前に**断る。Commander の fence に 1 件でも失敗すれば cancel_incomplete(state: partial / cancelled: false)で対象 task は更新しない。成功応答の fullyStopped は「全 worker を止められたか」を意味する。完了済み・キャンセル済みのタスクには何もしない(冪等)。worktree やターミナルの削除は行わない。**sub-run**: Commander が sub-run を作っている場合、task ツリーだけ追う cascade はその worker を走りたままにする(実測)。既定 includeSubRuns: true は run-list の coordinatorHandle 照合で sub-run の部分木を cascade 対象に組み込み、**呼び出し元 Run の Commander より先に**止める(拾った Run は subRunsDiscovered / subRuns に載せる)。上限 12 件は sub-run 込みの件数で判定する。",
       inputSchema: cancelTaskInputSchema,
       annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
     },
@@ -61,6 +61,7 @@ export function registerInterveneTools(server: McpServer, client: OrcaClient): v
           reason: input.reason,
           mode: input.mode,
           cascade: input.cascade,
+          includeSubRuns: input.includeSubRuns,
         }),
       ),
   );

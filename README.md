@@ -12,9 +12,10 @@
 | やりたいこと | ツール | 返ること |
 | --- | --- | --- |
 | 頼む | `orca_delegate_task` | `taskId`(即返る。仕事はここで始まる) |
-| 聞く | `orca_get_task_status` | 今の状態と、Commander が分解した子タスク・ワーカーの進捗 |
+| 聞く | `orca_get_task_status` | 今の状態と、Commander が分解した子タスク・ワーカーの進捗(**sub-run の中まで拾う**) |
 | 受け取る | `orca_get_task_result` | 完了後の成果(ワーカー個々の成果も集約できる) |
-| 途中で手を出す(任意) | `orca_send_message` / `orca_resolve_gate` / `orca_cancel_task` | 指示の追加 / ゲートの承認 / 停止 |
+| 途中で手を出す(任意) | `orca_send_message` / `orca_resolve_gate` / `orca_cancel_task` | 指示の追加 / ゲートの承認 / 停止(sub-run の worker まで止める) |
+| Run を見る(任意) | `orca_list_runs` / `orca_get_run` | Orca の Run 一覧と詳細(sub-run 発見の唯一の経路) |
 
 **1 回の MCP 呼び出しでワーカーの完了を待つことはありません。**(30 分ブロックし続ける設計にしていません)
 
@@ -183,12 +184,12 @@ providers 列挙にそのエージェント名は出ない)。`orca_delegate_tas
 
 1. `orca_readiness({ commanderAgent })` — 前提を確認する
 2. `orca_delegate_task({ spec, constraints })` — 頼む(委譲する) → `{ taskId, state: "running" }` を即受け取る
-3. `orca_get_task_status({ taskId })` — 数分おきに poll する(`children` に Commander が分解した子タスクと worker が出る)
+3. `orca_get_task_status({ taskId })` — 数分おきに poll する(`children` に Commander が分解した子タスクと worker が出る。Commander が sub-run を作っていた場合はその中身も `sourceRunId` 付きで拾う)
 4. 方針を変えたいときだけ `orca_send_message({ subject, body, run, taskId })`
 5. `state: "blocked"` / `phase: "decision_gate"` になったら `orca_resolve_gate({ gateId, resolution, run })`
-6. 取り消すときだけ `orca_cancel_task({ taskId, reason })`(既定で子孫 worker も子から順に止める)
+6. 取り消すときだけ `orca_cancel_task({ taskId, reason })`(既定で子孫 worker も子から順に止める。**sub-run の worker も Commander より先に止める**)
 7. `state: "completed"` になったら `orca_get_task_result({ taskId })`。ワーカー個々の成果まで欲しければ `includeChildren: true`
-8. 状況確認が欲しいときだけ `orca_list_worktrees` / `orca_get_worktree` / `orca_list_agents` / `orca_status`
+8. 状況確認が欲しいときだけ `orca_list_worktrees` / `orca_get_worktree` / `orca_list_agents` / `orca_list_runs` / `orca_status`
 
 **poll / result / 観測ツールは変更を一切行いません。** 変更系は `orca_delegate_task` と介入 3 個だけです。
 
@@ -196,7 +197,7 @@ providers 列挙にそのエージェント名は出ない)。`orca_delegate_tas
 
 ## ツールリファレンス
 
-公開 API は 11 個です。低レベルすぎる API(`orca_create_worktree` / `orca_start_agent` /
+公開 API は 13 個です。低レベルすぎる API(`orca_create_worktree` / `orca_start_agent` /
 `orca_send_terminal` など)は外部に出さず、内部実装に隠しています。
 
 ### Job API
@@ -204,8 +205,8 @@ providers 列挙にそのエージェント名は出ない)。`orca_delegate_tas
 | ツール | 役割 | 内部で呼ぶもの | 待つ? |
 | --- | --- | --- | --- |
 | `orca_delegate_task` | **submit**(Commander API) | run-create(未指定時) → task-create(固定 Commander 指示 + goal + repo + constraints) → supervised worker-start | 待たない |
-| `orca_get_task_status` | **poll** | task-list / dispatch-show / worker-list / gate-list | 待たない |
-| `orca_get_task_result` | **result** | task-list / dispatch-show / worker-read | 待たない |
+| `orca_get_task_status` | **poll** | task-list / dispatch-show / worker-list / gate-list / run-list(sub-run 照合) | 待たない |
+| `orca_get_task_result` | **result** | task-list / dispatch-show / worker-read / run-list(sub-run 照合) | 待たない |
 
 ```
 orca_delegate_task({
@@ -227,9 +228,13 @@ orca_get_task_status({ taskId: "task_abc123" })
       "children": [
         { "taskId": "task_backend", "title": "Implement backend", "state": "completed",
           "workers": [ { "agent": "claude", "status": "completed", "dispatchId": "disp_…" } ] },
-        { "taskId": "task_tests",   "title": "Write tests",       "state": "running",
+        { "taskId": "task_sub_root", "title": "Split docs work", "state": "blocked",
+          "sourceRunId": "run_8d1d20524d42",
           "workers": [ { "agent": "codex", "status": "running", "dispatchId": "disp_…" } ] }
       ],
+      "subRunsDiscovered": 1,
+      "subRuns": [ { "runId": "run_8d1d20524d42", "objective": "sub", "coordinatorHandle": "term_…",
+                     "taskCount": 7, "rootTaskIds": ["task_sub_root"] } ],
       "gates": [], "attentionRequired": false, "attentionNotes": [],
       "nextAction": "poll again with orca_get_task_status" }
 
@@ -265,11 +270,16 @@ orca_get_task_result({ taskId: "task_abc123", includeChildren: true })
 - `children` は Commander が分解した**直接の子タスク**(`parent_id` 一致)とその worker。
   `childCount` は実件数、`returnedChildCount` が返した件数(上限 20)、`childrenTruncated` で打ち切りを伝えます。
   **孫以降は出ません**(その子の poll / result で見る)。
+- **sub-run も拾います**(既定 `includeSubRuns: true`)。Commander が自分の terminal で `run-create` を作ると、
+  その Run の task / worker / gate は呼び出し元 Run の `task-list` に出てきません(`task-list` は Run スコープ)。
+  poll は `run-list` の `coordinator_handle` を照合して sub-run を特定し、その中の**root タスク**を
+  `children` に合算します(行に `sourceRunId` が付くので呼び出し元 Run の子と区別できます)。
+  拾った Run は `subRunsDiscovered` / `subRuns[]` に出します。`includeSubRuns: false` で止められます
 - `attentionRequired` / `attentionNotes` は worker 側の「人間側の対応が必要そう」の合図。
   ゲートが pending でないのに progress が止まる典型は、エージェントのターミナルに出る**ツール承認プロンプト**です
   (`attentionNotes` の `terminal(read) で確認` をたどってください)。
 - `orca_get_task_result` は既定で Commander だけ読みます。`includeChildren: true` で直接の子タスクの
-  `result` と出力も集約します(子 10 件・worker-read 8 件まで)。
+  `result` と出力も集約します(子 10 件・worker-read 8 件まで)。sub-run の子も `sourceRunId` 付きで集約されます。
 - 大きな欄は既定で切り詰めます(`specPreview` 200 字、worker 出力 4000 字、`orca_list_agents` の `prompt` 200 字)。
 
 **`repo` の渡し方** — `repo` は **repo セレクタ**です。`id:<repoId>` と `path:<repo home>` は解決できますが、
@@ -311,8 +321,9 @@ orca_resolve_gate({ gateId: "gate_333059a5ece6", resolution: "approve", run: "ru
 
 orca_cancel_task({ taskId: "task_abc123", reason: "方針変更" })   // cascade 既定 true
   → { "taskId": "task_abc123", "state": "cancelled", "cancelled": true, "fullyStopped": true,
-      "cascade": true, "taskCount": 3, "mode": "stop",
-      "tasks": [ { "taskId": "task_deep", "state": "cancelled", "fenced": [ … ] }, … ],
+      "cascade": true, "taskCount": 3, "mode": "stop", "subRunsDiscovered": 1,
+      "subRuns": [ { "runId": "run_8d1d20524d42", "objective": "sub", "taskCount": 7 } ],
+      "tasks": [ { "taskId": "task_deep", "state": "cancelled", "runId": "run_…", "fenced": [ … ] }, … ],
       "workers": [ { "taskId": "task_deep", "dispatchId": "ctx_…", "action": "stop", "resultState": "stopped" }, … ],
       "warnings": [] }
 ```
@@ -329,6 +340,11 @@ orca_cancel_task({ taskId: "task_abc123", reason: "方針変更" })   // cascade
   **ゲートを解決する API がないとジョブは途中で詰まります**(blocked / decision_gate の `nextAction` が指します)
 - **cancel はジョブ単位**(既定 `cascade: true`)。Commander が分解した**子孫タスクとその worker を子から順**に
   止めます(親だけ止めて子 Worker を走らせたままにしない)。`cascade: false` なら対象だけ
+- **sub-run も止めます**。Commander が自分の terminal で `run-create` を作ると、その Run の中の task / worker は
+  呼び出し元 Run の task ツリーから見えません(実測で cascade が sub-run の worker を走りたままにした)。
+  既定 `includeSubRuns: true` は `run-list` の `coordinator_handle` 照合で sub-run の部分木を拾い、
+  **呼び出し元 Run の Commander より先に**止めます(拾った Run は `subRunsDiscovered` / `subRuns` に出す)。
+  上限 12 件は sub-run 込みの件数です。sub-run を対象にしたくないときだけ `includeSubRuns: false`
 - cancel は 2 段階(preflight → mutation)。子孫が 12 件を超える場合は `cancel_scope_too_large`、
   1 タスクの dispatch が 3 件を超える場合は `cancel_dispatch_scope_too_large` で、**何も変更する前に**断ります
   (`detail` に `taskCount` / `dispatchIds` が出るので `cascade: false` か個別 cancel を選べます)
@@ -348,6 +364,8 @@ orca_cancel_task({ taskId: "task_abc123", reason: "方針変更" })   // cascade
 | `orca_list_worktrees` | ワークツリー一覧(repo / limit) | `orca worktree list --json` |
 | `orca_get_worktree` | 1 件のワークツリー詳細 | `orca worktree show --json` |
 | `orca_list_agents` | worktree 横断のエージェント一覧 | `orca worktree ps --json` |
+| `orca_list_runs` | Run 一覧(limit / cursor)。**run は poll / cancel の境界**なので sub-run 発見に使う | `orca orchestration run-list --json` |
+| `orca_get_run` | 1 件の Run 詳細(runId) | `orca orchestration run-show --id --json` |
 
 `orca_delegate` と `orca_message` は内部実装として保持しており、MCP ツールとしては公開していません。
 送信は `orca_send_message` を使ってください。
@@ -489,6 +507,7 @@ poll を打ち切る前に数回待ってください。**launcher 運用では�
 | `blocked` / `phase: "decision_gate"` | 承認ゲート待ち | `blockedReasons` の `question` / `options` を読み、`orca_resolve_gate({ gateId, resolution, run })` で進める |
 | `blocked` / `phase: "blocked"`(`gates` が空) | ゲート以外の停止(Commander の blocked 報告、承認プロンプトなど) | `blockedReasons` の `kind` を確認(`task_report` は `orca_send_message` / cancel、`agent_prompt` は pane で人間が答える) |
 | `consumer_fenced` | 呼び出し元の Run バインドが対象と違う | 介入ツールは自動で `run-use` して 1 回だけ再試行します。worker 側なら自分の terminal を 1 回バインド |
+| poll の `childCount: 0` のまま Commander が進み、cancel でも worker が止まらない | Commander が自分の terminal で `run-create` を作り、仕事が **別の sub-run** に移った(`task-list` は Run スコープ) | 既定の sub-run 集約で拾います(`subRunsDiscovered` / `children[].sourceRunId`)。`orca_list_runs` で Run を直接見る。Commander には「sub-worker 用に run-create を作らない」を指示に書き込む |
 | `repo_not_found` | worktree の `name:` / worktree path を渡した | `id:<repoId>` か `path:<repo home>` を使う(repoId は `orca worktree current --json`) |
 | `outcome_required` / `dispatch_id_required` | `worker_done` に `outcome` / `dispatchId` が無い | 両方を付けて送り直す |
 | `cancel_incomplete`(`fullyStopped: false`) | Commander の worker を止められなかった | 対象 task は未更新。pane を確認して worker を止めてから cancel し直す |
@@ -544,6 +563,7 @@ orca-mcp/
 │     ├─ readiness.ts   # orca_readiness(runtime / orchestration / skill の前提チェック)
 │     ├─ worktrees.ts   # orca_list_worktrees / orca_get_worktree
 │     ├─ agents.ts      # orca_list_agents(worktree ps の平坦化)
+│     ├─ runs.ts        # orca_list_runs / orca_get_run(run-list / run-show の正規化)
 │     ├─ delegate.ts    # orca_delegate(内部実装)
 │     └─ message.ts     # orca_message(内部実装)
 ├─ scripts/
@@ -554,7 +574,9 @@ orca-mcp/
 │  └─ dsh-headless-worker.mjs # 注入 → dsh --profile headless の argv に載せ直すブリッジ(旧経路)
 ├─ docs/
 │  ├─ templates/acp-cordis.patch.example.yml   # ACP 用ローカル LLM ルーティングのテンプレ
-│  └─ design/streamable-http-transport.md      # HTTP トランスポートの設計案
+│  ├─ design/streamable-http-transport.md      # HTTP トランスポートの設計案
+│  ├─ design/blocked-reasons.md                # poll の blockedReasons の設計
+│  └─ design/sub-run-observability.md           # sub-run の観測・取消(§7 に実測での是正記録)
 ├─ tests/               # orca ランタイム不要の単体テスト(job.test.ts は偽 client)
 ├─ AGENTS.md            # エージェント向け開発規約
 ├─ package.json

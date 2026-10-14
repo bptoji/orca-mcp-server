@@ -586,7 +586,7 @@ export function findChildTasks(payload: JsonObject, taskId: string): JsonObject[
 }
 
 /** 子タスクの応答を 1 行に正規化する(テスト対象)。 */
-export function toChildRow(child: JsonObject, workers: JsonObject[]): JsonObject {
+export function toChildRow(child: JsonObject, workers: JsonObject[], sourceRunId?: string | null): JsonObject {
   const rawStatus = pickString(child, ["status", "state", "taskStatus"]);
   return {
     taskId: pickString(child, ID_KEYS) ?? null,
@@ -597,6 +597,270 @@ export function toChildRow(child: JsonObject, workers: JsonObject[]): JsonObject
     resultPreview: preview(child["result"], 200),
     createdAt: child["created_at"] ?? child["createdAt"] ?? null,
     completedAt: child["completed_at"] ?? child["completedAt"] ?? null,
+    // Commander が sub-run を作った場合、その子タスクは呼び出し元 Run には現れない。
+    // どの Run から拾ったかを正直に載せる(呼び出し側が poll / cancel で使える)。
+    sourceRunId: sourceRunId ?? null,
+  };
+}
+
+/* ---------------------------------------------------------------------------
+ * sub-run 観測(Commander が `run-create` で子 Run を作った場合の復元)
+ *
+ * 実測(2026-10-13 / orca 1.4.222):
+ *  - Commander は自分の terminal から `run-create` を実行し、sub-run を作る。
+ *    その `coordinator_handle` は **Commander の terminal handle そのもの**。
+ *  - sub-run 内のタスクは `parent_id` が **sub-run 内で作った新しい root** を指す
+ *    (呼び出し元 Run の Commander task を指さない)。だから `parent == taskId` だけ
+ *    では 1 件も見つからない → 照合は handle 経由が正しい。
+ *  - task-list は run スコープなので、呼び出し元 Run の poll / cancel は sub-run を丸ごと見失う。
+ * --------------------------------------------------------------------------- */
+
+/** 1 poll / cancel で照合する sub-run の上限(CLI 呼び出し数の抑制)。 */
+export const MAX_SUB_RUNS = 3;
+/** run-list から読む行数(応答は keyset cursor 付きの作成順)。 */
+const SUB_RUN_SCAN_LIMIT = 50;
+/** 対象タスクよりこれ以前に作られた run は除外する(TZ 表記ゆれ吸収用の安全策)。 */
+const SUB_RUN_CREATED_SKEW_MS = 24 * 60 * 60 * 1000;
+
+const RUN_ID_KEYS = ["runId", "run_id", "id"] as const;
+const COORDINATOR_HANDLE_KEYS = ["coordinator_handle", "coordinatorHandle"] as const;
+const CREATED_BY_HANDLE_KEYS = ["created_by_terminal_handle", "createdByTerminalHandle"] as const;
+
+/** run-list / run-show 応答から run 配列(単一オブジェクトも含む)を取り出す。 */
+export function extractRuns(payload: JsonObject): JsonObject[] {
+  const source = unwrapResult(payload);
+  const raw = source["runs"] ?? source["items"];
+  if (Array.isArray(raw)) {
+    return raw.filter(isJsonObject);
+  }
+  const single = source["run"];
+  return isJsonObject(single) ? [single] : [];
+}
+
+/** run 行を Job API 用の 1 行に正規化する(テスト対象)。 */
+export function toRunRow(run: JsonObject): JsonObject {
+  return {
+    runId: pickString(run, RUN_ID_KEYS) ?? null,
+    objective: pickString(run, ["objective"]) ?? null,
+    coordinatorHandle: pickString(run, COORDINATOR_HANDLE_KEYS) ?? null,
+    createdAt: run["created_at"] ?? run["createdAt"] ?? null,
+    updatedAt: run["updated_at"] ?? run["updatedAt"] ?? null,
+  };
+}
+
+function toEpoch(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value !== "string" || value.length === 0) {
+    return undefined;
+  }
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+/**
+ * run-list から Commander 配下の sub-run を拾う(テスト対象)。
+ *
+ * 照合キーは `coordinator_handle`(= その Run を作成した coordinator の terminal handle)。
+ *  - handle 無しは照合不能なので落とす(実測で 5 件中 2 件が null)。
+ *  - 呼び出し元 Run 自身は除外する。
+ *  - handle が Commander のもの(対象タスクの assignee / worker terminal)と一致しないものは除外。
+ *  - 対象タスクより 24 分以上前に作られた run は除外する(terminal 再利用で古い Run が
+ *    同じ handle を持つ事故を避ける。task-list の created_at はローカル表記、run-list は
+ *    UTC 表記なので厳密比較はしない)。
+ */
+export function matchSubRuns(
+  runs: JsonObject[],
+  input: { callerRunId: string | null; handles: readonly string[]; taskCreatedAt?: unknown },
+): JsonObject[] {
+  const handles = new Set(input.handles.filter((handle) => typeof handle === "string" && handle.length > 0));
+  if (handles.size === 0) {
+    return [];
+  }
+  const taskEpoch = toEpoch(input.taskCreatedAt);
+  const floor = taskEpoch === undefined ? undefined : taskEpoch - SUB_RUN_CREATED_SKEW_MS;
+
+  const matched: JsonObject[] = [];
+  for (const run of runs) {
+    const row = toRunRow(run);
+    const runId = row["runId"];
+    const handle = row["coordinatorHandle"];
+    if (typeof runId !== "string" || typeof handle !== "string") {
+      continue; // handle 無しは照合不能
+    }
+    if (input.callerRunId !== null && runId === input.callerRunId) {
+      continue; // 呼び出し元 Run 自身
+    }
+    if (!handles.has(handle)) {
+      continue;
+    }
+    const created = toEpoch(row["createdAt"]);
+    if (created !== undefined && floor !== undefined && created < floor) {
+      continue;
+    }
+    matched.push(row);
+  }
+  return matched.slice(0, MAX_SUB_RUNS);
+}
+
+/**
+ * sub-run の task 配列から、Commander 配下の **root**(sub-run 内で親を持たない行)を拾う(テスト対象)。
+ *
+ * 実測: Commander は sub-run 内で新しい root task を作り、子 6 件はその root を指す。
+ * 呼び出し元 Run の Commander task を指す `parent_id` は使われないので、
+ * 「sub-run 内で親が居ない + Commander の handle が作った」で root を特定する。
+ */
+export function selectSubRunRoots(tasks: JsonObject[], handles: readonly string[]): JsonObject[] {
+  const handleSet = new Set(handles.filter((handle) => typeof handle === "string" && handle.length > 0));
+  const ids = new Set(
+    tasks.map((task) => pickString(task, ID_KEYS)).filter((id): id is string => id !== undefined),
+  );
+  return tasks.filter((task) => {
+    if (pickString(task, ID_KEYS) === undefined) {
+      return false;
+    }
+    const parent = pickString(task, ["parent_id", "parentId"]);
+    if (parent !== undefined && ids.has(parent)) {
+      return false; // sub-run 内に親がいる = root ではない(部分木側で拾える)
+    }
+    const createdBy = pickString(task, CREATED_BY_HANDLE_KEYS);
+    return createdBy !== undefined && handleSet.has(createdBy);
+  });
+}
+
+interface SubRunCapture {
+  /** 監査用に、何を sub-run として見つけたか(run 行)。 */
+  subRuns: JsonObject[];
+  /** 呼び出し元タスクの direct children として見せる行(sub-run の root)。 */
+  childTasks: JsonObject[];
+  /** cancel cascade 用の部分木(sub-run root + その子孫、post-order)。runId 付き。 */
+  subtreeTasks: Array<JsonObject & { __runId?: string }>;
+  /** sub-run 内の worker 行(部分木に紐づくものだけ)。 */
+  workers: JsonObject[];
+  /** sub-run 内の gate(部分木に紐づくものだけ)。 */
+  gates: JsonObject[];
+  warnings: string[];
+}
+
+const EMPTY_CAPTURE: SubRunCapture = {
+  subRuns: [],
+  childTasks: [],
+  subtreeTasks: [],
+  workers: [],
+  gates: [],
+  warnings: [],
+};
+
+/**
+ * Commander が自作した sub-run を読み集める(**読み取りだけ**)。
+ *
+ * 失敗しても poll / cancel / result は壊さない(run-list が読めなければ warning だけ添える)。
+ * 呼び出し元 Run には現れない配下を拾うのが目的なので、`sourceRunId` を全結果に載せる。
+ */
+async function captureSubRuns(
+  client: OrcaClient,
+  input: {
+    callerRunId: string | null;
+    handles: readonly string[];
+    taskCreatedAt?: unknown;
+    enabled: boolean;
+  },
+): Promise<SubRunCapture> {
+  if (!input.enabled || typeof client.runList !== "function" || input.handles.length === 0) {
+    return EMPTY_CAPTURE;
+  }
+
+  const warnings: string[] = [];
+  let matched: JsonObject[];
+  try {
+    const listed = unwrapResult(
+      await client.runList({ limit: SUB_RUN_SCAN_LIMIT }),
+    );
+    matched = matchSubRuns(extractRuns(listed), {
+      callerRunId: input.callerRunId,
+      handles: input.handles,
+      taskCreatedAt: input.taskCreatedAt,
+    });
+  } catch (error) {
+    return { ...EMPTY_CAPTURE, warnings: [`sub-run 探索の run-list に失敗: ${failureLine(error)}`] };
+  }
+  if (matched.length === 0) {
+    return { ...EMPTY_CAPTURE, warnings };
+  }
+
+  const capture: SubRunCapture = { ...EMPTY_CAPTURE, subRuns: [], childTasks: [], subtreeTasks: [], workers: [], gates: [], warnings };
+  for (const run of matched) {
+    const runId = run["runId"] as string;
+    try {
+      const list = unwrapResult(await client.taskList({ run: runId, brief: false }));
+      const tasks = extractTasks(list);
+      const roots = selectSubRunRoots(tasks, input.handles);
+      if (roots.length === 0) {
+        continue;
+      }
+      capture.subRuns.push({ ...run, taskCount: tasks.length, rootTaskIds: roots.map((row) => pickString(row, ID_KEYS) ?? null) });
+
+      const subtreeIds = new Set<string>();
+      for (const root of roots) {
+        const rootId = pickString(root, ID_KEYS) as string;
+        capture.childTasks.push({ ...root, __runId: runId });
+        for (const row of collectDescendants({ tasks }, rootId)) {
+          const id = pickString(row, ID_KEYS);
+          if (id === undefined || subtreeIds.has(id)) {
+            continue;
+          }
+          subtreeIds.add(id);
+          capture.subtreeTasks.push({ ...row, __runId: runId });
+        }
+      }
+
+      const workersPayload = unwrapResult(await client.workerList({ run: runId, limit: 100 }));
+      for (const row of extractWorkers(workersPayload).map(toWorkerRow)) {
+        const taskId = row["taskId"];
+        if (typeof taskId === "string" && subtreeIds.has(taskId)) {
+          capture.workers.push(row);
+        }
+      }
+
+      const gatesPayload = unwrapResult(await client.gateList({ run: runId }));
+      for (const gate of extractGates(gatesPayload)) {
+        const gateTask = pickString(gate, ["task_id", "taskId"]);
+        if (gateTask === undefined || subtreeIds.has(gateTask)) {
+          capture.gates.push(gate);
+        }
+      }
+    } catch (error) {
+      warnings.push(`sub-run ${runId} の読み集めに失敗: ${failureLine(error)}`);
+    }
+  }
+  return capture;
+}
+
+/** poll / cancel で「Commander の terminal handle」の候補を揃える(sub-run 照合キー)。 */
+function commanderHandles(task: JsonObject, workers: JsonObject[]): string[] {
+  const handles = new Set<string>();
+  const assignee = pickString(task, ["assignee_handle", "assigneeHandle"]);
+  if (assignee !== undefined) {
+    handles.add(assignee);
+  }
+  for (const worker of workers) {
+    const handle = worker["terminalHandle"];
+    if (typeof handle === "string" && handle.length > 0) {
+      handles.add(handle);
+    }
+  }
+  return [...handles];
+}
+
+/** gate 行を Job API 用の 1 行に正規化する(poll / sub-run 共通)。 */
+function toGateRow(gate: JsonObject): JsonObject {
+  return {
+    id: pickString(gate, ["gateId", "gate_id", "id"]) ?? null,
+    taskId: pickString(gate, ["task_id", "taskId"]) ?? null,
+    status: pickString(gate, ["status", "state"]) ?? null,
+    question: preview(gate["question"], MAX_REASON_TEXT),
+    options: gate["options"] ?? null,
   };
 }
 
@@ -674,10 +938,26 @@ human approval — a worker that needs approval escalates to you, and you create
 the gate on your own task and resolve it when the human answers.
 
 Run ownership:
-You are already dispatched inside a Run and a task. Do not create new Runs.
-Create child tasks with --parent set to your task, inside your own Run, and
-delegate them to supervised workers. A new Run fragments the job the caller is
-polling and cancels.
+The caller polls, collects results and cancels through exactly ONE Run: {{runId}}.
+Your task lives inside it — its id is in your dispatch preamble, and you can
+confirm it with: orca orchestration task-list --run {{runId}} --json
+
+Create every child task inside that Run, with --parent set to your own task id:
+
+  orca orchestration task-create --run {{runId}} --parent <your task id> --spec ...
+  orca orchestration worker-start --run {{runId}} --task <child task id> --agent <worker agent>
+
+Never run run-create for sub-workers. A second Run splits the job your caller is
+polling: the tasks, workers and gates inside it stay invisible to the caller's
+orca_get_task_status / orca_cancel_task, so nothing there can stop them.
+If a run-scoped command reports "No Run is bound. Use orchestration run-create or
+run-use first.", that means run-use — NEVER run-create:
+
+  orca orchestration run-use --id {{runId}} --json
+
+If binding keeps failing, do not improvise: finish what you can inside {{runId}}
+and report the blocker. If you ever did create another Run, list its exact id in
+your final report so the caller can find and cancel it.
 
 Completion boundary:
 Before declaring success, verify that every delegated child task has reached a
@@ -692,21 +972,55 @@ change, the constraints, the ownership boundary, and the observable acceptance.`
 
 const DEFAULT_CONSTRAINTS = ["Preserve existing APIs and project conventions."];
 
-function commanderSpec(input: DelegateTaskInput): string {
+/** 未注入のプレースホルダ検出用({{runId}} 等は複数箇所に出るので global で置換する)。 */
+const PLACEHOLDER_PATTERN = /\{\{[A-Za-z][A-Za-z0-9_]*\}\}/g;
+
+/**
+ * Commander 用の spec を組み立てる(テスト対象)。
+ *
+ * `{{runId}}` は task-create の**前**から分かっている値なので注入できる。
+ * `{{taskId}}` は task-create の後にしか決まらず、`task-update` に `--spec` が無い
+ * (実機 help 実測: --id / --status / --result / --run / --from / --retry-request のみ)
+ * ため注入しない — Commander 自身に dispatch preamble と task-list で確認させる。
+ * 未注入のプレースホルダは `leaked` で返す(spec に文字列を残さない)。
+ */
+export function commanderSpec(
+  input: DelegateTaskInput,
+  runId: string,
+): { spec: string; leaked: string[] } {
   const constraints =
     input.constraints !== undefined && input.constraints.length > 0
       ? input.constraints.map((line) => `- ${line}`).join("\n")
       : DEFAULT_CONSTRAINTS.map((line) => `- ${line}`).join("\n");
 
-  return COMMANDER_PROMPT
-    .replace("{{goal}}", input.spec)
-    .replace("{{repo}}", input.repo ?? "the current repository")
-    .replace("{{constraints}}", constraints);
+  let spec = COMMANDER_PROMPT.replace(PLACEHOLDER_PATTERN, (token) => {
+    switch (token) {
+      case "{{goal}}":
+        return input.spec;
+      case "{{repo}}":
+        return input.repo ?? "the current repository";
+      case "{{constraints}}":
+        return constraints;
+      case "{{runId}}":
+        return runId;
+      default:
+        return token;
+    }
+  });
+
+  const leaked = [...new Set(spec.match(PLACEHOLDER_PATTERN) ?? [])];
+  if (leaked.length > 0) {
+    // プレースホルダを Commander の目に晒すと自行解釈を招く(今回の不具合の根)。
+    spec = spec.replace(PLACEHOLDER_PATTERN, "(unavailable)");
+  }
+  return { spec, leaked };
 }
 
 export interface TaskStatusInput {
   taskId: string;
   run?: string;
+  /** 既定 true: Commander が自作した sub-run の配下も children / gates に集約する。 */
+  includeSubRuns?: boolean;
 }
 
 export interface TaskResultInput {
@@ -715,6 +1029,8 @@ export interface TaskResultInput {
   outputLimit?: number;
   /** 既定 false: Commander だけ読む。true にすると子タスクの成果と出力も集約する。 */
   includeChildren?: boolean;
+  /** 既定 true: Commander が自作した sub-run の子タスクも集約対象に含める。 */
+  includeSubRuns?: boolean;
 }
 
 function runIdOf(payload: JsonObject): string | undefined {
@@ -756,9 +1072,15 @@ export async function delegateTask(
   }
 
   // 2) task-create(ここが成功すれば Job は成立する)。Commander 経路では spec を固定プロンプトで包む。
+  const built = commanderSpec(input, runId);
+  if (built.leaked.length > 0) {
+    warnings.push(
+      `Commander spec に未注入のプレースホルダがありました: ${built.leaked.join(", ")} — '(unavailable)' に置き換えました`,
+    );
+  }
   const task = await runMutation(client, runId, () =>
     client.taskCreate({
-      spec: commanderSpec(input),
+      spec: built.spec,
       title: input.title,
       deps: input.deps,
       parent: input.parent,
@@ -902,11 +1224,24 @@ export async function getTaskStatus(client: OrcaClient, input: TaskStatusInput):
       (typeof worker["dispatchId"] === "string" && dispatchIds.has(worker["dispatchId"] as string)),
   );
 
-  const allChildTasks = findChildTasks(list, input.taskId);
+  // Commander が `run-create` で sub-run を作ると、その配下は呼び出し元 Run の
+  // task-list に 1 件も現れない(実測: childCount: 0)。handle 照合で拾って合算する。
+  const handles = commanderHandles(task, workers);
+  const subCapture = await captureSubRuns(client, {
+    callerRunId: runId,
+    handles,
+    taskCreatedAt: task["created_at"] ?? task["createdAt"],
+    enabled: input.includeSubRuns !== false && (dispatchIds.size > 0 || workers.length > 0),
+  });
+
+  const allChildTasks = [...findChildTasks(list, input.taskId), ...subCapture.childTasks];
   const childTasks = allChildTasks.slice(0, MAX_CHILDREN);
-  const children = childTasks.map((child) =>
-    toChildRow(child, allWorkers.filter((worker) => worker["taskId"] === pickString(child, ID_KEYS))),
-  );
+  const children = childTasks.map((child) => {
+    const childId = pickString(child, ID_KEYS);
+    const childRunId = typeof child["__runId"] === "string" ? (child["__runId"] as string) : null;
+    const pool = childRunId !== null ? subCapture.workers : allWorkers;
+    return toChildRow(child, pool.filter((worker) => worker["taskId"] === childId), childRunId);
+  });
   const childWorkers = children.flatMap((child) => child["workers"] as JsonObject[]);
 
   // --task で絞らず Run 全体を読み、対象タスクと直接の子タスクのゲートだけを残す
@@ -919,18 +1254,13 @@ export async function getTaskStatus(client: OrcaClient, input: TaskStatusInput):
     }
   }
   const gatesPayload = await client.gateList({ run: input.run ?? runId ?? undefined });
-  const gates = extractGates(gatesPayload)
-    .filter((gate) => {
+  const gates = [
+    ...extractGates(gatesPayload).filter((gate) => {
       const gateTask = pickString(gate, ["task_id", "taskId"]);
       return gateTask === undefined || scopeIds.has(gateTask);
-    })
-    .map((gate) => ({
-      id: pickString(gate, ["gateId", "gate_id", "id"]) ?? null,
-      taskId: pickString(gate, ["task_id", "taskId"]) ?? null,
-      status: pickString(gate, ["status", "state"]) ?? null,
-      question: preview(gate["question"], MAX_REASON_TEXT),
-      options: gate["options"] ?? null,
-    }));
+    }),
+    ...subCapture.gates,
+  ].map(toGateRow);
 
   await enrichAgentNames(client, [...workers, ...childWorkers]);
 
@@ -945,7 +1275,7 @@ export async function getTaskStatus(client: OrcaClient, input: TaskStatusInput):
 
   const phase = estimatePhase(state, [...workers, ...childWorkers], gates);
 
-  const warnings: string[] = [];
+  const warnings: string[] = [...subCapture.warnings];
   const blockedReasons = await collectBlockedReasons(
     client,
     { state, tasks: [task, ...childTasks], gates, workers: [...workers, ...childWorkers], rootTaskId: input.taskId },
@@ -979,6 +1309,8 @@ export async function getTaskStatus(client: OrcaClient, input: TaskStatusInput):
     returnedChildCount: children.length,
     childrenTruncated: allChildTasks.length > children.length,
     children,
+    subRuns: subCapture.subRuns,
+    subRunsDiscovered: subCapture.subRuns.length,
     gates,
     blockedReasons,
     warnings,
@@ -1127,6 +1459,8 @@ export interface CancelTaskInput {
   mode?: "stop" | "abandon";
   /** 既定 true: 子孫タスクとその worker まで子から順に止める。 */
   cascade?: boolean;
+  /** 既定 true: Commander が自作した sub-run の部分木も cascade 対象に含める。 */
+  includeSubRuns?: boolean;
 }
 
 /** cascade で訪れるタスク数の上限。超過は部分 cancel を避けるため無変更で断る。 */
@@ -1215,26 +1549,57 @@ export async function cancelTask(client: OrcaClient, input: CancelTaskInput): Pr
 
   const descendants = cascade ? collectDescendants(list, input.taskId) : [task];
 
+  // Commander が sub-run を作っている場合、task ツリーだけ追う cascade は
+  // sub-run の worker を走りたままにする(実測: 呼び出し元 Run には子が見えない)。
+  // handle 照合で拾った部分木を **sub-run 側が先**に並べる = 呼び出し元 Run の
+  // Commander(root)より先に止める。post-order なので各部分木の中も子が先。
+  let subCapture: SubRunCapture = EMPTY_CAPTURE;
+  if (cascade && input.includeSubRuns !== false) {
+    const handles = commanderHandles(task, []);
+    try {
+      const workersPayload = unwrapResult(
+        await client.workerList({ run: runId ?? undefined, limit: 100 }),
+      );
+      for (const row of extractWorkers(workersPayload).map(toWorkerRow)) {
+        if (row["taskId"] === input.taskId && typeof row["terminalHandle"] === "string") {
+          handles.push(row["terminalHandle"] as string);
+        }
+      }
+    } catch (error) {
+      subCapture = { ...EMPTY_CAPTURE, warnings: [`cancel の worker-list に失敗: ${failureLine(error)}`] };
+    }
+    subCapture = {
+      ...EMPTY_CAPTURE,
+      ...await captureSubRuns(client, {
+        callerRunId: runId,
+        handles,
+        taskCreatedAt: task["created_at"] ?? task["createdAt"],
+        enabled: true,
+      }),
+    };
+  }
+
+  const targets = [...subCapture.subtreeTasks, ...descendants];
+
   // 上限超過は**何も変更する前に**断る。collectDescendants は post-order なので、
   // 子孫を 12 件で切ると末尾の root(Commander)だけが対象から漏れ、
   // 「一部しか止めていないのに cancelled: true」になり得る。部分 cancel を黙って
   // 返すより、cascade: false か個別 cancel を選んでもらう方が安全。
-  if (descendants.length > MAX_CASCADE_TASKS) {
+  if (targets.length > MAX_CASCADE_TASKS) {
     throw new JobError(
       "cancel_scope_too_large",
-      `cascade 対象が ${descendants.length} 件あり、上限 ${MAX_CASCADE_TASKS} 件を超えます。何も変更していません。cascade: false で対象タスクだけ止めるか、子タスクを個別にキャンセルしてください`,
+      `cascade 対象が ${targets.length} 件あり、上限 ${MAX_CASCADE_TASKS} 件を超えます(sub-run 含む)。何も変更していません。cascade: false で対象タスクだけ止めるか、子タスクを個別にキャンセルしてください`,
       {
         taskId: input.taskId,
         runId,
-        taskCount: descendants.length,
+        taskCount: targets.length,
         maxCascadeTasks: MAX_CASCADE_TASKS,
-        sampleTaskIds: descendants.slice(0, 5).map((row) => pickString(row, ID_KEYS) ?? null),
+        subRunsDiscovered: subCapture.subRuns.length,
+        sampleTaskIds: targets.slice(0, 5).map((row) => pickString(row, ID_KEYS) ?? null),
       },
     );
   }
-
-  const targets = descendants;
-  const warnings: string[] = [];
+  const warnings: string[] = [...subCapture.warnings];
 
   // Phase 1: preflight — 全 target の dispatch を**変更前に**読み切って上限を点検する。
   // 処理しながら検査すると「子 A は cancel 済み、子 B で dispatch 5 件を発見 → error」
@@ -1320,16 +1685,19 @@ export async function cancelTask(client: OrcaClient, input: CancelTaskInput): Pr
       );
     }
 
+    // sub-run 側のタスクは sub-run 名義で叩く(task-update の Run スコープは
+    // バインドで決まるので、runMutation が consumer_fenced 時にその run へ切り替える)。
+    const targetRun = typeof target["__runId"] === "string" ? (target["__runId"] as string) : (runId ?? undefined);
     try {
-      await runMutation(client, runId ?? undefined, () =>
+      await runMutation(client, targetRun, () =>
         client.taskUpdate({
           id: targetId,
           status: "failed",
           result: `cancelled: ${reason}`,
-          run: runId ?? undefined,
+          run: targetRun,
         }),
       );
-      tasks.push({ taskId: targetId, state: "cancelled", fenced });
+      tasks.push({ taskId: targetId, state: "cancelled", fenced, runId: targetRun ?? null });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const boundRun = error instanceof OrcaCommandError ? extractBoundRun(error.message) : undefined;
@@ -1364,6 +1732,8 @@ export async function cancelTask(client: OrcaClient, input: CancelTaskInput): Pr
     cascade,
     taskCount: tasks.length,
     runId,
+    subRunsDiscovered: subCapture.subRuns.length,
+    subRuns: subCapture.subRuns,
     mode,
     reason,
     tasks,
@@ -1490,8 +1860,28 @@ export async function getTaskResult(client: OrcaClient, input: TaskResultInput):
   // 子タスクの成果は頼まれたときだけ集約する(既定は Commander だけ = 応答が膨らみすぎない)
   const children: JsonObject[] = [];
   let childrenTruncated = false;
+  let subCapture: SubRunCapture = EMPTY_CAPTURE;
   if (input.includeChildren === true) {
-    const childTasks = findChildTasks(list, input.taskId);
+    // Commander が sub-run を作っていると、その子タスクは呼び出し元 Run の
+    // task-list に無いので result からも消える(実測: 結果回収が壊れる)。拾って合算する。
+    subCapture = await captureSubRuns(client, {
+      callerRunId: runId,
+      handles: commanderHandles(task, []),
+      taskCreatedAt: task["created_at"] ?? task["createdAt"],
+      enabled: input.includeSubRuns !== false,
+    });
+    const subDispatchByTask = new Map<string, string[]>();
+    for (const worker of subCapture.workers) {
+      const taskId = worker["taskId"];
+      const dispatchId = worker["dispatchId"];
+      if (typeof taskId === "string" && typeof dispatchId === "string") {
+        const bucket = subDispatchByTask.get(taskId) ?? [];
+        bucket.push(dispatchId);
+        subDispatchByTask.set(taskId, bucket);
+      }
+    }
+
+    const childTasks = [...findChildTasks(list, input.taskId), ...subCapture.childTasks];
     const targets = childTasks.slice(0, MAX_CHILD_RESULTS);
     childrenTruncated = childTasks.length > targets.length;
     let reads = 0;
@@ -1503,7 +1893,13 @@ export async function getTaskResult(client: OrcaClient, input: TaskResultInput):
       }
       const childOutputs: JsonObject[] = [];
       if (reads < MAX_CHILD_OUTPUTS) {
-        for (const dispatchId of [...(await childDispatchIds(client, child, childId))].slice(0, 1)) {
+        // sub-run の子行には dispatch_id が無いので、capture 済みの worker 行から拾う
+        // (dispatch-show を sub-run 名義で足しにいかない)
+        const fromSub = subDispatchByTask.get(childId);
+        const ids = fromSub !== undefined && fromSub.length > 0
+          ? fromSub
+          : [...(await childDispatchIds(client, child, childId))];
+        for (const dispatchId of ids.slice(0, 1)) {
           reads += 1;
           try {
             const read = unwrapResult(await client.workerRead({ dispatch: dispatchId, limit }));
@@ -1528,6 +1924,7 @@ export async function getTaskResult(client: OrcaClient, input: TaskResultInput):
         state: mapTaskState(pickString(child, ["status", "state", "taskStatus"])),
         result: child["result"] ?? null,
         resultPreview: preview(child["result"], 500),
+        sourceRunId: child["__runId"] ?? null,
         outputs: childOutputs,
       });
     }
@@ -1544,6 +1941,9 @@ export async function getTaskResult(client: OrcaClient, input: TaskResultInput):
     includeChildren: input.includeChildren === true,
     children,
     childrenTruncated,
+    subRunsDiscovered: subCapture.subRuns.length,
+    subRuns: subCapture.subRuns,
+    warnings: subCapture.warnings,
     createdAt: task["created_at"] ?? task["createdAt"] ?? null,
     finishedAt: task["completed_at"] ?? task["completedAt"] ?? null,
   };
