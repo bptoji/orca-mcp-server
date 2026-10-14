@@ -244,7 +244,7 @@ docs/
   CLI 側で worker_done が通らない。CLI は dispatchId も要求する)。
 - ジョブ層の語彙は `JobError`(`task_not_found` / `task_id_missing` / `run_create_failed` /
   `outcome_required` / `outcome_not_allowed` / `dispatch_id_required` / `cancel_incomplete` /
-  `cancel_scope_too_large` / `cancel_dispatch_scope_too_large` / `gate_not_found`)。
+  `cancel_scope_too_large` / `cancel_dispatch_scope_too_large` / `gate_not_found` / `gate_run_mismatch`)。
   CLI 側の語彙(`run_required` など)はそのまま転送する。
 - `state: "cancelled"` は **MCP 側の論理状態**(CLI に native status が無い)。実体は
   `status: failed` + `result: "cancelled: <reason>"`。README にその旨を 1 行書く。
@@ -252,7 +252,10 @@ docs/
   agent_prompt / unknown`。`blocked` でも gate が無いことがある(Commander の blocked 報告 = `task-update` の `result`、
   エージェントの承認プロンプト)ので、**`blocked` = `decision_gate` と決めつけない**。pending のゲートがあるときだけ
   phase は `decision_gate`、無ければ `blocked`。gates は `gate-list --run` で全件取り、対象タスク + 直接の子タスクに絞る。
-  追加の読み取りは `agent_prompt` の `worker-read`(最大 2 worker)だけで、変更系は呼ばない。
+  **gate 行には必ず `runId` を載せる**(行の `run_id` を優先、無いときは照合した Run 名義で補う)。
+  `gate-resolve` に `--run` が無く `orca_resolve_gate` は `run` 必須なので、呼び出し側が所属 Run を知れていなければ
+  解決に使えない(sub-run のゲートは呼び出し元 Run と違う Run にある)。`blockedReasons` の gate `detail` にも
+  `gateId` / `runId` / `options` を入れる。追加の読み取りは `agent_prompt` の `worker-read`(最大 2 worker)だけで、変更系は呼ばない。
 - poll は worker の `projection.attention.requiresAction` を `attentionRequired` / `attentionNotes`
   (行には `attentionCategories`)として出す。ゲートが pending でないのに止まる典型はエージェント側の
   ツール承認プロンプト(E2E 実測)。Commander Prompt には「答えられない承認待ちで止めない / 新しい Run を
@@ -292,6 +295,9 @@ orca CLI は **呼び出し元ターミナルを 1 つの Run にバインド**�
   読み取り(task-list / worker-list など)はロックしない。
 - `gate-create` / `gate-resolve` には `--run` が無い(Run スコープはバインドで決まる)。
   なので `orca_resolve_gate` の `run` は必須で、`gate-list --run <run>` で対象を読んでから叩く。
+  **`run` はゲートの所属 Run**(poll の `gates[].runId`)でなければならない — 行の `run_id` が指定 Run と
+  一致しないなら `gate_run_mismatch` で**何も変更する前に**拒否する(`runMutation` が gate 側の Run へ
+  binding を切り替え、別 Run のゲートを解決してしまう。実測: ゲートは sub-run にあり呼び出し元 Run は 0 件)。
 
 ### sub-run(Commander が別の Run を作ってしまう事故)の扱い
 

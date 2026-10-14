@@ -580,7 +580,7 @@ describe("getTaskStatus(poll)", () => {
     expect(view["state"]).toBe("blocked");
     expect(view["phase"]).toBe("decision_gate");
     expect(view["gates"]).toEqual([
-      { id: "g1", taskId: null, status: "pending", question: null, options: null },
+      { id: "g1", runId: null, taskId: null, status: "pending", question: null, options: null },
     ]);
   });
 
@@ -963,6 +963,7 @@ describe("getTaskStatus(poll) — Commander の配下", () => {
     expect(view["gates"]).toEqual([
       {
         id: "gate_1",
+        runId: "run_x",
         taskId: "task_cmd",
         status: "pending",
         question: "main へ merge してよい?",
@@ -975,10 +976,23 @@ describe("getTaskStatus(poll) — Commander の配下", () => {
         taskId: "task_cmd",
         role: "commander",
         summary: "main へ merge してよい?",
-        detail: { gateId: "gate_1", options: '["approve","reject"]' },
+        detail: { gateId: "gate_1", runId: "run_x", options: '["approve","reject"]' },
       },
     ]);
     expect(view["nextAction"]).toContain("orca_resolve_gate");
+    expect(view["nextAction"]).toContain("gates[].runId");
+  });
+
+  it("gate 行に run_id が無い CLI では照合した Run 名義で runId を補う", async () => {
+    const { client } = createFakeClient({
+      taskList: { ok: true, result: { tasks: [{ id: "task_cmd", status: "blocked", run_id: "run_caller" }] } },
+      gateList: {
+        ok: true,
+        result: { gates: [{ id: "gate_1", task_id: "task_cmd", question: "merge してよい?", status: "pending" }] },
+      },
+    });
+    const view = await getTaskStatus(client, { taskId: "task_cmd" });
+    expect((view["gates"] as JsonObject[])[0]).toMatchObject({ id: "gate_1", runId: "run_caller" });
   });
 
   it("子タスクのゲートは見え、無関係な task のゲートは除外される", async () => {
@@ -1237,6 +1251,57 @@ describe("resolveGate(介入 / Human-in-the-loop)", () => {
     expect(error).toBeInstanceOf(JobError);
     expect((error as JobError).code).toBe("gate_not_found");
     expect(calls.some((call) => call.startsWith("gateResolve:"))).toBe(false);
+  });
+
+  it("gate の所属 Run と違う run を渡すと gate_run_mismatch で**変更前に**拒否する", async () => {
+    // 実測の事故型: gate は sub-run(run_sub)に存在するのに、呼び出し元 Run を名指しして解決しようとする。
+    // gate-resolve に --run が無いので、このまま叩くと runMutation が sub-run へ binding を切り替え、
+    // 「指定 Run のゲート」という前提で別 Run のゲートを解決してしまう。
+    const { client, calls } = createFakeClient({
+      gateList: {
+        ok: true,
+        result: {
+          gates: [
+            {
+              id: "gate_333059a5ece6",
+              run_id: "run_sub",
+              task_id: "task_sub_root",
+              question: "merge してよい?",
+              status: "pending",
+            },
+          ],
+        },
+      },
+    });
+    const error = await resolveGate(client, {
+      gateId: "gate_333059a5ece6",
+      resolution: "approve",
+      run: "run_caller",
+    }).catch((e) => e);
+    expect(error).toBeInstanceOf(JobError);
+    expect((error as JobError).code).toBe("gate_run_mismatch");
+    expect((error as JobError).detail).toMatchObject({
+      requestedRun: "run_caller",
+      gateRunId: "run_sub",
+      taskId: "task_sub_root",
+    });
+    // 変更系(gate-resolve / run-use)を 1 回も叩いていない = 何も変更していない
+    expect(calls.some((call) => call.startsWith("gateResolve:"))).toBe(false);
+    expect(calls.some((call) => call.startsWith("runUse:"))).toBe(false);
+  });
+
+  it("gate 行の run_id と同じ run なら解決できる(sub-run のゲートを正しい Run で解決)", async () => {
+    const { client, calls } = createFakeClient({
+      gateList: {
+        ok: true,
+        result: {
+          gates: [{ id: "gate_sub", run_id: "run_sub", task_id: "task_sub_root", question: "q", status: "pending" }],
+        },
+      },
+    });
+    const result = await resolveGate(client, { gateId: "gate_sub", resolution: "approve", run: "run_sub" });
+    expect(result).toMatchObject({ gateId: "gate_sub", resolved: true, runId: "run_sub", taskId: "task_sub_root" });
+    expect(calls[0]).toContain('"run":"run_sub"');
   });
 
   it("解決済みの gate には何もしない(冪等)", async () => {
@@ -2248,9 +2313,15 @@ describe("getTaskStatus(poll) — sub-run の自動集約", () => {
   it("sub-run のゲートも gates に出し、phase を decision_gate にする", async () => {
     const { client } = createSubRunClient();
     const view = await getTaskStatus(client, { taskId: "task_cmd", run: "run_caller" });
-    expect((view["gates"] as JsonObject[]).map((gate) => gate["id"])).toEqual(["gate_sub"]);
+    const gates = view["gates"] as JsonObject[];
+    expect(gates.map((gate) => gate["id"])).toEqual(["gate_sub"]);
+    // 実測の欠陥: gate に所属 Run が無いと orca_resolve_gate の run が決まらない。
+    // gate 行の run_id が無い CLI 版でも、照合した sub-run 名義で補完する。
+    expect(gates[0]).toMatchObject({ id: "gate_sub", runId: "run_sub", taskId: "task_sub_b" });
     expect(view["phase"]).toBe("decision_gate");
-    expect((view["blockedReasons"] as JsonObject[]).map((reason) => reason["kind"])).toContain("gate");
+    const gateReason = (view["blockedReasons"] as JsonObject[]).find((reason) => reason["kind"] === "gate");
+    expect(gateReason).toMatchObject({ taskId: "task_sub_b", role: "child" });
+    expect(gateReason?.["detail"]).toMatchObject({ gateId: "gate_sub", runId: "run_sub" });
   });
 
   it("includeSubRuns: false なら run-list を読まない(呼び出し元 Run だけ)", async () => {

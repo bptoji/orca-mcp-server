@@ -163,10 +163,12 @@ Run ownership 節(`COMMANDER_PROMPT` L676-680)差し替え(案A' 最終):
 | 6 | Phase 2 が poll / cancel のみ | 目的は「poll / cancel / **結果回収**」なのに `orca_get_task_result` が抜けていた | result にも sub-run 集約を入れた(`includeChildren: true` 時に合算、`sourceRunId` 付き) |
 | 7 | 「`childCount == 0` のときだけ追加探索」 | 親 Run にも sub-run にも子がある場合、childCount > 0 で sub-run が invisible のまま残る | 探索条件を「worker / dispatch が 1 件以上あるとき」に変更(queued では走らせない)。`includeSubRuns: false` で無効化できる |
 | 8 | — | `run-list` / `run-show` は読み取り専用なので poll ハンドラーで呼んでよい(AGENTS.md の「poll / result の読み集め」) | 変更系(run-use 等)は sub-run 集約では呼ばない。cancel の task-update だけ対象 run 名義 |
+| 9 | 「Gate 作成に失敗し、Commander が独力で処理する事態が発生した」(review8 §7.1 の前提) | **Gate 作成は成功していた**。`gate_e3de81e4d0d4` は sub-run `run_8d1d20524d42` の `task_a9c5f6f06805` に `status: pending` で存在し、呼び出し元 Run `run_6a42e93d341d` の `gate-list` は 0 件だった(2026-10-13 作成 → 2026-10-14 現在も pending)。事故は「作れない」ではなく「**sub-run の Gate が呼び出し元から見えなかった**」 | gate 行に `runId`(行の `run_id` 優先、無いときは照合 Run 名義で補完)、`blockedReasons[].detail.runId` を追加。`orca_resolve_gate` は gateId と run の組が一致しなければ `gate_run_mismatch` で**変更前に**拒否する |
 
 ### 実装で追加した応答フィールド
 
 - poll: `subRuns[]`(runId / objective / coordinatorHandle / taskCount / rootTaskIds)、`subRunsDiscovered`、children 行の `sourceRunId`
+- poll: gates 行の `runId`(ゲートの所属 Run)、gate 由来 `blockedReasons[].detail` の `gateId` / `runId` / `options`
 - cancel: `subRunsDiscovered` / `subRuns`、tasks 行の `runId`、上限判定は sub-run 込みの件数
 - result: `subRunsDiscovered` / `subRuns` / `warnings`、children 行の `sourceRunId`
 
@@ -174,3 +176,5 @@ Run ownership 節(`COMMANDER_PROMPT` L676-680)差し替え(案A' 最終):
 
 - 孫以降(sub-run 内の sub-run)は `children` に出さない(呼び出し元 Run の direct children semantics を保つ)。
 - `coordinator_handle` 照合は run lineage が無いことへの代替ハック。Orca 本体に `parentRunId` が入れば §6 の要求へ置換できる。
+- gate 行の `runId` は CLI の `run_id` を優先する。行に `run_id` が無い CLI 版では「そのゲートを照合した Run」名義の
+  補完になるため、sub-run 集約が動かない環境(caller gate のみ)では呼び出し元 Run 名義で返る。

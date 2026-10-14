@@ -257,10 +257,12 @@ orca_get_task_result({ taskId: "task_abc123", includeChildren: true })
     `result: "cancelled: <reason>"` で記録されます(CLI に native の `cancelled` が無い)。
 - `phase`: `queued / starting / implementation / decision_gate / blocked / settling / finished`
   (`decision_gate` は pending のゲートがあるときだけ。ゲートが無い `blocked` は `blocked`)
-- `gates` は対象タスクと**直接の子タスク**のゲート(`taskId` 付き、`question` は 2000 字まで)。
+- `gates` は対象タスクと**直接の子タスク**(sub-run 集約時はその部分木)のゲート(`taskId` と **`runId`** 付き、`question` は 2000 字まで)。
+  `runId` は**そのゲートの所属 Run** です。実測では sub-run 内のゲートが `run_8d1d20524d42` に pending で、
+  呼び出し元 Run の `gate-list` は 0 件でした — `orca_resolve_gate` にはこの `runId` をそのまま `run` として渡します。
 - `blockedReasons[]` は止まっている理由(`{ kind, taskId, role, summary, detail? }`)。`role` は `commander`(対象タスク自身 = Commander)/
   `child`(直接の子タスク)で、どちらが止まっているかを示します。`kind` は
-  `gate`(質問文 + `detail.gateId/options`)/ `task_report`(Commander・子タスクの blocked 報告 `result`)/
+  `gate`(質問文 + `detail.gateId` / `detail.runId` / `detail.options`)/ `task_report`(Commander・子タスクの blocked 報告 `result`)/
   `agent_prompt`(入力待ちの worker。`detail` に `outputTail` / `outputHash` / `looksLikePrompt` / `observedAt` / `activity`。
   MCP からは解除不可。`looksLikePrompt` は文言からの推定。`outputHash` は呼び出し側が前回値と比べて動作中かを判定する)/
   `unknown`(根拠なし)。`nextAction` は最優先の kind に合わせて案内します。
@@ -315,9 +317,10 @@ orca_send_message({ subject: "done", body: "実装とテスト完了", type: "wo
                     outcome: "succeeded", taskId: "task_abc123", dispatchId: "disp_…", run: "run_…" })
   → { "ok": true, "messageId": "msg_…", "type": "worker_done", "outcome": "succeeded" }
 
-orca_resolve_gate({ gateId: "gate_333059a5ece6", resolution: "approve", run: "run_…" })
-  → { "gateId": "gate_333059a5ece6", "resolved": true, "status": "resolved",
-      "resolution": "approve", "taskId": "task_abc123", "runId": "run_…" }
+orca_resolve_gate({ gateId: "gate_e3de81e4d0d4", resolution: "approve", run: "run_8d1d20524d42" })
+  //  ↑ poll の gates[].runId(このゲートは sub-run 側に存在する)をそのまま run に渡す
+  → { "gateId": "gate_e3de81e4d0d4", "resolved": true, "status": "resolved",
+      "resolution": "approve", "taskId": "task_a9c5f6f06805", "runId": "run_8d1d20524d42" }
 
 orca_cancel_task({ taskId: "task_abc123", reason: "方針変更" })   // cascade 既定 true
   → { "taskId": "task_abc123", "state": "cancelled", "cancelled": true, "fullyStopped": true,
@@ -336,6 +339,10 @@ orca_cancel_task({ taskId: "task_abc123", reason: "方針変更" })   // cascade
 - MCP 側は Run バインドを持たないので `run`(`orca_delegate_task` が返した `runId`)を渡してください
 - **ゲートは Run バインドスコープ**(`gate-resolve` に `--run` が無い)なので `orca_resolve_gate` の `run` は必須。
   Run に gate が無ければ `gate_not_found`、解決済みなら何もしません(冪等)
+- **`run` は poll が返す `gates[].runId`(ゲートの所属 Run)を渡す**こと。Commander が sub-run を作っていると
+  ゲートは呼び出し元 Run と違う Run にあり(実測: 呼び出し元 Run の `gate-list` は 0 件、sub-run に pending が 1 件)、
+  組が一致しない場合は**何も変更する前に** `gate_run_mismatch` で拒否します(`gate_not_found` と合わせて
+  誤った Run のゲートを解決しないための gate)
 - Commander Prompt は「承認ゲート無しでは merge / push / deploy をしない」と約束しています。
   **ゲートを解決する API がないとジョブは途中で詰まります**(blocked / decision_gate の `nextAction` が指します)
 - **cancel はジョブ単位**(既定 `cascade: true`)。Commander が分解した**子孫タスクとその worker を子から順**に
@@ -378,7 +385,7 @@ orca_cancel_task({ taskId: "task_abc123", reason: "方針変更" })   // cascade
   例: `run_required` / `run_not_found` / `worktree_not_found`(+ `data.nextSteps`)
 - ジョブ層の失敗語彙: `task_not_found` / `task_id_missing` / `run_create_failed` / `outcome_required` /
   `outcome_not_allowed` / `dispatch_id_required` / `cancel_incomplete` / `cancel_scope_too_large` /
-  `cancel_dispatch_scope_too_large` / `gate_not_found`
+  `cancel_dispatch_scope_too_large` / `gate_not_found` / `gate_run_mismatch`
 - orca CLI は**呼び出し元ターミナルを 1 つの Run にバインド**します。違う Run への変更は `consumer_fenced` で
   拒否されるため、介入ツールだけが必要に応じて `run-use` でバインドを切り替えて 1 回だけ再試行します
   (poll / 観測ツールは切り替えません)。変更系は MCP サーバー内で直列化します
@@ -504,7 +511,7 @@ poll を打ち切る前に数回待ってください。**launcher 運用では�
 | `nested_worker_depth_exceeded`(子 worker が起動しない) | Orca の **Nested worker depth** が既定 1。MCP が起動する Commander は既に depth 1 なので、その子は depth 2 で拒否される | Orca の Settings → Orchestration → "Nested worker depth" を 2 にする(既定 1 / 1 以上の整数)。`depth 2, max 1` がそのまま応答に出る |
 | `running` のまま progress が止まる | エージェントの**ツール承認プロンプト**で worker が停止 | `attentionNotes` をたどって pane を確認。codex は `--approve-for-me`、claude は `agentDefaultArgs.claude` の `--permission-mode acceptEdits --allowedTools Bash …` |
 | claude の worker が `dispatched` のまま動かない、pane に `Not logged in` | claude の auth 切れ(権限設定ではない) | Orca 側のアカウント紐づけ / pane で `/login` |
-| `blocked` / `phase: "decision_gate"` | 承認ゲート待ち | `blockedReasons` の `question` / `options` を読み、`orca_resolve_gate({ gateId, resolution, run })` で進める |
+| `blocked` / `phase: "decision_gate"` | 承認ゲート待ち | `blockedReasons` の `question` / `options` を読み、`orca_resolve_gate({ gateId, resolution, run })` で進める(`run` には `gates[].runId` を使う) |
 | `blocked` / `phase: "blocked"`(`gates` が空) | ゲート以外の停止(Commander の blocked 報告、承認プロンプトなど) | `blockedReasons` の `kind` を確認(`task_report` は `orca_send_message` / cancel、`agent_prompt` は pane で人間が答える) |
 | `consumer_fenced` | 呼び出し元の Run バインドが対象と違う | 介入ツールは自動で `run-use` して 1 回だけ再試行します。worker 側なら自分の terminal を 1 回バインド |
 | poll の `childCount: 0` のまま Commander が進み、cancel でも worker が止まらない | Commander が自分の terminal で `run-create` を作り、仕事が **別の sub-run** に移った(`task-list` は Run スコープ) | 既定の sub-run 集約で拾います(`subRunsDiscovered` / `children[].sourceRunId`)。`orca_list_runs` で Run を直接見る。Commander には「sub-worker 用に run-create を作らない」を指示に書き込む |
@@ -513,7 +520,8 @@ poll を打ち切る前に数回待ってください。**launcher 運用では�
 | `cancel_incomplete`(`fullyStopped: false`) | Commander の worker を止められなかった | 対象 task は未更新。pane を確認して worker を止めてから cancel し直す |
 | `cancel_scope_too_large` / `cancel_dispatch_scope_too_large` | 子孫 12 件超 / 1 タスク 3 dispatch 超 | 何も変更していません。`cascade: false` か個別 cancel を選ぶ |
 | cancel した task が `failed` に見える | `cancelled` は MCP 側の論理状態 | 実体は `status: failed` + `result: "cancelled: <reason>"`。想定どおり |
-| `gate_not_found` | その Run に gate が無い | `run` を対象 Run に直す(`gate-list` は Run バインドスコープ) |
+| `gate_not_found` | その Run に gate が無い | `run` を対象 Run に直す(`gate-list` は Run バインドスコープ)。sub-run のゲートは `gates[].runId` の Run で見る |
+| `gate_run_mismatch` | 渡した `run` とゲートの所属 Run が違う | 何も変更していません。poll の `gates[].runId` / `blockedReasons[].detail.runId` を `run` に渡す |
 | `orca 起動失敗: orca CLI が見つかりませんでした` | PATH / `ORCA_BIN` | PATH を確認するか `ORCA_BIN` にバイナリパスを指定 |
 | `no_active_sender_terminal`(`run-create` など) | MCP サーバーが Orca ターミナルの外で起動され `ORCA_TERMINAL_HANDLE` が無い | 専用ターミナルの pane 内で起動する、または専用ターミナルの handle を `ORCA_TERMINAL_HANDLE` に設定して起動する |
 | MCP クライアントに接続されない | 未ビルド / stdio 設定 | `npm run build` 後に `npm run dev` で手動起動して確認 |

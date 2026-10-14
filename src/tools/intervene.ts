@@ -71,7 +71,7 @@ export function registerInterveneTools(server: McpServer, client: OrcaClient): v
     {
       title: "Orca Resolve Gate",
       description:
-        "pending の判断ゲート(Decision Gate)を承認/却下して Commander を進める。内部で gate-list から対象を読み、`orca orchestration gate-resolve --id --resolution --json` を 1 回呼ぶだけ。gate は Run バインドスコープなので run は必須(consumer_fenced 時だけ run-use で切り替えて 1 回再試行)。解決済みのゲートには何もしない(冪等)。Commander Prompt が「承認ゲート無しでは merge/push/deploy をしない」と約束しているため、これを呼ぶ手段が無いとジョブが途中で止まる。",
+        "pending の判断ゲート(Decision Gate)を承認/却下して Commander を進める。内部で gate-list から対象を読み、`orca orchestration gate-resolve --id --resolution --json` を 1 回呼ぶだけ。gate は Run バインドスコープなので run は必須(consumer_fenced 時だけ run-use で切り替えて 1 回再試行)。run には poll(gates[].runId / blockedReasons[].detail.runId)で得た **そのゲートの所属 Run** を渡すこと — Commander が sub-run を作っていると、ゲートは呼び出し元 Run と違う Run に存在する。gateId と run の組が一致しない場合は何も変更せずに gate_run_mismatch で拒否する。解決済みのゲートには何もしない(冪等)。Commander Prompt が「承認ゲート無しでは merge/push/deploy をしない」と約束しているため、これを呼ぶ手段が無いとジョブが途中で止まる。",
       inputSchema: resolveGateInputSchema,
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     },

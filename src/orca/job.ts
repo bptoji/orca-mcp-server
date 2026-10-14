@@ -340,7 +340,8 @@ export function estimatePhase(state: JobState, workers: JsonObject[], gates: Jso
 export type BlockedKind = "gate" | "task_report" | "agent_prompt" | "unknown";
 
 const BLOCKED_HINTS: Record<BlockedKind, string> = {
-  gate: "判断ゲートが pending。blockedReasons の question / options を確認し、承認/却下は orca_resolve_gate({ gateId, resolution, run })",
+  gate:
+    "判断ゲートが pending。blockedReasons の question / options を確認し、承認/却下は orca_resolve_gate({ gateId, resolution, run }) — run には blockedReasons[].detail.runId(gates[].runId)を使う。sub-run 内のゲートは呼び出し元 Run と違う Run に属する",
   task_report:
     "Commander / 子タスクが blocked を報告している。blockedReasons の内容を読み、orca_send_message で指示するか orca_cancel_task で止める",
   agent_prompt:
@@ -433,7 +434,9 @@ export async function collectBlockedReasons(
       kind: "gate",
       taskId: gate["taskId"] ?? null,
       summary: gate["question"] ?? null,
-      detail: { gateId: gate["id"] ?? null, options: gate["options"] ?? null },
+      // runId を添える: gate-resolve には --run が無く、orca_resolve_gate は run 必須。
+      // 呼び出し側が blockedReasons だけで解決に必要な Run を決められるようにする。
+      detail: { gateId: gate["id"] ?? null, runId: gate["runId"] ?? null, options: gate["options"] ?? null },
     });
   }
 
@@ -542,7 +545,7 @@ export function nextActionHint(
       return "poll again with orca_get_task_status";
     case "blocked":
       return phase === "decision_gate"
-        ? "判断ゲートが pending(gates を参照)。承認/却下は orca_resolve_gate({ gateId, resolution, run })"
+        ? "判断ゲートが pending(gates を参照)。承認/却下は orca_resolve_gate({ gateId, resolution, run }) で、run には gates[].runId を使う(sub-run のゲートは呼び出し元 Run と違う Run に属する)"
         : "poll again with orca_get_task_status";
     case "completed":
       return "call orca_get_task_result";
@@ -827,7 +830,8 @@ async function captureSubRuns(
       for (const gate of extractGates(gatesPayload)) {
         const gateTask = pickString(gate, ["task_id", "taskId"]);
         if (gateTask === undefined || subtreeIds.has(gateTask)) {
-          capture.gates.push(gate);
+          // `__runId`: 照合した sub-run 名義(gate 行に run_id が無い CLI 版向けの補完用)。
+          capture.gates.push({ ...gate, __runId: runId });
         }
       }
     } catch (error) {
@@ -853,10 +857,20 @@ function commanderHandles(task: JsonObject, workers: JsonObject[]): string[] {
   return [...handles];
 }
 
-/** gate 行を Job API 用の 1 行に正規化する(poll / sub-run 共通)。 */
-function toGateRow(gate: JsonObject): JsonObject {
+/**
+ * gate 行を Job API 用の 1 行に正規化する(poll / sub-run 共通)。
+ *
+ * `runId` は**必須で載せる**。`gate-resolve` には `--run` が無く(Run スコープは
+ * 呼び出し元の binding で決まる)、`orca_resolve_gate` は `run` 必須なので、
+ * 呼び出し側が「どの Run のゲートか」を分かっていなければならない。
+ * 実測: sub-run の gate は `gate-list --run <sub-run>` でしか見えない
+ * (呼び出し元 Run には 0 件)ので、runId 無しでは解決に使える Run が決まらない。
+ * CLI 行の `run_id` を優先し、無いときは照合した Run 名義(第 2 引数)で補う。
+ */
+function toGateRow(gate: JsonObject, fallbackRunId?: string | null): JsonObject {
   return {
     id: pickString(gate, ["gateId", "gate_id", "id"]) ?? null,
+    runId: pickString(gate, ["runId", "run_id", "run"]) ?? fallbackRunId ?? null,
     taskId: pickString(gate, ["task_id", "taskId"]) ?? null,
     status: pickString(gate, ["status", "state"]) ?? null,
     question: preview(gate["question"], MAX_REASON_TEXT),
@@ -1254,13 +1268,16 @@ export async function getTaskStatus(client: OrcaClient, input: TaskStatusInput):
     }
   }
   const gatesPayload = await client.gateList({ run: input.run ?? runId ?? undefined });
+  const callerRunName = input.run ?? runId ?? null;
   const gates = [
-    ...extractGates(gatesPayload).filter((gate) => {
-      const gateTask = pickString(gate, ["task_id", "taskId"]);
-      return gateTask === undefined || scopeIds.has(gateTask);
-    }),
-    ...subCapture.gates,
-  ].map(toGateRow);
+    ...extractGates(gatesPayload)
+      .filter((gate) => {
+        const gateTask = pickString(gate, ["task_id", "taskId"]);
+        return gateTask === undefined || scopeIds.has(gateTask);
+      })
+      .map((gate) => toGateRow(gate, callerRunName)),
+    ...subCapture.gates.map((gate) => toGateRow(gate, pickString(gate, ["__runId"]) ?? null)),
+  ];
 
   await enrichAgentNames(client, [...workers, ...childWorkers]);
 
@@ -1770,9 +1787,23 @@ export async function resolveGate(client: OrcaClient, input: ResolveGateInput): 
     );
   }
 
-  const runId = pickString(gate, ["run_id", "runId"]) ?? input.run;
+  const gateRunId = pickString(gate, ["run_id", "runId"]) ?? input.run;
   const taskId = pickString(gate, ["task_id", "taskId"]) ?? null;
   const status = pickString(gate, ["status", "state"]);
+
+  // **変更前に** gateId と run の組を点検する。gate-list は `--run` で名指しした Run を
+  // 読むが、行の `run_id` が指定 Run と違うなら「指定 Run のゲート」という前提が崩れる。
+  // gate-resolve には `--run` が無いので、このまま叩くと別 Run のゲートを解決する
+  // (runMutation が gate 側の Run へ binding を切り替えてしまう)。
+  if (gateRunId !== input.run) {
+    throw new JobError(
+      "gate_run_mismatch",
+      `ゲート ${input.gateId} の所属 Run は ${gateRunId} です(指定 ${input.run} と一致しません)。何も変更していません。poll の gates[].runId を run に渡してください`,
+      { gateId: input.gateId, requestedRun: input.run, gateRunId, taskId },
+    );
+  }
+
+  const runId = gateRunId;
 
   // 解決済みゲートには触らない(冪等)。CLI は解決の取り消しを支持していない。
   if (status !== undefined && status.toLowerCase() !== "pending") {
