@@ -186,7 +186,10 @@ const main = async () => {
     last = status.parsed;
     log(
       `poll#${polls} state=${last?.state} phase=${last?.phase} children=${last?.childCount ?? 0}` +
-        ` gates=${(last?.gates ?? []).length}`,
+        ` gates=${(last?.gates ?? []).length}` +
+        ` subRuns=${last?.subRunsDiscovered ?? 0}` +
+        ` scanComplete=${last?.subRunScanComplete}(pages=${last?.subRunScanPageCount}, runs=${last?.subRunScanRunCount})` +
+        ` ownershipComplete=${last?.subRunOwnershipComplete} workerScanComplete=${last?.subRunWorkerScanComplete}`,
     );
     if (polls === 1 || polls % 5 === 0) {
       record(`poll#${polls}`, {
@@ -196,19 +199,45 @@ const main = async () => {
         children: last?.children,
         gates: last?.gates,
         workers: last?.workers,
+        subRunsDiscovered: last?.subRunsDiscovered,
+        subRuns: last?.subRuns,
+        subRunScanComplete: last?.subRunScanComplete,
+        subRunsTruncated: last?.subRunsTruncated,
+        subRunScanPageCount: last?.subRunScanPageCount,
+        subRunScanRunCount: last?.subRunScanRunCount,
+        subRunOwnershipComplete: last?.subRunOwnershipComplete,
+        subRunWorkerScanComplete: last?.subRunWorkerScanComplete,
+        blockedReasons: last?.blockedReasons,
+        warnings: last?.warnings,
       });
     }
 
     const pendingGates = (last?.gates ?? []).filter((gate) => gate.status === "pending");
     for (const gate of pendingGates) {
+      // gate-resolve には --run が無いので「ゲートの所属 Run」を叩く(sub-run のゲートは呼び出し元 Run と違う)
+      const gateRun = typeof gate.runId === "string" && gate.runId.length > 0 ? gate.runId : runId;
+      // taskId を渡すと「自分の job のゲートか」を MCP 側が点検する(gate_task_mismatch で変更前に拒否)。
+      // ただし sub-run のゲートは呼び出し元 Run の task 部分木に属さないので点検させない(review11 §3)。
+      const ownJobGate = gateRun === runId;
       const resolved = await call("orca_resolve_gate", {
         gateId: gate.id,
         resolution: "approve (e2e)",
-        run: runId,
+        run: gateRun,
+        ...(ownJobGate ? { taskId } : {}),
       });
-      log(`gate ${gate.id} → approve (e2e) isError=${resolved.isError}`);
-      gatesResolved.push({ gateId: gate.id, question: gate.question ?? null, result: resolved.parsed });
-      record("resolve_gate", { gateId: gate.id, result: resolved.parsed });
+      log(
+        `gate ${gate.id} → approve (e2e) run=${gateRun} taskId=${ownJobGate ? taskId : "none(sub-run)"} isError=${resolved.isError}`,
+      );
+      gatesResolved.push({
+        gateId: gate.id,
+        gateRun,
+        callerRun: runId,
+        gateTaskId: gate.taskId ?? null,
+        requestedTaskId: ownJobGate ? taskId : null,
+        question: gate.question ?? null,
+        result: resolved.parsed,
+      });
+      record("resolve_gate", { gateId: gate.id, gateRun, callerRun: runId, taskId: ownJobGate ? taskId : null, result: resolved.parsed });
     }
 
     if (["completed", "failed", "cancelled"].includes(last?.state)) {
@@ -225,10 +254,14 @@ const main = async () => {
   record("result", {
     state: result.parsed?.state,
     resultPreview: result.parsed?.resultPreview,
+    subRunsDiscovered: result.parsed?.subRunsDiscovered,
+    subRuns: result.parsed?.subRuns,
+    warnings: result.parsed?.warnings,
     children: (result.parsed?.children ?? []).map((child) => ({
       taskId: child.taskId,
       title: child.title,
       state: child.state,
+      sourceRunId: child.sourceRunId,
       resultPreview: child.resultPreview,
       outputs: (child.outputs ?? []).map((output) => ({ dispatchId: output.dispatchId, agent: output.agent })),
     })),
@@ -248,13 +281,15 @@ const main = async () => {
   record("cancel_delegate", cancelJob.parsed);
 
   let cancelView = null;
+  let cancelledSummary = {};
   if (typeof cancelTaskId === "string") {
     for (let index = 0; index < 6; index += 1) {
       const status = await call("orca_get_task_status", { taskId: cancelTaskId, run: cancelRunId });
       cancelView = status.parsed;
       log(
         `cancel poll#${index + 1} state=${cancelView?.state} children=${cancelView?.childCount ?? 0}` +
-          ` workers=${(cancelView?.workers ?? []).length}`,
+          ` workers=${(cancelView?.workers ?? []).length}` +
+          ` subRuns=${cancelView?.subRunsDiscovered ?? 0}`,
       );
       if ((cancelView?.childCount ?? 0) > 0 || (cancelView?.workers ?? []).length > 0) {
         break;
@@ -265,9 +300,16 @@ const main = async () => {
     const cancelled = await call("orca_cancel_task", { taskId: cancelTaskId, run: cancelRunId, reason: "E2E cancel 検証" });
     log(
       `cancel isError=${cancelled.isError} cancelled=${cancelled.parsed?.cancelled}` +
-        ` fullyStopped=${cancelled.parsed?.fullyStopped} taskCount=${cancelled.parsed?.taskCount}`,
+        ` fullyStopped=${cancelled.parsed?.fullyStopped} taskCount=${cancelled.parsed?.taskCount}` +
+        ` subRunsDiscovered=${cancelled.parsed?.subRunsDiscovered ?? 0}` +
+        ` residual=${(cancelled.parsed?.residualWorkers ?? []).length}` +
+        ` scanComplete=${cancelled.parsed?.subRunScanComplete}`,
     );
     record("cancel", cancelled.parsed);
+    cancelledSummary = cancelled.parsed ?? {};
+    if (cancelled.isError && cancelled.parsed?.code === "cancel_ownership_unverified") {
+      log(`cancel_ownership_unverified: ${JSON.stringify(cancelled.parsed?.detail?.subRuns ?? [])}`);
+    }
 
     const after = await call("orca_get_task_status", { taskId: cancelTaskId, run: cancelRunId });
     log(`cancel 後 state=${after.parsed?.state} children=${after.parsed?.childCount ?? 0}`);
@@ -300,9 +342,20 @@ const main = async () => {
     finalState: last?.state,
     polls,
     gatesResolved: gatesResolved.length,
+    gateRuns: gatesResolved.map((gate) => `${gate.gateId}@${gate.gateRun}`),
+    gateTasks: gatesResolved.map((gate) => `${gate.gateId}@${gate.gateTaskId ?? "null"}`),
+    subRunsDiscovered: last?.subRunsDiscovered ?? 0,
+    subRunOwnership: (last?.subRuns ?? []).map((row) => `${row.runId}:${row.ownership}`),
+    subRunScanComplete: last?.subRunScanComplete ?? null,
+    subRunScanPageCount: last?.subRunScanPageCount ?? null,
+    subRunScanRunCount: last?.subRunScanRunCount ?? null,
+    subRunWorkerScanComplete: last?.subRunWorkerScanComplete ?? null,
     resultChildren: (result.parsed?.children ?? []).length,
     cancelTaskId,
     cancelState: cancelView?.state ?? null,
+    cancelFullyStopped: cancelledSummary.fullyStopped ?? null,
+    cancelResidualWorkers: cancelledSummary.residualWorkers?.length ?? 0,
+    cancelErrorCode: cancelledSummary.code ?? null,
   };
   writeFileSync("e2e-transcript.json", JSON.stringify(transcript, null, 2), "utf8");
   log("トランスクリプトを e2e-transcript.json に保存しました");

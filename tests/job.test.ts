@@ -1,11 +1,16 @@
 import { describe, expect, it } from "vitest";
 import type { JsonObject, OrcaClient } from "../src/orca/client.js";
 import {
+  buildTerminalIdentities,
   buildWorktreeName,
   cancelTask,
+  classifySubRunOwnership,
   collectDescendants,
+  commanderSpec,
   estimatePhase,
   extractApprovalPrompt,
+  extractRuns,
+  matchSubRuns,
   outputHashOf,
   extractBoundRun,
   findChildTasks,
@@ -16,10 +21,15 @@ import {
   JobError,
   mapTaskState,
   mapWorkerStatus,
+  parseParentMarker,
   resolveGate,
+  selectSubRunRoots,
   sendMessage,
+  SUB_RUN_MARKER_PREFIX,
   toChildRow,
+  toRunRow,
   toWorkerRow,
+  MAX_SUB_RUNS,
 } from "../src/orca/job.js";
 import { OrcaCommandError } from "../src/orca/command.js";
 
@@ -194,6 +204,7 @@ function createFakeClient(options: {
   taskList?: JsonObject;
   dispatchShow?: JsonObject;
   workerList?: JsonObject;
+  runList?: JsonObject;
   gateList?: JsonObject;
   gateResolve?: JsonObject;
   workerRead?: JsonObject;
@@ -298,6 +309,10 @@ function createFakeClient(options: {
       calls.push(`runUse:${runId}`);
       return { ok: true, result: { run: { id: runId } } };
     },
+    runList: async (input: JsonObject) => {
+      calls.push(`runList:${JSON.stringify(input)}`);
+      return options.runList ?? { ok: true, result: { runs: [] } };
+    },
   };
   return { client: client as unknown as OrcaClient, calls };
 }
@@ -357,10 +372,40 @@ describe("delegateTask(submit / Commander API)", () => {
     expect(taskCreate).toContain("If loading the guide is blocked by a tool-permission prompt");
     expect(taskCreate).toContain("fall back to");
     expect(taskCreate).toContain("orca orchestration --help");
-    // 自分の Run の中で走る Commander が新しい Run を作って job を分断しない(E2E で実測)
-    expect(taskCreate).toContain("Run ownership:");
-    expect(taskCreate).toContain("Do not create new Runs");
-    expect(taskCreate).toContain("--parent set to your task");
+    // Run 所有権(review9 §3 の文言): 既存 Run を使い、深さ/ circuit-break / 失敗 dispatch /
+    // binding 無しの回避として run-create を作らせない
+    expect(taskCreate).toContain("Run ownership and sub-run policy:");
+    expect(taskCreate).toContain("Reuse that Run for ordinary child tasks");
+    expect(taskCreate).toContain("Do not create a new Run merely because the current terminal has no bound Run");
+    expect(taskCreate).toContain("Never create a Run to bypass a nested worker depth limit");
+    expect(taskCreate).toContain("does not reset depth");
+    // legacy takeover は別操作 = 新しい Run を作る許可ではない
+    expect(taskCreate).toContain("run-use --takeover-legacy");
+    expect(taskCreate).toContain("it is not permission to");
+    // 自律 coordinator は guide が許すときだけ child Run を作り、マーカーと報告で関連付ける
+    expect(taskCreate).toContain("A worker acting as an autonomous coordinator may create and manage a child Run");
+    expect(taskCreate).toContain(`${SUB_RUN_MARKER_PREFIX} run=run_test task=<your task id>`);
+    expect(taskCreate).toContain("Report the child Run id and its relationship to this job");
+    // gate 作成に失敗したら承認を進めない(人間への介入要求までが手順)
+    expect(taskCreate).toContain("If gate-create fails: check the Run binding");
+    expect(taskCreate).toContain("Never proceed as if approval had");
+  });
+
+  it("spec に runId が注入され、プレースホルダが 1 つも残らない", async () => {
+    const { client, calls } = createFakeClient();
+    await delegateTask(client, { spec: "README を更新して" });
+
+    const taskCreate = calls[1] ?? "";
+    // {{runId}} は複数箇所に出る(global 置換で全部埋める)
+    expect(taskCreate).toContain("exactly ONE Run: run_test");
+    expect(taskCreate).toContain("task-list --run run_test --json");
+    expect(taskCreate).toContain("task-create --run run_test --parent");
+    expect(taskCreate).toContain("worker-start --run run_test --task");
+    expect(taskCreate).toContain("run-use --id run_test --json");
+    expect(taskCreate).not.toContain("{{");
+    // taskId は task-create の後にしか決まらず task-update に --spec が無い(実機 help 実測)
+    // ので注入しない → 注入漏れを warnings で黙らない
+    expect(taskCreate).not.toContain("{{taskId}}");
   });
 
   it("constraints は Constraints 欄に箇条書きで入る(省略時は既定の 1 行)", async () => {
@@ -551,7 +596,7 @@ describe("getTaskStatus(poll)", () => {
     expect(view["state"]).toBe("blocked");
     expect(view["phase"]).toBe("decision_gate");
     expect(view["gates"]).toEqual([
-      { id: "g1", taskId: null, status: "pending", question: null, options: null },
+      { id: "g1", runId: null, taskId: null, status: "pending", question: null, options: null },
     ]);
   });
 
@@ -934,6 +979,7 @@ describe("getTaskStatus(poll) — Commander の配下", () => {
     expect(view["gates"]).toEqual([
       {
         id: "gate_1",
+        runId: "run_x",
         taskId: "task_cmd",
         status: "pending",
         question: "main へ merge してよい?",
@@ -946,10 +992,23 @@ describe("getTaskStatus(poll) — Commander の配下", () => {
         taskId: "task_cmd",
         role: "commander",
         summary: "main へ merge してよい?",
-        detail: { gateId: "gate_1", options: '["approve","reject"]' },
+        detail: { gateId: "gate_1", runId: "run_x", options: '["approve","reject"]' },
       },
     ]);
     expect(view["nextAction"]).toContain("orca_resolve_gate");
+    expect(view["nextAction"]).toContain("gates[].runId");
+  });
+
+  it("gate 行に run_id が無い CLI では照合した Run 名義で runId を補う", async () => {
+    const { client } = createFakeClient({
+      taskList: { ok: true, result: { tasks: [{ id: "task_cmd", status: "blocked", run_id: "run_caller" }] } },
+      gateList: {
+        ok: true,
+        result: { gates: [{ id: "gate_1", task_id: "task_cmd", question: "merge してよい?", status: "pending" }] },
+      },
+    });
+    const view = await getTaskStatus(client, { taskId: "task_cmd" });
+    expect((view["gates"] as JsonObject[])[0]).toMatchObject({ id: "gate_1", runId: "run_caller" });
   });
 
   it("子タスクのゲートは見え、無関係な task のゲートは除外される", async () => {
@@ -1208,6 +1267,131 @@ describe("resolveGate(介入 / Human-in-the-loop)", () => {
     expect(error).toBeInstanceOf(JobError);
     expect((error as JobError).code).toBe("gate_not_found");
     expect(calls.some((call) => call.startsWith("gateResolve:"))).toBe(false);
+  });
+
+  it("gate の所属 Run と違う run を渡すと gate_run_mismatch で**変更前に**拒否する", async () => {
+    // 実測の事故型: gate は sub-run(run_sub)に存在するのに、呼び出し元 Run を名指しして解決しようとする。
+    // gate-resolve に --run が無いので、このまま叩くと runMutation が sub-run へ binding を切り替え、
+    // 「指定 Run のゲート」という前提で別 Run のゲートを解決してしまう。
+    const { client, calls } = createFakeClient({
+      gateList: {
+        ok: true,
+        result: {
+          gates: [
+            {
+              id: "gate_333059a5ece6",
+              run_id: "run_sub",
+              task_id: "task_sub_root",
+              question: "merge してよい?",
+              status: "pending",
+            },
+          ],
+        },
+      },
+    });
+    const error = await resolveGate(client, {
+      gateId: "gate_333059a5ece6",
+      resolution: "approve",
+      run: "run_caller",
+    }).catch((e) => e);
+    expect(error).toBeInstanceOf(JobError);
+    expect((error as JobError).code).toBe("gate_run_mismatch");
+    expect((error as JobError).detail).toMatchObject({
+      requestedRun: "run_caller",
+      gateRunId: "run_sub",
+      taskId: "task_sub_root",
+    });
+    // 変更系(gate-resolve / run-use)を 1 回も叩いていない = 何も変更していない
+    expect(calls.some((call) => call.startsWith("gateResolve:"))).toBe(false);
+    expect(calls.some((call) => call.startsWith("runUse:"))).toBe(false);
+  });
+
+  it("gate 行の run_id と同じ run なら解決できる(sub-run のゲートを正しい Run で解決)", async () => {
+    const { client, calls } = createFakeClient({
+      gateList: {
+        ok: true,
+        result: {
+          gates: [{ id: "gate_sub", run_id: "run_sub", task_id: "task_sub_root", question: "q", status: "pending" }],
+        },
+      },
+    });
+    const result = await resolveGate(client, { gateId: "gate_sub", resolution: "approve", run: "run_sub" });
+    expect(result).toMatchObject({ gateId: "gate_sub", resolved: true, runId: "run_sub", taskId: "task_sub_root" });
+    expect(calls[0]).toContain('"run":"run_sub"');
+  });
+
+  it("taskId を渡すと自分の job のゲートか点検し、無関係なら gate_task_mismatch で変更前に拒否する", async () => {
+    // 認可の境界(review10 §3): gate-resolve は「Run ID と Gate ID を知る誰でも」解決できる CLI 構造。
+    // 呼び出し側が「自分の job のゲート」と宣言したなら、その job に属さないゲートを叩かない。
+    const { client, calls } = createFakeClient({
+      gateList: {
+        ok: true,
+        result: {
+          gates: [{ id: "gate_other", run_id: "run_sub", task_id: "task_of_other_job", question: "q", status: "pending" }],
+        },
+      },
+      taskList: {
+        ok: true,
+        result: { tasks: [{ id: "task_cmd", run_id: "run_sub", parent_id: null, status: "dispatched" }] },
+      },
+    });
+    const error = await resolveGate(client, {
+      gateId: "gate_other",
+      resolution: "approve",
+      run: "run_sub",
+      taskId: "task_cmd",
+    }).catch((e) => e);
+    expect(error).toBeInstanceOf(JobError);
+    expect((error as JobError).code).toBe("gate_task_mismatch");
+    expect((error as JobError).detail).toMatchObject({
+      gateId: "gate_other",
+      gateTaskId: "task_of_other_job",
+      requestedTaskId: "task_cmd",
+    });
+    expect(calls.some((call) => call.startsWith("gateResolve:"))).toBe(false);
+    expect(calls.some((call) => call.startsWith("runUse:"))).toBe(false);
+  });
+
+  it("taskId 自身とその部分木(task-create で分解した子)のゲートは解決できる", async () => {
+    const family = {
+      ok: true,
+      result: {
+        tasks: [
+          { id: "task_cmd", run_id: "run_sub", parent_id: null, status: "dispatched" },
+          { id: "task_child", run_id: "run_sub", parent_id: "task_cmd", status: "blocked" },
+        ],
+      },
+    };
+    const gateList = {
+      ok: true,
+      result: { gates: [{ id: "gate_child", run_id: "run_sub", task_id: "task_child", question: "q", status: "pending" }] },
+    };
+
+    const child = createFakeClient({ gateList, taskList: family });
+    const result = await resolveGate(child.client, {
+      gateId: "gate_child",
+      resolution: "approve",
+      run: "run_sub",
+      taskId: "task_cmd",
+    });
+    expect(result).toMatchObject({ gateId: "gate_child", resolved: true, taskId: "task_child" });
+
+    // 自分自身の task のゲートは task-list を読み足しせずに解決できる
+    const own = createFakeClient({
+      gateList: {
+        ok: true,
+        result: { gates: [{ id: "gate_own", run_id: "run_sub", task_id: "task_cmd", question: "q", status: "pending" }] },
+      },
+      taskList: family,
+    });
+    const ownResult = await resolveGate(own.client, {
+      gateId: "gate_own",
+      resolution: "approve",
+      run: "run_sub",
+      taskId: "task_cmd",
+    });
+    expect(ownResult).toMatchObject({ gateId: "gate_own", resolved: true });
+    expect(own.calls.some((call) => call.startsWith("taskList:"))).toBe(false);
   });
 
   it("解決済みの gate には何もしない(冪等)", async () => {
@@ -1481,6 +1665,21 @@ describe("cancelTask(介入)", () => {
     const client = {
       taskList: async () => runningTaskList,
       dispatchShow: async () => ({ ok: true, result: { dispatch: { id: "ctx_42e6925ec35f" } } }),
+      // cancel の探索前提(worker-list / run-list)は揃えた上で fence 失敗を再現する
+      workerList: async () => ({
+        ok: true,
+        result: {
+          workers: [
+            {
+              dispatchId: "ctx_42e6925ec35f",
+              taskId: "task_3208dcf22c18",
+              workerState: "in_progress",
+              agentTerminalHandle: "term_cmd",
+            },
+          ],
+        },
+      }),
+      runList: async () => ({ ok: true, result: { runs: [] } }),
       workerStop: async () => {
         throw new Error("release_unknown");
       },
@@ -1497,6 +1696,42 @@ describe("cancelTask(介入)", () => {
     expect(detail["failedDispatches"]).toEqual(["ctx_42e6925ec35f"]);
     // 実プロセスが止まった保証が無いまま task だけ failed にしていない
     expect(detail["cancelledTasks"]).toEqual([]);
+  });
+
+  it("worker-stop が stop_unknown を返したら停止成功に数えない(cancel_incomplete / fullyStopped: false)", async () => {
+    // 実測 2026-10-14: worker-stop は stop_unknown / processAction: none を返し得る。
+    // dispatch は active のままなので task-update は task_not_startable で落ち、
+    // 「fence 成功 + fullyStopped: true」は誤報になる。
+    const client = {
+      taskList: async () => runningTaskList,
+      dispatchShow: async () => ({ ok: true, result: { dispatch: { id: "ctx_42e6925ec35f" } } }),
+      workerList: async () => ({
+        ok: true,
+        result: {
+          workers: [
+            {
+              dispatchId: "ctx_42e6925ec35f",
+              taskId: "task_3208dcf22c18",
+              workerState: "in_progress",
+              agentTerminalHandle: "term_cmd",
+            },
+          ],
+        },
+      }),
+      runList: async () => ({ ok: true, result: { runs: [] } }),
+      workerStop: async () => ({ ok: true, result: { state: "stop_unknown", processAction: "none" } }),
+      taskUpdate: async () => ({ ok: true, result: {} }),
+    } as unknown as OrcaClient;
+
+    const error = await cancelTask(client, { taskId: "task_3208dcf22c18" }).catch((e) => e);
+    expect(error).toBeInstanceOf(JobError);
+    expect((error as JobError).code).toBe("cancel_incomplete");
+    const detail = (error as JobError).detail as JsonObject;
+    expect(detail["fullyStopped"]).toBe(false);
+    expect(detail["failedDispatches"]).toEqual(["ctx_42e6925ec35f"]);
+    expect(detail["cancelledTasks"]).toEqual([]);
+    // 停止を確定できないことを warning に出す
+    expect(JSON.stringify(detail)).toContain("ctx_42e6925ec35f");
   });
 
   it("子タスクの worker-stop 失敗は warnings に記録し、cancel は進める(fullyStopped: false)", async () => {
@@ -1528,7 +1763,7 @@ describe("cancelTask(介入)", () => {
 
   it("task 行の id を dispatch id と取り違えない(worker-abandon を空打ちしない)", async () => {
     const { client, calls } = createFakeClient({
-      taskList: { ok: true, result: { tasks: [{ id: "task_695cee4c872d", status: "dispatched" }] } },
+      taskList: { ok: true, result: { tasks: [{ id: "task_695cee4c872d", status: "dispatched", run_id: "run_x" }] } },
       dispatchShow: { ok: true, result: { dispatch: null } },
     });
     const result = await cancelTask(client, { taskId: "task_695cee4c872d" });
@@ -1567,6 +1802,15 @@ describe("cancelTask(介入)", () => {
     const client = {
       taskList: async () => runningTaskList,
       dispatchShow: async () => ({ ok: true, result: { dispatch: { id: "ctx_1" } } }),
+      workerList: async () => ({
+        ok: true,
+        result: {
+          workers: [
+            { dispatchId: "ctx_1", taskId: "task_3208dcf22c18", workerState: "in_progress", agentTerminalHandle: "term_cmd" },
+          ],
+        },
+      }),
+      runList: async () => ({ ok: true, result: { runs: [] } }),
       workerStop: async () => ({ ok: true, result: { state: "stopped" } }),
       taskUpdate: async () => {
         throw new OrcaCommandError(
@@ -1752,11 +1996,12 @@ describe("cancelTask(cascade / 子孫への子から順)", () => {
       ok: true,
       result: {
         tasks: [
-          { id: "root", parent_id: null, status: "dispatched" },
+          { id: "root", parent_id: null, status: "dispatched", run_id: "run_x" },
           ...Array.from({ length: 20 }, (_, index) => ({
             id: `child_${index}`,
             parent_id: "root",
             status: "dispatched" as const,
+            run_id: "run_x",
           })),
         ],
       },
@@ -1783,11 +2028,12 @@ describe("cancelTask(cascade / 子孫への子から順)", () => {
       ok: true,
       result: {
         tasks: [
-          { id: "root", parent_id: null, status: "dispatched" },
+          { id: "root", parent_id: null, status: "dispatched", run_id: "run_x" },
           ...Array.from({ length: 11 }, (_, index) => ({
             id: `child_${index}`,
             parent_id: "root",
             status: "dispatched" as const,
+            run_id: "run_x",
           })),
         ],
       },
@@ -1815,6 +2061,8 @@ describe("runMutation(直列化)", () => {
           result: { tasks: [{ id: `task_${runId}`, run_id: runId, status: "dispatched" }] },
         }),
         dispatchShow: async () => ({ ok: true, result: { dispatch: null } }),
+        workerList: async () => ({ ok: true, result: { workers: [] } }),
+        runList: async () => ({ ok: true, result: { runs: [] } }),
         taskUpdate: async (input: JsonObject) => {
           attempts += 1;
           push(`taskUpdate:${JSON.stringify(input)}`);
@@ -1852,6 +2100,40 @@ describe("runMutation(直列化)", () => {
       const owner = call.split("|")[0];
       expect(calls[index + 1] ?? "").toMatch(new RegExp(`^${owner}\\|taskUpdate:`));
     }
+  });
+
+  it("バインドが空のターミナル(run_required)でも run-use でバインドして 1 回再試行する", async () => {
+    const calls: string[] = [];
+    let attempts = 0;
+    const client = {
+      gateList: async () => ({
+        ok: true,
+        result: { gates: [{ id: "gate_1", run_id: "run_gate", task_id: "task_child", status: "pending" }] },
+      }),
+      gateResolve: async (input: JsonObject) => {
+        attempts += 1;
+        calls.push(`gateResolve:${JSON.stringify(input)}`);
+        if (attempts === 1) {
+          throw new OrcaCommandError(
+            { code: "run_required", message: "No Run is bound. Use orchestration run-create or run-use first." },
+            { ok: false, args: ["orchestration", "gate-resolve"], exitCode: 1, stdout: "", stderr: "" },
+          );
+        }
+        return { ok: true, result: {} };
+      },
+      runUse: async (id: string) => {
+        calls.push(`runUse:${id}`);
+        return { ok: true, result: {} };
+      },
+    } as unknown as OrcaClient;
+
+    const result = await resolveGate(client, { gateId: "gate_1", resolution: "approve", run: "run_gate" });
+    expect(result["resolved"]).toBe(true);
+    expect(calls).toEqual([
+      'gateResolve:{"id":"gate_1","resolution":"approve"}',
+      "runUse:run_gate",
+      'gateResolve:{"id":"gate_1","resolution":"approve"}',
+    ]);
   });
 });
 
@@ -1967,5 +2249,814 @@ describe("extractBoundRun", () => {
       extractBoundRun("This coordinator terminal is bound to run_2fd476f310f3, not run_a781f51d4c91."),
     ).toBe("run_2fd476f310f3");
     expect(extractBoundRun("no run here")).toBeUndefined();
+  });
+});
+
+describe("commanderSpec — runId 注入とプレースホルダ漏れ", () => {
+  it("{{runId}} の全箇所を埋め、leaked を返さない(実測で sub-run 逸脱の温床になった文言)", () => {
+    const { spec, leaked } = commanderSpec({ spec: "goal text", repo: "id:repo1" }, "run_abc");
+    expect(leaked).toEqual([]);
+    expect(spec).not.toContain("{{");
+    expect((spec.match(/run_abc/g) ?? []).length).toBeGreaterThanOrEqual(4);
+    expect(spec).toContain("goal text");
+    expect(spec).toContain("id:repo1");
+  });
+
+  it("既定の repo / constraints 文言が入る", () => {
+    const { spec } = commanderSpec({ spec: "goal" }, "run_abc");
+    expect(spec).toContain("the current repository");
+    expect(spec).toContain("- Preserve existing APIs and project conventions.");
+  });
+
+  it("制約の箇条書きが Constraints 欄に入る", () => {
+    const { spec } = commanderSpec({ spec: "goal", constraints: ["マージしない"] }, "run_abc");
+    expect(spec).toContain("- マージしない");
+  });
+});
+
+describe("matchSubRuns — coordinator_handle 照合", () => {
+  const runs: JsonObject[] = [
+    { id: "run_sub", objective: "sub", coordinator_handle: "term_cmd", created_at: "2026-10-13T06:53:49Z" },
+    { id: "run_caller", objective: "caller", coordinator_handle: "term_cmd", created_at: "2026-10-13T06:50:52Z" },
+    { id: "run_orphan", objective: "orphan", coordinator_handle: null, created_at: "2026-10-13T06:54:00Z" },
+    { id: "run_other", objective: "other", coordinator_handle: "term_someone_else", created_at: "2026-10-13T06:54:00Z" },
+    { id: "run_ancient", objective: "ancient", coordinator_handle: "term_cmd", created_at: "2026-01-01T00:00:00Z" },
+  ];
+
+  it("handle 一致の sub-run だけ拾い、呼び出し元 Run 自身 / handle 無し / 他人の Run を除外する", () => {
+    const matched = matchSubRuns(runs, {
+      callerRunId: "run_caller",
+      handles: ["term_cmd"],
+      taskCreatedAt: "2026-10-13 06:50:52",
+    });
+    expect(matched.map((run) => run["runId"])).toEqual(["run_sub"]);
+    expect(matched[0]).toMatchObject({ objective: "sub", coordinatorHandle: "term_cmd" });
+  });
+
+  it("handle が無いと 1 件も拾わない(照合キーが無い)", () => {
+    expect(matchSubRuns(runs, { callerRunId: null, handles: [] })).toEqual([]);
+  });
+
+  it("対象タスクより 24 分以上前に作られた Run は除外する(terminal 再利用の誤マッチ対策)", () => {
+    const matched = matchSubRuns(runs, {
+      callerRunId: "run_caller",
+      handles: ["term_cmd", "term_none"],
+      taskCreatedAt: "2026-10-13 06:50:52",
+    });
+    expect(matched.map((run) => run["runId"])).not.toContain("run_ancient");
+  });
+
+  it("照合できる Run は MAX_SUB_RUNS 件で打ち切る", () => {
+    const many = Array.from({ length: 8 }, (_, index) => ({
+      id: `run_sub_${index}`,
+      coordinator_handle: "term_cmd",
+      created_at: "2026-10-13T06:53:49Z",
+    }));
+    expect(matchSubRuns(many, { callerRunId: null, handles: ["term_cmd"] })).toHaveLength(MAX_SUB_RUNS);
+  });
+});
+
+describe("selectSubRunRoots — sub-run 内の root 特定", () => {
+  // 実測: Commander は sub-run 内で新しい root を作り、子 6 件はその root を指す
+  // (呼び出し元 Run の Commander task を指す parent_id は使われない)
+  const tasks: JsonObject[] = [
+    { id: "task_root", parent_id: null, created_by_terminal_handle: "term_cmd" },
+    { id: "task_child", parent_id: "task_root", created_by_terminal_handle: "term_cmd" },
+    { id: "task_orphan", parent_id: "task_gone", created_by_terminal_handle: "term_cmd" },
+    { id: "task_foreign", parent_id: null, created_by_terminal_handle: "term_other" },
+  ];
+
+  it("sub-run 内に親を持たない行 + Commander の handle が作った行だけを root にする", () => {
+    expect(selectSubRunRoots(tasks, ["term_cmd"]).map((row) => row["id"])).toEqual(["task_root", "task_orphan"]);
+  });
+
+  it("handle が一致しない行は root にしない", () => {
+    expect(selectSubRunRoots(tasks, ["term_nobody"])).toEqual([]);
+  });
+});
+
+describe("extractRuns / toRunRow", () => {
+  it("run-list の result.runs[] と run-show の result.run 両方から取り出す", () => {
+    expect(
+      extractRuns({ ok: true, result: { runs: [{ id: "run_a" }, { id: "run_b" }] } }).map((run) => run["id"]),
+    ).toEqual(["run_a", "run_b"]);
+    expect(extractRuns({ ok: true, result: { run: { id: "run_one" } } })).toHaveLength(1);
+    expect(extractRuns({ ok: true })).toEqual([]);
+  });
+
+  it("キー名の揺れを吸収して正規化する", () => {
+    expect(
+      toRunRow({ runId: "run_a", objective: "goal", coordinatorHandle: "term_x", created_at: "2026-10-13T06:53:49Z" }),
+    ).toMatchObject({ runId: "run_a", objective: "goal", coordinatorHandle: "term_x", createdAt: "2026-10-13T06:53:49Z" });
+    expect(toRunRow({}).coordinatorHandle).toBeNull();
+  });
+});
+
+/** sub-run を持つ family の fake client(実測ペイロードの形に寄せる)。 */
+function createSubRunClient(options: { runs?: JsonObject[] } = {}) {
+  const calls: string[] = [];
+  // workerStop を叩いた dispatch は「stopped」に変わる(停止後の読み直しを実データにするため)
+  const stoppedDispatches = new Set<string>();
+  const callerTasks: JsonObject[] = [
+    {
+      id: "task_cmd",
+      run_id: "run_caller",
+      parent_id: null,
+      status: "dispatched",
+      assignee_handle: "term_cmd",
+      created_at: "2026-10-13 06:50:52",
+    },
+  ];
+  const subTasks: JsonObject[] = [
+    {
+      id: "task_sub_root",
+      run_id: "run_sub",
+      parent_id: null,
+      created_by_terminal_handle: "term_cmd",
+      // 実測で一致した来歴(terminal list の tabId:leafId / ptyId:incarnationId)
+      created_by_pane_key: "tab_1:leaf_1",
+      created_by_process_incarnation: "pty_1:inc_1",
+      status: "blocked",
+      result: "blocked: 承認ゲート待ち",
+      created_at: "2026-10-13 06:55:24",
+    },
+    {
+      id: "task_sub_a",
+      run_id: "run_sub",
+      parent_id: "task_sub_root",
+      created_by_terminal_handle: "term_cmd",
+      status: "completed",
+      result: "core.md 完成",
+    },
+    {
+      id: "task_sub_b",
+      run_id: "run_sub",
+      parent_id: "task_sub_root",
+      created_by_terminal_handle: "term_cmd",
+      status: "dispatched",
+    },
+  ];
+  const dispatchesByTask: Record<string, string> = {
+    task_cmd: "disp_cmd",
+    task_sub_root: "disp_root",
+    task_sub_a: "disp_a",
+    task_sub_b: "disp_b",
+  };
+  const client = {
+    taskList: async (input: JsonObject) => {
+      const run = input["run"];
+      calls.push(`taskList:${run ?? "bind"}`);
+      return { ok: true, result: { tasks: run === "run_sub" ? subTasks : callerTasks } };
+    },
+    runList: async (input: JsonObject) => {
+      calls.push(`runList:${JSON.stringify(input)}`);
+      // 実測の keyset cursor: 2 ページ目以降は空で終端する
+      if (input["cursor"] !== undefined) {
+        return { ok: true, result: { runs: [] } };
+      }
+      return {
+        ok: true,
+        result: {
+          runs: options.runs ?? [
+            { id: "run_sub", objective: "sub", coordinator_handle: "term_cmd", created_at: "2026-10-13T06:53:49Z" },
+            { id: "run_caller", objective: "caller", coordinator_handle: "term_cmd", created_at: "2026-10-13T06:50:52Z" },
+            { id: "run_orphan", objective: "orphan", coordinator_handle: null, created_at: "2026-10-13T06:54:00Z" },
+          ],
+          nextCursor: "cursor_1",
+        },
+      };
+    },
+    dispatchShow: async (task: string) => {
+      calls.push(`dispatchShow:${task}`);
+      const dispatchId = dispatchesByTask[task];
+      return { ok: true, result: { dispatch: dispatchId === undefined ? null : { id: dispatchId } } };
+    },
+    workerList: async (input: JsonObject) => {
+      const run = input["run"];
+      calls.push(`workerList:${run ?? "bind"}`);
+      const rows =
+        run === "run_sub"
+          ? [
+              { dispatchId: "disp_a", taskId: "task_sub_a", workerState: "succeeded", agentTerminalHandle: "term_wa" },
+              { dispatchId: "disp_b", taskId: "task_sub_b", workerState: "in_progress", agentTerminalHandle: "term_wb" },
+            ]
+          : [{ dispatchId: "disp_cmd", taskId: "task_cmd", workerState: "in_progress", agentTerminalHandle: "term_cmd" }];
+      return {
+        ok: true,
+        result: {
+          workers: rows.map((row) => ({
+            ...row,
+            workerState: stoppedDispatches.has(row.dispatchId) ? "stopped" : row.workerState,
+          })),
+        },
+      };
+    },
+    gateList: async (input: JsonObject) => {
+      const run = input["run"];
+      calls.push(`gateList:${run ?? "bind"}`);
+      return {
+        ok: true,
+        result: {
+          gates:
+            run === "run_sub"
+              ? [{ id: "gate_sub", task_id: "task_sub_b", status: "pending", question: "merge してよい?" }]
+              : [],
+        },
+      };
+    },
+    workerRead: async (input: JsonObject) => {
+      const dispatch = String(input["dispatch"]);
+      calls.push(`workerRead:${dispatch}`);
+      return { ok: true, result: { text: `output of ${dispatch}`, source: "transcript" } };
+    },
+    workerStop: async (dispatch: string) => {
+      calls.push(`workerStop:${dispatch}`);
+      stoppedDispatches.add(dispatch);
+      return { ok: true, result: { state: "stopped" } };
+    },
+    taskUpdate: async (input: JsonObject) => {
+      calls.push(`taskUpdate:${JSON.stringify(input)}`);
+      return { ok: true, result: {} };
+    },
+    runUse: async (runId: string) => {
+      calls.push(`runUse:${runId}`);
+      return { ok: true, result: {} };
+    },
+    terminalList: async () => ({
+      ok: true,
+      result: {
+        terminals: [{ handle: "term_cmd", tabId: "tab_1", leafId: "leaf_1", ptyId: "pty_1", incarnationId: "inc_1" }],
+      },
+    }),
+  };
+  return { client: client as unknown as OrcaClient, calls };
+}
+
+describe("getTaskStatus(poll) — sub-run の自動集約", () => {
+  it("呼び出し元 Run に見えない sub-run の子を children に sourceRunId 付きで合算する", async () => {
+    const { client, calls } = createSubRunClient();
+    const view = await getTaskStatus(client, { taskId: "task_cmd", run: "run_caller" });
+
+    // 実測の事故: 呼び出し元 Run の poll は childCount: 0 を返していた
+    expect(view["childCount"]).toBe(1);
+    const children = view["children"] as JsonObject[];
+    expect(children[0]).toMatchObject({
+      taskId: "task_sub_root",
+      state: "blocked",
+      sourceRunId: "run_sub",
+    });
+    expect(view["subRunsDiscovered"]).toBe(1);
+    expect((view["subRuns"] as JsonObject[])[0]).toMatchObject({
+      runId: "run_sub",
+      coordinatorHandle: "term_cmd",
+      taskCount: 3,
+      rootTaskIds: ["task_sub_root"],
+    });
+    expect(view["warnings"]).toEqual([]);
+    expect(calls).toContain("runList:" + JSON.stringify({ limit: 50 }));
+    expect(calls.some((call) => call === "taskList:run_sub")).toBe(true);
+  });
+
+  it("sub-run のゲートも gates に出し、phase を decision_gate にする", async () => {
+    const { client } = createSubRunClient();
+    const view = await getTaskStatus(client, { taskId: "task_cmd", run: "run_caller" });
+    const gates = view["gates"] as JsonObject[];
+    expect(gates.map((gate) => gate["id"])).toEqual(["gate_sub"]);
+    // 実測の欠陥: gate に所属 Run が無いと orca_resolve_gate の run が決まらない。
+    // gate 行の run_id が無い CLI 版でも、照合した sub-run 名義で補完する。
+    expect(gates[0]).toMatchObject({ id: "gate_sub", runId: "run_sub", taskId: "task_sub_b" });
+    expect(view["phase"]).toBe("decision_gate");
+    const gateReason = (view["blockedReasons"] as JsonObject[]).find((reason) => reason["kind"] === "gate");
+    expect(gateReason).toMatchObject({ taskId: "task_sub_b", role: "child" });
+    expect(gateReason?.["detail"]).toMatchObject({ gateId: "gate_sub", runId: "run_sub" });
+  });
+
+  it("includeSubRuns: false なら run-list を読まない(呼び出し元 Run だけ)", async () => {
+    const { client, calls } = createSubRunClient();
+    const view = await getTaskStatus(client, { taskId: "task_cmd", run: "run_caller", includeSubRuns: false });
+    expect(calls.some((call) => call.startsWith("runList:"))).toBe(false);
+    expect(view["childCount"]).toBe(0);
+    expect(view["subRunsDiscovered"]).toBe(0);
+  });
+
+  it("run-list が読めなくても poll は壊さず warning だけ添える", async () => {
+    const { client } = createSubRunClient();
+    client.runList = (async () => {
+      throw new Error("runtime_unavailable");
+    }) as unknown as typeof client.runList;
+    const view = await getTaskStatus(client, { taskId: "task_cmd", run: "run_caller" });
+    expect(view["state"]).toBe("running");
+    expect((view["warnings"] as string[]).join("|")).toContain("run-list");
+  });
+
+  it("worker / dispatch が無い queued では sub-run 探索を走らせない", async () => {
+    const { client, calls } = createSubRunClient();
+    client.taskList = (async () => ({
+      ok: true,
+      result: { tasks: [{ id: "task_cmd", run_id: "run_caller", status: "ready" }] },
+    })) as unknown as typeof client.taskList;
+    client.dispatchShow = (async () => ({ ok: true, result: { dispatch: null } })) as unknown as typeof client.dispatchShow;
+    client.workerList = (async () => ({ ok: true, result: { workers: [] } })) as unknown as typeof client.workerList;
+    const view = await getTaskStatus(client, { taskId: "task_cmd", run: "run_caller" });
+    expect(calls.some((call) => call.startsWith("runList:"))).toBe(false);
+    expect(view["subRunsDiscovered"]).toBe(0);
+    expect(view["state"]).toBe("queued");
+  });
+});
+
+describe("cancelTask — sub-run まで止める cascade", () => {
+  it("sub-run の部分金を呼び出し元 Run の Commander より先に、子から順に止める", async () => {
+    const { client, calls } = createSubRunClient();
+    const result = await cancelTask(client, { taskId: "task_cmd", run: "run_caller" });
+
+    expect(result["cancelled"]).toBe(true);
+    expect(result["fullyStopped"]).toBe(true);
+    expect(result["subRunsDiscovered"]).toBe(1);
+
+    // 終端(completed)の子は触らない = task_sub_a は更新も fence もしない
+    const updates = calls.filter((call) => call.startsWith("taskUpdate:"));
+    expect(updates.map((call) => (call.match(/"id":"(\w+)"/) ?? [])[1])).toEqual([
+      "task_sub_b",
+      "task_sub_root",
+      "task_cmd",
+    ]);
+    expect(calls).not.toContain("workerStop:disp_a");
+    expect(calls).toContain("workerStop:disp_b");
+    expect(calls).toContain("workerStop:disp_root");
+    expect(calls).toContain("workerStop:disp_cmd");
+    // Commander を止めるのは sub-run の worker より後(子が先)
+    expect(calls.indexOf("workerStop:disp_b")).toBeLessThan(calls.indexOf("workerStop:disp_cmd"));
+    expect(calls.indexOf("workerStop:disp_root")).toBeLessThan(calls.indexOf("workerStop:disp_cmd"));
+    // sub-run のタスクは sub-run 名義で叩いている(task-update の Run スコープ)
+    expect(updates[0]).toContain('"run":"run_sub"');
+    expect(updates[updates.length - 1]).toContain('"run":"run_caller"');
+    expect((result["tasks"] as JsonObject[]).map((row) => row["taskId"])).toEqual([
+      "task_sub_b",
+      "task_sub_root",
+      "task_cmd",
+    ]);
+  });
+
+  it("includeSubRuns: false は sub-run を対象にしない(後方互換の逃げ道)", async () => {
+    const { client, calls } = createSubRunClient();
+    const result = await cancelTask(client, { taskId: "task_cmd", run: "run_caller", includeSubRuns: false });
+    expect(calls.some((call) => call.startsWith("runList:"))).toBe(false);
+    expect(result["subRunsDiscovered"]).toBe(0);
+    expect(result["taskCount"]).toBe(1);
+  });
+
+  it("sub-run 込みで上限を超えたら何も変更する前に断る", async () => {
+    const { client, calls } = createSubRunClient();
+    const many = Array.from({ length: 12 }, (_, index) => ({
+      id: `task_sub_${index}`,
+      run_id: "run_sub",
+      parent_id: "task_sub_root",
+      created_by_terminal_handle: "term_cmd",
+      status: "dispatched" as const,
+    }));
+    client.taskList = (async (input: JsonObject) => {
+      const run = input["run"];
+      calls.push(`taskList:${run ?? "bind"}`);
+      return {
+        ok: true,
+        result: {
+          tasks:
+            run === "run_sub"
+              ? [
+                  {
+                    id: "task_sub_root",
+                    run_id: "run_sub",
+                    parent_id: null,
+                    created_by_terminal_handle: "term_cmd",
+                    created_by_pane_key: "tab_1:leaf_1",
+                    created_by_process_incarnation: "pty_1:inc_1",
+                    status: "dispatched",
+                  },
+                  ...many,
+                ]
+              : [{ id: "task_cmd", run_id: "run_caller", parent_id: null, status: "dispatched", assignee_handle: "term_cmd" }],
+        },
+      };
+    }) as unknown as typeof client.taskList;
+
+    const error = await cancelTask(client, { taskId: "task_cmd", run: "run_caller" }).catch((e) => e);
+    expect(error).toBeInstanceOf(JobError);
+    expect((error as JobError).code).toBe("cancel_scope_too_large");
+    expect((error as JobError).detail).toMatchObject({ taskCount: 14, subRunsDiscovered: 1 });
+    // 部分 cancel をしない = 変更系コマンドを 1 回も叩いていない
+    expect(calls.some((call) => call.startsWith("taskUpdate:"))).toBe(false);
+    expect(calls.some((call) => call.startsWith("workerStop:"))).toBe(false);
+  });
+});
+
+describe("getTaskResult(result) — sub-run の成果集約", () => {
+  it("includeChildren: true は sub-run の子タスクも sourceRunId 付きで集約する", async () => {
+    const { client } = createSubRunClient();
+    const result = await getTaskResult(client, { taskId: "task_cmd", run: "run_caller", includeChildren: true });
+
+    const children = result["children"] as JsonObject[];
+    expect(children.map((child) => child["taskId"])).toEqual(["task_sub_root"]);
+    expect(children[0]).toMatchObject({ sourceRunId: "run_sub", state: "blocked" });
+    expect(result["subRunsDiscovered"]).toBe(1);
+  });
+
+  it("既定(includeChildren: false)は sub-run を読まない", async () => {
+    const { client, calls } = createSubRunClient();
+    const result = await getTaskResult(client, { taskId: "task_cmd", run: "run_caller" });
+    expect(result["children"]).toEqual([]);
+    expect(calls.some((call) => call.startsWith("runList:"))).toBe(false);
+  });
+});
+
+describe("parseParentMarker / buildTerminalIdentities — 発見の候補と来歴", () => {
+  it("objective のマーカーから親の run / task を取り出す", () => {
+    expect(parseParentMarker(`orca-mcp-parent: run=run_caller task=task_cmd\nsub job`)).toEqual({
+      runId: "run_caller",
+      taskId: "task_cmd",
+    });
+    expect(parseParentMarker("orca-mcp-parent: run=run_x")).toEqual({ runId: "run_x", taskId: null });
+    expect(parseParentMarker("sub job")).toBeNull();
+  });
+
+  it("terminal list から handle → pane key / incarnation の対応表を作る", () => {
+    const identities = buildTerminalIdentities({
+      ok: true,
+      result: {
+        terminals: [
+          { handle: "term_cmd", tabId: "t1", leafId: "l1", ptyId: "p1", incarnationId: "i1" },
+          { tabId: "t2" },
+        ],
+      },
+    });
+    expect(identities.get("term_cmd")).toMatchObject({ tabId: "t1", leafId: "l1", ptyId: "p1", incarnationId: "i1" });
+    expect(identities.size).toBe(1);
+  });
+});
+
+describe("classifySubRunOwnership — handle 一致だけでは verified にしない", () => {
+  const terminals = buildTerminalIdentities({
+    ok: true,
+    result: { terminals: [{ handle: "term_cmd", tabId: "t1", leafId: "l1", ptyId: "p1", incarnationId: "i1" }] },
+  });
+  const run: JsonObject = { runId: "run_sub", coordinatorHandle: "term_cmd", objective: "sub" };
+  const root: JsonObject = {
+    id: "task_sub_root",
+    created_by_terminal_handle: "term_cmd",
+    created_by_pane_key: "t1:l1",
+    created_by_process_incarnation: "p1:i1",
+  };
+
+  it("pane key と incarnation が揃って一致すれば verified(auto-cancel の対象)", () => {
+    const verdict = classifySubRunOwnership({
+      run,
+      roots: [root],
+      handles: ["term_cmd"],
+      callerRunId: "run_caller",
+      terminals,
+    });
+    expect(verdict.ownership).toBe("verified");
+    expect(verdict.cancelEligible).toBe(true);
+    expect(verdict.source).toBe("provenance");
+  });
+
+  it("来歴が読めない handle 一致は probable(破壊的操作には使わない)", () => {
+    const verdict = classifySubRunOwnership({
+      run,
+      roots: [{ id: "task_sub_root", created_by_terminal_handle: "term_cmd" }],
+      handles: ["term_cmd"],
+      callerRunId: "run_caller",
+      terminals: new Map(),
+    });
+    expect(verdict.ownership).toBe("probable");
+    expect(verdict.cancelEligible).toBe(false);
+  });
+
+  it("pane key が一致しても incarnation が違えば conflicting", () => {
+    const verdict = classifySubRunOwnership({
+      run,
+      roots: [{ ...root, created_by_process_incarnation: "p9:i9" }],
+      handles: ["term_cmd"],
+      callerRunId: "run_caller",
+      terminals,
+    });
+    expect(verdict.ownership).toBe("conflicting");
+    expect(verdict.cancelEligible).toBe(false);
+  });
+
+  it("objective のマーカーは来歴と組み合わせてだけ使う(別の Run を指したら conflicting)", () => {
+    const verdict = classifySubRunOwnership({
+      run: { ...run, objective: "orca-mcp-parent: run=run_other task=task_x" },
+      roots: [root],
+      handles: ["term_cmd"],
+      callerRunId: "run_caller",
+      terminals,
+    });
+    expect(verdict.ownership).toBe("conflicting");
+    expect(verdict.verificationReasons.join("|")).toContain("別の Run");
+  });
+
+  it("マーカーだけでは verified にしない(来歴が読めなければ probable)", () => {
+    const verdict = classifySubRunOwnership({
+      run: { ...run, objective: "orca-mcp-parent: run=run_caller task=task_cmd" },
+      roots: [{ id: "task_sub_root", created_by_terminal_handle: "term_cmd" }],
+      handles: ["term_cmd"],
+      callerRunId: "run_caller",
+      terminals: new Map(),
+    });
+    expect(verdict.ownership).toBe("probable");
+    expect(verdict.source).toBe("explicit");
+  });
+
+  it("coordinator_handle が Commander の handle でなければ unverified", () => {
+    const verdict = classifySubRunOwnership({
+      run: { ...run, coordinatorHandle: "term_other" },
+      roots: [root],
+      handles: ["term_cmd"],
+      callerRunId: "run_caller",
+      terminals,
+    });
+    expect(verdict.ownership).toBe("unverified");
+    expect(verdict.cancelEligible).toBe(false);
+  });
+});
+
+describe("getTaskStatus(poll) — sub-run の所有判定とスキャンの完全性", () => {
+  it("subRuns に ownership / cancelEligible / verificationReasons を載せる", async () => {
+    const { client } = createSubRunClient();
+    const view = await getTaskStatus(client, { taskId: "task_cmd", run: "run_caller" });
+    const sub = (view["subRuns"] as JsonObject[])[0]!;
+    expect(sub).toMatchObject({
+      runId: "run_sub",
+      ownership: "verified",
+      cancelEligible: true,
+      discoverySource: "provenance",
+    });
+    expect((sub["verificationReasons"] as string[]).join("|")).toContain("pane key");
+    expect(view["subRunOwnershipComplete"]).toBe(true);
+  });
+
+  it("run-list を cursor でページングし、読み切った件数を応答に載せる", async () => {
+    const { client, calls } = createSubRunClient();
+    const view = await getTaskStatus(client, { taskId: "task_cmd", run: "run_caller" });
+    expect(view["subRunScanComplete"]).toBe(true);
+    expect(view["subRunScanPageCount"]).toBe(2);
+    expect(view["subRunScanRunCount"]).toBe(3);
+    const runListCalls = calls.filter((call) => call.startsWith("runList:"));
+    expect(runListCalls).toHaveLength(2);
+    expect(runListCalls[1]).toContain('"cursor":"cursor_1"');
+  });
+
+  it("来歴が読めない sub-run は probable とし、ownershipComplete を false にする", async () => {
+    const { client } = createSubRunClient();
+    client.terminalList = (async () => ({ ok: true, result: { terminals: [] } })) as unknown as typeof client.terminalList;
+    const view = await getTaskStatus(client, { taskId: "task_cmd", run: "run_caller" });
+    expect((view["subRuns"] as JsonObject[])[0]).toMatchObject({ ownership: "probable", cancelEligible: false });
+    expect(view["subRunOwnershipComplete"]).toBe(false);
+    expect(view["warnings"]).toEqual([]);
+  });
+
+  it("run-list をページ上限で打ち切ったら scanComplete: false + warning", async () => {
+    const { client } = createSubRunClient();
+    let seen = 0;
+    client.runList = (async () => {
+      seen += 1;
+      return {
+        ok: true,
+        result: {
+          runs: [{ id: "run_x", objective: "x", coordinator_handle: "term_other", created_at: "2026-10-13T06:53:49Z" }],
+          // 毎回新しい cursor を返す = 上限(MAX_SCAN_PAGES)まで歩き続ける
+          nextCursor: `cursor_next_${seen}`,
+        },
+      };
+    }) as unknown as typeof client.runList;
+    const view = await getTaskStatus(client, { taskId: "task_cmd", run: "run_caller" });
+    expect(view["subRunScanComplete"]).toBe(false);
+    expect(view["subRunScanPageCount"]).toBe(5);
+    expect((view["warnings"] as string[]).join("|")).toContain("打ち切りました(ページ上限に到達)");
+  });
+
+  it("同じ cursor が戻るページングはループとして打ち切る(無限に読み続けない)", async () => {
+    const { client } = createSubRunClient();
+    client.runList = (async () => ({
+      ok: true,
+      result: {
+        runs: [{ id: "run_x", objective: "x", coordinator_handle: "term_other", created_at: "2026-10-13T06:53:49Z" }],
+        nextCursor: "cursor_same",
+      },
+    })) as unknown as typeof client.runList;
+    const view = await getTaskStatus(client, { taskId: "task_cmd", run: "run_caller" });
+    expect(view["subRunScanComplete"]).toBe(false);
+    expect(view["subRunScanPageCount"]).toBe(2);
+    expect((view["warnings"] as string[]).join("|")).toContain("同じ cursor が戻った(ループ)");
+  });
+
+  it("hasMore: true に対して nextCursor が無い応答は打ち切りとして出す", async () => {
+    const { client } = createSubRunClient();
+    client.runList = (async () => ({
+      ok: true,
+      result: {
+        runs: [{ id: "run_x", objective: "x", coordinator_handle: "term_other", created_at: "2026-10-13T06:53:49Z" }],
+        page: { hasMore: true },
+      },
+    })) as unknown as typeof client.runList;
+    const view = await getTaskStatus(client, { taskId: "task_cmd", run: "run_caller" });
+    expect(view["subRunScanComplete"]).toBe(false);
+    expect((view["warnings"] as string[]).join("|")).toContain("hasMore: true に対して nextCursor が無い");
+  });
+});
+
+describe("cancelTask — 所有検証・dispatch 重複・停止後の読み直し", () => {
+  it("所有が verified でない sub-run があれば preflight で断る(何も変更しない)", async () => {
+    const { client, calls } = createSubRunClient();
+    client.terminalList = (async () => ({ ok: true, result: { terminals: [] } })) as unknown as typeof client.terminalList;
+    const error = await cancelTask(client, { taskId: "task_cmd", run: "run_caller" }).catch((e) => e);
+    expect(error).toBeInstanceOf(JobError);
+    expect((error as JobError).code).toBe("cancel_ownership_unverified");
+    expect((error as JobError).detail).toMatchObject({
+      subRuns: [{ runId: "run_sub", ownership: "probable", cancelEligible: false }],
+    });
+    expect(calls.some((call) => call.startsWith("workerStop:"))).toBe(false);
+    expect(calls.some((call) => call.startsWith("taskUpdate:"))).toBe(false);
+    expect(calls.some((call) => call.startsWith("runUse:"))).toBe(false);
+  });
+
+  it("停止後も worker が残っていれば fullyStopped: false で正直に返す", async () => {
+    const { client } = createSubRunClient();
+    // workerStop を叩いても worker-list は in_progress を返し続ける(= 実際に止まっていない)
+    client.workerList = (async (input: JsonObject) => ({
+      ok: true,
+      result: {
+        workers:
+          input["run"] === "run_sub"
+            ? [{ dispatchId: "disp_b", taskId: "task_sub_b", workerState: "in_progress" }]
+            : [{ dispatchId: "disp_cmd", taskId: "task_cmd", workerState: "in_progress" }],
+      },
+    })) as unknown as typeof client.workerList;
+
+    const result = await cancelTask(client, { taskId: "task_cmd", run: "run_caller" });
+    expect(result["cancelled"]).toBe(true);
+    expect(result["fullyStopped"]).toBe(false);
+    expect((result["residualWorkers"] as JsonObject[]).map((row) => row["taskId"])).toEqual(["task_cmd", "task_sub_b"]);
+    expect((result["warnings"] as string[]).join("|")).toContain("生存");
+  });
+
+  it("同じ dispatch を 2 回叩かない(sub-run 集約と task ツリーが同じ dispatch を持つ)", async () => {
+    const { client, calls } = createSubRunClient();
+    client.dispatchShow = (async (task: string) => ({
+      ok: true,
+      result: { dispatch: { id: task === "task_sub_b" ? "disp_b" : "disp_shared" } },
+    })) as unknown as typeof client.dispatchShow;
+
+    await cancelTask(client, { taskId: "task_cmd", run: "run_caller" });
+    expect(calls.filter((call) => call === "workerStop:disp_shared")).toHaveLength(1);
+  });
+
+  it("worker-list をページ上限で打ち切ったら subRunWorkerScanComplete: false + fullyStopped: false", async () => {
+    // review10 §1: worker 行の取りこぼしは停止漏れなので、打ち切りを完走として扱わない。
+    const { client } = createSubRunClient();
+    let seen = 0;
+    client.workerList = (async (input: JsonObject) => {
+      const run = input["run"];
+      const rows =
+        run === "run_sub"
+          ? [
+              { dispatchId: "disp_a", taskId: "task_sub_a", workerState: "stopped" },
+              { dispatchId: "disp_b", taskId: "task_sub_b", workerState: "stopped" },
+            ]
+          : [{ dispatchId: "disp_cmd", taskId: "task_cmd", workerState: "stopped" }];
+      if (run !== "run_sub") {
+        return { ok: true, result: { workers: rows } };
+      }
+      seen += 1;
+      // hasMore: true が続く = 3 ページ(MAX_WORKER_PAGES)で打ち切る
+      return { ok: true, result: { workers: rows, page: { hasMore: true, nextCursor: `cursor_${seen}` } } };
+    }) as unknown as typeof client.workerList;
+
+    const result = await cancelTask(client, { taskId: "task_cmd", run: "run_caller" });
+    expect(result["cancelled"]).toBe(true);
+    expect(result["subRunWorkerScanComplete"]).toBe(false);
+    expect(result["fullyStopped"]).toBe(false);
+    expect((result["residualWorkers"] as JsonObject[]).map((row) => row["status"])).toContain("scan_incomplete");
+    expect((result["warnings"] as string[]).join("|")).toContain("worker-list を 3 ページで打ち切りました");
+  });
+
+  it("cancel 前提の worker-list が読めなければ preflight で断る(cancel_discovery_incomplete / 変更ゼロ)", async () => {
+    // review10 §2: 探索の前提が欠けたまま進めると、見落とした worker を走りたまま cancelled: true で返す。
+    const { client, calls } = createSubRunClient();
+    client.workerList = (async () => {
+      throw new Error("worker list unavailable");
+    }) as unknown as typeof client.workerList;
+
+    const error = await cancelTask(client, { taskId: "task_cmd", run: "run_caller" }).catch((e) => e);
+    expect(error).toBeInstanceOf(JobError);
+    expect((error as JobError).code).toBe("cancel_discovery_incomplete");
+    expect((error as JobError).detail).toMatchObject({
+      taskId: "task_cmd",
+      runId: "run_caller",
+    });
+    expect((((error as JobError).detail as JsonObject)["discoveryFailures"] as string[]).join("|")).toContain("worker-list");
+    expect(calls.some((call) => call.startsWith("workerStop:"))).toBe(false);
+    expect(calls.some((call) => call.startsWith("taskUpdate:"))).toBe(false);
+    expect(calls.some((call) => call.startsWith("runUse:"))).toBe(false);
+  });
+
+  it("sub-run 探索の run-list が読めなければ preflight で断る(「sub-run は無い」と言わない)", async () => {
+    const { client, calls } = createSubRunClient();
+    client.runList = (async () => {
+      throw new Error("run list unavailable");
+    }) as unknown as typeof client.runList;
+
+    const error = await cancelTask(client, { taskId: "task_cmd", run: "run_caller" }).catch((e) => e);
+    expect(error).toBeInstanceOf(JobError);
+    expect((error as JobError).code).toBe("cancel_discovery_incomplete");
+    expect((error as JobError).detail).toMatchObject({ subRunScanComplete: false });
+    expect(calls.some((call) => call.startsWith("workerStop:"))).toBe(false);
+    expect(calls.some((call) => call.startsWith("taskUpdate:"))).toBe(false);
+  });
+
+  it("cascade: false / includeSubRuns: false なら探索を走らせない(逃げ道は生かす)", async () => {
+    const { client, calls } = createSubRunClient();
+    client.workerList = (async () => {
+      throw new Error("worker list unavailable");
+    }) as unknown as typeof client.workerList;
+
+    const cascadeOff = await cancelTask(client, { taskId: "task_cmd", run: "run_caller", cascade: false });
+    expect(cascadeOff["cancelled"]).toBe(true);
+
+    const subRunsOff = await cancelTask(client, { taskId: "task_cmd", run: "run_caller", includeSubRuns: false });
+    expect(subRunsOff["cancelled"]).toBe(true);
+    expect(calls.some((call) => call.startsWith("runList:"))).toBe(false);
+  });
+
+  it("workerList を持たない client では cascade cancel を安全側で断る(成功扱いしない)", async () => {
+    // review11 §4: 「探索機能が走れない」を完全成功の経路にしない。
+    const calls: string[] = [];
+    const client = {
+      taskList: async () => ({
+        ok: true,
+        result: { tasks: [{ id: "task_cmd", run_id: "run_caller", status: "dispatched", dispatch_id: "disp_cmd" }] },
+      }),
+      dispatchShow: async () => ({ ok: true, result: { dispatch: { id: "disp_cmd" } } }),
+      runList: async () => ({ ok: true, result: { runs: [] } }),
+      workerStop: async (dispatch: string) => {
+        calls.push(`workerStop:${dispatch}`);
+        return { ok: true, result: { state: "stopped" } };
+      },
+      taskUpdate: async (input: JsonObject) => {
+        calls.push(`taskUpdate:${JSON.stringify(input)}`);
+        return { ok: true, result: {} };
+      },
+    } as unknown as OrcaClient;
+
+    const error = await cancelTask(client, { taskId: "task_cmd", run: "run_caller" }).catch((e) => e);
+    expect(error).toBeInstanceOf(JobError);
+    expect((error as JobError).code).toBe("cancel_discovery_incomplete");
+    expect((((error as JobError).detail as JsonObject)["discoveryFailures"] as string[]).join("|")).toContain("workerList");
+    expect(calls).toEqual([]);
+
+    // 逃げ道(cascade: false)は従来どおり通す
+    const escape = await cancelTask(client, { taskId: "task_cmd", run: "run_caller", cascade: false });
+    expect(escape["cancelled"]).toBe(true);
+  });
+
+  it("呼び出し元 Run の worker-list がページ上限に到達したら cancel 前に拒否する(変更ゼロ)", async () => {
+    // review11 §5: worker 行を取りこぼしたまま「全部止めた」を返さない。
+    const { client, calls } = createSubRunClient();
+    let seen = 0;
+    client.workerList = (async (input: JsonObject) => {
+      const run = input["run"];
+      const rows =
+        run === "run_sub"
+          ? [
+              { dispatchId: "disp_a", taskId: "task_sub_a", workerState: "stopped", agentTerminalHandle: "term_wa" },
+              { dispatchId: "disp_b", taskId: "task_sub_b", workerState: "stopped", agentTerminalHandle: "term_wb" },
+            ]
+          : [{ dispatchId: "disp_cmd", taskId: "task_cmd", workerState: "stopped", agentTerminalHandle: "term_cmd" }];
+      if (run !== "run_caller") {
+        return { ok: true, result: { workers: rows } };
+      }
+      seen += 1;
+      // 呼び出し元 Run の worker-list が hasMore を出し続ける(毎回新しい cursor)
+      return { ok: true, result: { workers: rows, page: { hasMore: true, nextCursor: `caller_cursor_${seen}` } } };
+    }) as unknown as typeof client.workerList;
+
+    const error = await cancelTask(client, { taskId: "task_cmd", run: "run_caller" }).catch((e) => e);
+    expect(error).toBeInstanceOf(JobError);
+    expect((error as JobError).code).toBe("cancel_discovery_incomplete");
+    const failures = ((error as JobError).detail as JsonObject)["discoveryFailures"] as string[];
+    expect(failures.join("|")).toContain("呼び出し元 Run の worker-list を 3 ページで打ち切りました");
+    expect(calls.some((call) => call.startsWith("workerStop:"))).toBe(false);
+    expect(calls.some((call) => call.startsWith("taskUpdate:"))).toBe(false);
+  });
+
+  it("worker-list を読み直せる Run が無い cancel は fullyStopped: false で返す", async () => {
+    // run 名義が無い = 停止後の残存 worker を検証できない(review11 §4 の安全側)。
+    const { client } = createFakeClient({
+      taskList: { ok: true, result: { tasks: [{ id: "task_orphan", status: "dispatched", dispatch_id: "disp_orphan" }] } },
+    });
+    const result = await cancelTask(client, { taskId: "task_orphan", cascade: false });
+    expect(result["cancelled"]).toBe(true);
+    expect(result["fullyStopped"]).toBe(false);
+    expect((result["warnings"] as string[]).join("|")).toContain("worker-list を読み直せる Run");
   });
 });

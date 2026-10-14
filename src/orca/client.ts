@@ -120,6 +120,11 @@ export interface DispatchShowInput {
   from?: string;
 }
 
+export interface RunListInput {
+  limit?: number;
+  cursor?: string;
+}
+
 export interface SendInput {
   subject: string;
   to?: string;
@@ -461,6 +466,22 @@ export class OrcaClient {
   /** `orca orchestration run-create` — オーケストレーション Run の作成。 */
   runCreate(objective: string): Promise<JsonObject> {
     return this.call(["orchestration", "run-create", "--objective", objective]);
+  }
+
+  /**
+   * `orca orchestration run-list` — Run の一覧(read-only)。
+   * 実測応答は `result.runs[]` + `result.nextCursor`(keyset cursor)。
+   */
+  runList(input: RunListInput = {}): Promise<JsonObject> {
+    const args = ["orchestration", "run-list"];
+    if (input.limit !== undefined) args.push("--limit", String(input.limit));
+    if (input.cursor !== undefined) args.push("--cursor", input.cursor);
+    return this.call(args);
+  }
+
+  /** `orca orchestration run-show` — 1 件の Run 詳細(read-only)。 */
+  runShow(runId: string): Promise<JsonObject> {
+    return this.call(["orchestration", "run-show", "--id", runId]);
   }
 
   /** `orca orchestration run-current` — バインド中の Run 表示。 */

@@ -266,20 +266,32 @@ describe("OrcaClient の引数組み立て", () => {
     expect(calls[0]).toEqual(["skills", "installed", "--json"]);
   });
 
-  it("dispatch-show は --preamble / --from を任意で付与する", async () => {
+  it("run-list / run-show は読み取り専用の argv を組み立てる", async () => {
     const { runner, calls } = createMockRunner();
     const client = new OrcaClient(runner);
-    await client.dispatchShow("t1");
-    expect(calls[0]).toEqual(["orchestration", "dispatch-show", "--task", "t1", "--json"]);
-    await client.dispatchShow("t1", { preamble: true, from: "term_1" });
-    expect(calls[1]).toEqual([
+    await client.runList();
+    expect(calls[0]).toEqual(["orchestration", "run-list", "--json"]);
+    await client.runList({ limit: 50, cursor: "abc" });
+    expect(calls[1]).toEqual(["orchestration", "run-list", "--limit", "50", "--cursor", "abc", "--json"]);
+    await client.runShow("run_8d1d20524d42");
+    expect(calls[2]).toEqual(["orchestration", "run-show", "--id", "run_8d1d20524d42", "--json"]);
+  });
+
+  it("worker-start は --run を渡せる(sub-run 外でも同じ Run に置ける)", async () => {
+    const { runner, calls } = createMockRunner();
+    const client = new OrcaClient(runner);
+    await client.workerStart({ task: "t1", agent: "codex", worktree: "new-child", run: "run_caller" });
+    expect(calls[0]).toEqual([
       "orchestration",
-      "dispatch-show",
+      "worker-start",
       "--task",
       "t1",
-      "--preamble",
-      "--from",
-      "term_1",
+      "--worktree",
+      "new-child",
+      "--agent",
+      "codex",
+      "--run",
+      "run_caller",
       "--json",
     ]);
   });

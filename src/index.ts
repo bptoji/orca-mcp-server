@@ -10,6 +10,7 @@ import { registerStatusTool } from "./tools/status.js";
 import { registerGetWorktreeTool, registerListWorktreesTool } from "./tools/worktrees.js";
 import { registerListAgentsTool } from "./tools/agents.js";
 import { registerReadinessTool } from "./tools/readiness.js";
+import { registerRunTools } from "./tools/runs.js";
 import {
   TransportConfigError,
   resolveTransportConfig,
@@ -38,6 +39,7 @@ export function createServer(client: OrcaClient = new OrcaClient()): McpServer {
   registerListWorktreesTool(server, client);
   registerGetWorktreeTool(server, client);
   registerListAgentsTool(server, client);
+  registerRunTools(server, client);
   return server;
 }
 

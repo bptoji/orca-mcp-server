@@ -6,7 +6,9 @@ import {
   getTaskResultInputSchema,
   getTaskStatusInputSchema,
   getWorktreeInputSchema,
+  getRunInputSchema,
   listAgentsInputSchema,
+  listRunsInputSchema,
   listWorktreesInputSchema,
   messageInputSchema,
   readinessInputSchema,
@@ -186,6 +188,36 @@ describe("cancelTaskInputSchema", () => {
   it("strict なので未知のキー(terminal / force など)は拒否する", () => {
     expect(cancelTaskInputSchema.safeParse({ taskId: "t1", terminal: "term_1" }).success).toBe(false);
     expect(cancelTaskInputSchema.safeParse({ taskId: "t1", force: true }).success).toBe(false);
+  });
+
+  it("includeSubRuns の既定は true(sub-run の worker を走りたままにしない)", () => {
+    expect(cancelTaskInputSchema.parse({ taskId: "t1" }).includeSubRuns).toBe(true);
+    expect(cancelTaskInputSchema.parse({ taskId: "t1", includeSubRuns: false }).includeSubRuns).toBe(false);
+  });
+});
+
+describe("listRunsInputSchema / getRunInputSchema", () => {
+  it("listRuns は limit の範囲と cursor を検証する(strict)", () => {
+    expect(listRunsInputSchema.safeParse({}).success).toBe(true);
+    expect(listRunsInputSchema.safeParse({ limit: 50 }).success).toBe(true);
+    expect(listRunsInputSchema.safeParse({ limit: 0 }).success).toBe(false);
+    expect(listRunsInputSchema.safeParse({ limit: 201 }).success).toBe(false);
+    expect(listRunsInputSchema.safeParse({ runId: "run_1" }).success).toBe(false);
+  });
+
+  it("getRun は runId が必須で、limit 等は受け付けない", () => {
+    expect(getRunInputSchema.safeParse({}).success).toBe(false);
+    expect(getRunInputSchema.safeParse({ runId: "" }).success).toBe(false);
+    expect(getRunInputSchema.safeParse({ runId: "run_8d1d20524d42" }).success).toBe(true);
+    expect(getRunInputSchema.safeParse({ runId: "run_1", limit: 5 }).success).toBe(false);
+  });
+});
+
+describe("includeSubRuns の既定(poll / result は sub-run を集約する)", () => {
+  it("poll は既定 true、result は includeChildren 時のみ読む", () => {
+    expect(getTaskStatusInputSchema.parse({ taskId: "t1" }).includeSubRuns).toBe(true);
+    expect(getTaskStatusInputSchema.parse({ taskId: "t1", includeSubRuns: false }).includeSubRuns).toBe(false);
+    expect(getTaskResultInputSchema.parse({ taskId: "t1" }).includeSubRuns).toBe(true);
   });
 });
 

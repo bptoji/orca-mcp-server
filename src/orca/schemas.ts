@@ -109,6 +109,12 @@ export const getTaskStatusInputSchema = z.object({
     .min(1)
     .optional()
     .describe("対象の orchestration Run ID(指定していれば検索が速く確実になる)"),
+  includeSubRuns: z
+    .boolean()
+    .default(true)
+    .describe(
+      "true(既定)は、Commander が自作した sub-run の配下も children / gates に集約する(sub-run 照合に run-list を 1 回読む)。false なら呼び出し元 Run だけ",
+    ),
 });
 export type GetTaskStatusInput = z.infer<typeof getTaskStatusInputSchema>;
 
@@ -127,6 +133,12 @@ export const getTaskResultInputSchema = z.strictObject({
     .default(false)
     .describe(
       "true にすると Commander が分解した子タスクの result と worker 出力も集約して返す(既定 false = Commander だけ)",
+    ),
+  includeSubRuns: z
+    .boolean()
+    .default(true)
+    .describe(
+      "true(既定)は includeChildren の対象に Commander 自作の sub-run の子タスクも含める(sourceRunId にどの Run 由来かを載せる)",
     ),
 });
 export type GetTaskResultInput = z.infer<typeof getTaskResultInputSchema>;
@@ -187,6 +199,12 @@ export const cancelTaskInputSchema = z.strictObject({
     .describe(
       "true(既定)は子孫タスクとその worker まで**子から順**に止める(cascade)。false なら対象タスクだけ。worktree / ターミナルの削除はどちらも行わない",
     ),
+  includeSubRuns: z
+    .boolean()
+    .default(true)
+    .describe(
+      "true(既定)は cascade 対象に Commander 自作の sub-run の部分木も含める(sub-run の worker を走りたままにしないため)。上限(子孫 12 件)は sub-run 込みの件数で判定する",
+    ),
 });
 export type CancelTaskInputSchema = z.infer<typeof cancelTaskInputSchema>;
 
@@ -209,6 +227,16 @@ export const resolveGateInputSchema = z.strictObject({
     .describe(
       "対象の orchestration Run ID(gate は Run バインドスコープ。MCP 側はバインドを持たないので必須)",
     ),
+  taskId: z
+    .string()
+    .min(1)
+    .optional()
+    .describe(
+      "任意: この解決が自分の job のものかを点検させる task ID(通常は orca_delegate_task の taskId)。" +
+        "ゲートの task がこの task またはその部分木に属さない場合は gate_task_mismatch で拒否する(何も変更しない)。" +
+        "指定なしはゲートの所属 task を点検しない(gateId と run が合っていれば解決する)。" +
+        "これは誤操作防止の任意チェックで、厳密な Job 単位の認可ではない(Run をまたぐ親子関係は検証しない)",
+    ),
 });
 export type ResolveGateInputSchema = z.infer<typeof resolveGateInputSchema>;
 
@@ -223,6 +251,31 @@ export const readinessInputSchema = z.strictObject({
     ),
 });
 export type ReadinessInput = z.infer<typeof readinessInputSchema>;
+
+/**
+ * Run 観測: poll / cancel の境界である Run を呼び出し側が列挙できるようにする。
+ * Commander が sub-run を作ったとき、これで見つけて run 名義の poll / cancel に使う。
+ */
+export const listRunsInputSchema = z.strictObject({
+  limit: z
+    .number()
+    .int()
+    .min(1)
+    .max(200)
+    .optional()
+    .describe("取得する Run 数の上限(省略時は CLI 既定)"),
+  cursor: z
+    .string()
+    .min(1)
+    .optional()
+    .describe("前回の応答の nextCursor(作成順の keyset cursor。新しい出力だけを受け取る)"),
+});
+export type ListRunsInput = z.infer<typeof listRunsInputSchema>;
+
+export const getRunInputSchema = z.strictObject({
+  runId: z.string().min(1).describe("Run ID(run_… の ID。orca_list_runs の runId)"),
+});
+export type GetRunInput = z.infer<typeof getRunInputSchema>;
 
 export const delegateInputSchema = z.object({
   spec: z.string().min(1).describe("ワーカーに渡すタスク仕様(指示文)"),
