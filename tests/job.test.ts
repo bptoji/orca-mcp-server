@@ -1958,6 +1958,40 @@ describe("runMutation(直列化)", () => {
       expect(calls[index + 1] ?? "").toMatch(new RegExp(`^${owner}\\|taskUpdate:`));
     }
   });
+
+  it("バインドが空のターミナル(run_required)でも run-use でバインドして 1 回再試行する", async () => {
+    const calls: string[] = [];
+    let attempts = 0;
+    const client = {
+      gateList: async () => ({
+        ok: true,
+        result: { gates: [{ id: "gate_1", run_id: "run_gate", task_id: "task_child", status: "pending" }] },
+      }),
+      gateResolve: async (input: JsonObject) => {
+        attempts += 1;
+        calls.push(`gateResolve:${JSON.stringify(input)}`);
+        if (attempts === 1) {
+          throw new OrcaCommandError(
+            { code: "run_required", message: "No Run is bound. Use orchestration run-create or run-use first." },
+            { ok: false, args: ["orchestration", "gate-resolve"], exitCode: 1, stdout: "", stderr: "" },
+          );
+        }
+        return { ok: true, result: {} };
+      },
+      runUse: async (id: string) => {
+        calls.push(`runUse:${id}`);
+        return { ok: true, result: {} };
+      },
+    } as unknown as OrcaClient;
+
+    const result = await resolveGate(client, { gateId: "gate_1", resolution: "approve", run: "run_gate" });
+    expect(result["resolved"]).toBe(true);
+    expect(calls).toEqual([
+      'gateResolve:{"id":"gate_1","resolution":"approve"}',
+      "runUse:run_gate",
+      'gateResolve:{"id":"gate_1","resolution":"approve"}',
+    ]);
+  });
 });
 
 describe("getTaskResult(result) — 子タスクの集約", () => {

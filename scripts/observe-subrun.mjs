@@ -94,11 +94,14 @@ if (subRuns.length > 0) {
 if (typeof view["subRunScanComplete"] !== "boolean") {
   failures.push("subRunScanComplete が無い(スキャンの完全性を正直に出していない)");
 }
-if (reasons.length > 0 && gates.length > 0) {
-  const gateReason = reasons.find((row) => row["kind"] === "gate");
-  const detail = gateReason?.["detail"];
-  if (!detail || typeof detail["runId"] !== "string") {
-    failures.push("gate 由来の blockedReasons.detail.runId が無い");
+const gateReasons = reasons.filter((row) => row["kind"] === "gate");
+if (gateReasons.length > 0) {
+  for (const row of gateReasons) {
+    const detail = row["detail"];
+    if (!detail || typeof detail["runId"] !== "string" || typeof detail["gateId"] !== "string") {
+      failures.push("gate 由来の blockedReasons.detail に gateId / runId が無い");
+      break;
+    }
   }
 }
 

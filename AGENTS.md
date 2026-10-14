@@ -292,6 +292,12 @@ orca CLI は **呼び出し元ターミナルを 1 つの Run にバインド**�
 `run-use --id <run>` でバインドを切り替えて **1 回だけ**再試行する。それ以外で
 `run-use` を勝手に呼ばないこと(呼び出し元の pane の状態が変わるため)。
 
+- **バインドが空のターミナルからの `run_required` も同じ手順で復旧する**("No Run is bound.
+  Use orchestration run-create or run-use first."、2026-10-14 実測で gate-resolve がこれで落ちた)。
+  バインドは pane の実体化で失われる(実測: 委譲成功後に gate-resolve が `run_required` になった)。
+  `runMutation` は `consumer_fenced` / `run_required` / "No Run is bound" をまとめて
+  `run-use` + 1 回再試行で recovery する(復旧後に gate-resolve が成功した実測あり)。
+
 - **バインドはプロセス共有の状態**。並行リクエストが `run-use` を交互に叩くと、A が切り替えた
   バインドを B が書き換えて A の再試行が別 Run に届く。`runMutation()` は `MutationQueue` で
   **変更系を 1 本に直列化**し、`run-use` + 再試行の並びを他リクエストと挟まない。

@@ -199,3 +199,23 @@ review9 の「条件付き実装承認」(`orca-mcp_review9.txt` §2–§7)ど�
   `created_by_pane_key == tabId:leafId`、`created_by_process_incarnation == ptyId:incarnationId`。
 - 未実施: P7(観測 API の include* 拡張)、P8 の実機 E2E(gate 解決 / cancel の実走)。
   実機 E2E は `gate_e3de81e4d0d4`(master merge / push の承認)を解決する操作を含むため、人間の承認なしには走らせない。
+
+### 8-1. P8 実機 E2E(2026-10-14、claude / repo orca-mcp / 子 worktree 隔離)
+
+`gate_e3de81e4d0d4` には一切触れていない(新規ジョブ自身のゲートだけを解決した)。
+
+| 実行 | 内容 | 実測 |
+|---|---|---|
+| 検証 A(`scripts/observe-subrun.mjs`) | 既存の sub-run を read-only で観測 | `subRunScanPageCount 2` / `subRunScanRunCount 82`(50+32 を cursor で読み切り)、`run_8d1d20524d42` の `ownership: verified`(`pane key` と `process incarnation` 一致)、`gates[0].runId = run_8d1d20524d42`、`warnings: []` |
+| E2E #1(`scripts/e2e.mjs`) | submit → poll → result → cancel(README のみ変更 goal) | `task_a5dc3b5f18b1 / run_ec6d76009ca2` が 15 poll(~11 分)で completed。`subRunScanComplete: true`(2 ページ / 83 件)、`subRunsDiscovered: 0`。cancel 用ジョブは `cancelled: true` / `fullyStopped: true` / `residualWorkers: []`、cancel 後 `state: failed`(= cancelled) |
+| E2E #2(gate 強制 goal) | gate-create を作らせる goal で poll → gate 解決 | Commander が `gate_8888c7461b08` を **呼び出し元 Run(`run_52e3ee6a9aec`)内に**作成(poll の `gates[].runId` と `blockedReasons[].detail` に出る)。解決は初回 `run_required`(後述)で失敗し、`run-use` 復旧後に `status: resolved` で成功 → 子タスクが `queued` へ進んだ |
+
+- **実測で出たバグと修正**: gate-resolve が `run_required`("No Run is bound. Use orchestration
+  run-create or run-use first.")で落ち、`runMutation` が `consumer_fenced` しか復旧しなかった。
+  バインドは pane の実体化で失われる(委譲成功後の gate-resolve で発生)。`runMutation` は
+  `run_required` / "No Run is bound" も `run-use` + 1 回再試行の対象に含めた(§8-1 の E2E #2 で復旧を実証)。
+- **バインドはターミナル共有の状態**(プロセスをまたいで動く)。E2E #2 では 2 本目の delegate が
+  同じターミナルを別 Run へ再バインドしたため、後から別プロセスで解決すると `Gate not found` になった。
+  「ゲートの Run を名指しで `run-use` して、そのまま同じプロセスで解決する」が正解(実測で成功)。
+- 残る未検証: sub-run を**作る** goal での verified 判定(検証 A が実データで確認済み)、
+  `cancel_ownership_unverified` の実機発火(ユニットテストで固定)。

@@ -90,6 +90,11 @@ const runBindingQueue = new MutationQueue();
  * orca CLI は呼び出し元(この MCP サーバーを起動したターミナル)を 1 つの Run に
  * バインドする。別の Run に対して `task-update` 等を行うと `consumer_fenced` で
  * 拒否されるため、そのときだけ `run-use` でバインドを切り替えて 1 回再試行する。
+ *
+ * バインドが**空**のターミナルから叩くと `run_required`("No Run is bound. Use
+ * orchestration run-create or run-use first.") になる(実測: gate-resolve が 0 件でなく
+ * 失敗した)。CLI の推奨どおり `run-use` でバインドして 1 回だけ再試行する —
+ * どちらも「渡す Run が決まっているなら復旧できる」同じ型の失敗なのでまとめて扱う。
  */
 export async function runMutation<T>(
   client: OrcaClient,
@@ -100,10 +105,13 @@ export async function runMutation<T>(
     try {
       return await mutate();
     } catch (error) {
-      const fenced =
+      const needsBinding =
         error instanceof OrcaCommandError &&
-        (error.code === "consumer_fenced" || error.message.includes("consumer_fenced"));
-      if (!fenced || runId === undefined) {
+        (error.code === "consumer_fenced" ||
+          error.code === "run_required" ||
+          error.message.includes("consumer_fenced") ||
+          error.message.includes("No Run is bound"));
+      if (!needsBinding || runId === undefined) {
         throw error;
       }
       await client.runUse(runId);
