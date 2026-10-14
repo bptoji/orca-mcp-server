@@ -295,3 +295,6 @@ goal: Commander に `run-create` で sub-run を作らせ、その Run 内に ga
   task 部分木に属さないので taskId を外して解決する」)。README のトラブルシュートにも同じ根拠を追記
 - **`scripts/e2e.mjs` はゲートの所属 Run が呼び出し元 Run と違うとき `taskId` を渡さない**
   (sub-run のゲートは点検させない)。ログには `taskId=none(sub-run)` を出す
+- **`mode: "abandon"` は同じ job で完走した**(2026-10-14 実測): stop 版は `stop_unknown` → `cancel_incomplete`、
+  abandon 版は `abandoned` → `cancelled: true` / `fullyStopped: true` / `residualWorkers: []`。
+  `worker-abandon` はプロセス停止を主張しない fence なので、CLI が task 確定を拒否しない

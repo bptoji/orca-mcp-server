@@ -239,6 +239,8 @@ docs/
   `task_not_startable`("cannot move to failed while supervised Dispatch … is active")で落ちる。
   `UNCONFIRMED_FENCE_STATES`(`stop_unknown / abandon_unknown / unknown / failed / error`、状態無しを含む)は
   fence 失敗として数え → `cancel_incomplete`(`fullyStopped: false`)。
+  **同じ job への `worker-abandon` は `abandoned` を返して完走した**(2026-10-14 実測: stop 版は
+  `cancel_incomplete`、abandon 版は `cancelled: true` / `fullyStopped: true` / `residualWorkers: []`)。
 - **Commander(root)の fence 失敗は cancel 成功にしない**: 対象タスクの fence に 1 件でも失敗したら
   `cancel_incomplete`(`state: "partial"` / `cancelled: false` / `fullyStopped: false`)で**対象 task は更新しない**。
   「論理 cancel」と「実プロセス停止」のズレを放置しないため。成功応答には `fullyStopped`(fence 全成功か)を載せる。
