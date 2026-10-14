@@ -298,7 +298,9 @@ orca_get_task_result({ taskId: "task_abc123", includeChildren: true })
   ゲートが pending でないのに progress が止まる典型は、エージェントのターミナルに出る**ツール承認プロンプト**です
   (`attentionNotes` の `terminal(read) で確認` をたどってください)。
 - `orca_get_task_result` は既定で Commander だけ読みます。`includeChildren: true` で直接の子タスクの
-  `result` と出力も集約します(子 10 件・worker-read 8 件まで)。sub-run の子も `sourceRunId` 付きで集約されます。
+  `result` と出力も集約します(子 10 件・worker-read 8 件まで)。sub-run の子も `sourceRunId` 付きで集約され、
+  集約の完全性は poll と同じ `subRunScanComplete` / `subRunsTruncated` / `subRunOwnershipComplete` /
+  `subRunWorkerScanComplete` で出します(打ち切ったら `warnings` に理由)。
 - 大きな欄は既定で切り詰めます(`specPreview` 200 字、worker 出力 4000 字、`orca_list_agents` の `prompt` 200 字)。
 
 **`repo` の渡し方**

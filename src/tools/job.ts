@@ -69,7 +69,7 @@ export function registerJobTools(server: McpServer, client: OrcaClient): void {
     {
       title: "Orca Get Task Result",
       description:
-        "タスクの成果とワーカー出力を読む(非同期 result)。内部で task-list / dispatch-show / worker-read / run-list を読むだけで、何も変更しない。worker 出力は 1 件あたり既定 40 行・最大 4000 文字に切り詰める。既定では Commander 自身の成果と出力だけを返し、includeChildren: true で**直接の子タスク**(direct children)の result と出力(子 10 件・worker-read 8 件まで)を集約する。孫以降は集約しない(その子自身の result で見る)。Commander が sub-run を作っていた場合、includeChildren: true(既定 includeSubRuns: true)はその sub-run の子タスクも sourceRunId 付きで集約する — 呼び出し元 Run だけの result は sub-run の成果を丸ごと見落とす(実測)。",
+        "タスクの成果とワーカー出力を読む(非同期 result)。内部で task-list / dispatch-show / worker-read / run-list を読むだけで、何も変更しない。worker 出力は 1 件あたり既定 40 行・最大 4000 文字に切り詰める。既定では Commander 自身の成果と出力だけを返し、includeChildren: true で**直接の子タスク**(direct children)の result と出力(子 10 件・worker-read 8 件まで)を集約する。孫以降は集約しない(その子自身の result で見る)。Commander が sub-run を作っていた場合、includeChildren: true(既定 includeSubRuns: true)はその sub-run の子タスクも sourceRunId 付きで集約する — 呼び出し元 Run だけの result は sub-run の成果を丸ごと見落とす(実測)。集約の完全性は poll と同じ応答フィールドで出す: subRunScanComplete / subRunsTruncated / subRunOwnershipComplete / subRunWorkerScanComplete(打ち切りのときは warnings に理由が出る)。",
       inputSchema: getTaskResultInputSchema,
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
