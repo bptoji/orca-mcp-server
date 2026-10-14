@@ -227,6 +227,15 @@ export const resolveGateInputSchema = z.strictObject({
     .describe(
       "対象の orchestration Run ID(gate は Run バインドスコープ。MCP 側はバインドを持たないので必須)",
     ),
+  taskId: z
+    .string()
+    .min(1)
+    .optional()
+    .describe(
+      "任意: この解決が自分の job のものかを点検させる task ID(通常は orca_delegate_task の taskId)。" +
+        "ゲートの task がこの task またはその部分木に属さない場合は gate_task_mismatch で拒否する(何も変更しない)。" +
+        "指定なしはゲートの所属 task を点検しない(gateId と run が合っていれば解決する)",
+    ),
 });
 export type ResolveGateInputSchema = z.infer<typeof resolveGateInputSchema>;
 

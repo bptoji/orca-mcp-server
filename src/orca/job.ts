@@ -960,6 +960,10 @@ interface SubRunCapture {
   subRunsTruncated: boolean;
   /** 見つけた sub-run の所有関係がすべて verified か(0 件なら true)。 */
   ownershipComplete: boolean;
+  /** sub-run 側の worker-list を読み切ったか(打ち切ったら false)。 */
+  workerScanComplete: boolean;
+  /** 探索の前提となる run-list が読めなかったか(cancel は preflight で断る)。 */
+  scanFailed: boolean;
 }
 
 const EMPTY_CAPTURE: SubRunCapture = {
@@ -975,6 +979,8 @@ const EMPTY_CAPTURE: SubRunCapture = {
   scanLimit: SUB_RUN_SCAN_LIMIT,
   subRunsTruncated: false,
   ownershipComplete: true,
+  workerScanComplete: true,
+  scanFailed: false,
 };
 
 /** ページ応答の次カーソル(run-list は result 直下、worker-list は page.nextCursor: 実測)。 */
@@ -983,45 +989,88 @@ function nextCursorOf(payload: JsonObject): string | null {
   return pickString(payload, ["nextCursor", "cursor"]) ?? (page === null ? null : pickString(page, ["nextCursor", "cursor"]) ?? null);
 }
 
+/** ページ応答の「まだ次がある」(worker-list の page.hasMore: 実測)。 */
+function hasMoreOf(payload: JsonObject): boolean {
+  const page = isJsonObject(payload["page"]) ? (payload["page"] as JsonObject) : null;
+  return page?.["hasMore"] === true;
+}
+
+type ScanStopReason = "complete" | "page_limit" | "has_more_without_cursor" | "cursor_repeat";
+
+interface PagedScan {
+  rows: JsonObject[];
+  pages: number;
+  complete: boolean;
+  stopReason: ScanStopReason;
+}
+
+/**
+ * cursor ページングの共通実装(P3)。
+ *
+ * 完走したかどうかを**必ず**返す(上限到達で黙って部分結果を返さない)。
+ * `page.hasMore: true` なのに `nextCursor` が無い、同じ cursor が戻る、といった
+ * 異常も「打ち切り」として出す(打ち切りを完走として扱うと、cancel が
+ * 「全部止めた」と誤報する。worker 行の取りこぼしはそのまま停止漏れになる)。
+ */
+async function scanPaged(
+  fetchPage: (cursor: string | undefined) => Promise<JsonObject>,
+  extract: (payload: JsonObject) => JsonObject[],
+  maxPages: number,
+): Promise<PagedScan> {
+  const rows: JsonObject[] = [];
+  const seen = new Set<string>();
+  let cursor: string | undefined;
+  let pages = 0;
+  for (let page = 0; page < maxPages; page += 1) {
+    const payload = await fetchPage(cursor);
+    rows.push(...extract(payload));
+    pages += 1;
+    const next = nextCursorOf(payload);
+    if (next === null) {
+      return hasMoreOf(payload)
+        ? { rows, pages, complete: false, stopReason: "has_more_without_cursor" }
+        : { rows, pages, complete: true, stopReason: "complete" };
+    }
+    if (seen.has(next)) {
+      return { rows, pages, complete: false, stopReason: "cursor_repeat" };
+    }
+    seen.add(next);
+    cursor = next;
+  }
+  return { rows, pages, complete: false, stopReason: "page_limit" };
+}
+
+const SCAN_STOP_TEXT: Record<ScanStopReason, string> = {
+  complete: "",
+  page_limit: "ページ上限に到達",
+  has_more_without_cursor: "hasMore: true に対して nextCursor が無い",
+  cursor_repeat: "同じ cursor が戻った(ループ)",
+};
+
 /**
  * run-list を cursor で読み集める(P3: 1 ページだけ見て「無い」と判定しない)。
  * 実測で live の run-list は limit 60 で 60 件 + nextCursor を返す = 打ち切りは現実に起きる。
  */
-async function scanRunRows(
-  client: OrcaClient,
-): Promise<{ rows: JsonObject[]; pages: number; complete: boolean }> {
-  const rows: JsonObject[] = [];
-  let cursor: string | undefined;
-  let pages = 0;
-  for (let page = 0; page < MAX_SCAN_PAGES; page += 1) {
-    const listed = unwrapResult(await client.runList({ limit: SUB_RUN_SCAN_LIMIT, cursor }));
-    const batch = extractRuns(listed);
-    rows.push(...batch);
-    pages += 1;
-    const next = nextCursorOf(listed);
-    if (next === null || batch.length === 0) {
-      return { rows, pages, complete: next === null };
-    }
-    cursor = next;
-  }
-  return { rows, pages, complete: false };
+async function scanRunRows(client: OrcaClient): Promise<PagedScan> {
+  return scanPaged(
+    async (cursor) => unwrapResult(await client.runList({ limit: SUB_RUN_SCAN_LIMIT, cursor })),
+    (payload) => extractRuns(payload),
+    MAX_SCAN_PAGES,
+  );
 }
 
-/** worker-list をページングして全行読む(worker-list は 100 件で page.hasMore を返す: 実測)。 */
-async function scanWorkerRows(client: OrcaClient, runId: string): Promise<JsonObject[]> {
-  const rows: JsonObject[] = [];
-  let cursor: string | undefined;
-  for (let page = 0; page < MAX_WORKER_PAGES; page += 1) {
-    const payload = unwrapResult(await client.workerList({ run: runId, limit: 100, cursor }));
-    const batch = extractWorkers(payload);
-    rows.push(...batch);
-    const next = nextCursorOf(payload);
-    if (next === null || batch.length === 0) {
-      return rows;
-    }
-    cursor = next;
-  }
-  return rows;
+/**
+ * worker-list をページングして全行読む(worker-list は 100 件で page.hasMore を返す: 実測)。
+ *
+ * 完走判定を返す: cancel の preflight と停止後検証は、打ち切りのときに
+ * 「完全停止した」と宣言してはならない(review10 §1)。
+ */
+async function scanWorkerRows(client: OrcaClient, runId: string): Promise<PagedScan> {
+  return scanPaged(
+    async (cursor) => unwrapResult(await client.workerList({ run: runId, limit: 100, cursor })),
+    (payload) => extractWorkers(payload),
+    MAX_WORKER_PAGES,
+  );
 }
 
 /**
@@ -1048,20 +1097,26 @@ async function captureSubRuns(
   let rows: JsonObject[];
   let pages = 0;
   let scanComplete = false;
+  let scanStopReason: ScanStopReason = "complete";
   try {
     const scanned = await scanRunRows(client);
     rows = scanned.rows;
     pages = scanned.pages;
     scanComplete = scanned.complete;
+    scanStopReason = scanned.stopReason;
   } catch (error) {
+    // 探索の前提が読めない = 「sub-run は無い」とは言えない。cancel 側が preflight で断れるようにする。
     return {
       ...EMPTY_CAPTURE,
       scanComplete: false,
+      scanFailed: true,
       warnings: [`sub-run 探索の run-list に失敗: ${failureLine(error)}`],
     };
   }
   if (!scanComplete) {
-    warnings.push(`sub-run 探索を ${pages} ページ(1 ページ ${SUB_RUN_SCAN_LIMIT} 件)で打ち切りました`);
+    warnings.push(
+      `sub-run 探索を ${pages} ページ(1 ページ ${SUB_RUN_SCAN_LIMIT} 件)で打ち切りました(${SCAN_STOP_TEXT[scanStopReason]})`,
+    );
   }
 
   const matchedAll = matchSubRuns(
@@ -1150,7 +1205,14 @@ async function captureSubRuns(
         }
       }
 
-      for (const row of (await scanWorkerRows(client, runId)).map(toWorkerRow)) {
+      const workerScan = await scanWorkerRows(client, runId);
+      if (!workerScan.complete) {
+        capture.workerScanComplete = false;
+        warnings.push(
+          `sub-run ${runId} の worker-list を ${workerScan.pages} ページで打ち切りました(${SCAN_STOP_TEXT[workerScan.stopReason]})`,
+        );
+      }
+      for (const row of workerScan.rows.map(toWorkerRow)) {
         const taskId = row["taskId"];
         if (typeof taskId === "string" && subtreeIds.has(taskId)) {
           capture.workers.push(row);
@@ -1683,6 +1745,7 @@ export async function getTaskStatus(client: OrcaClient, input: TaskStatusInput):
     subRunScanRunCount: subCapture.scanRunCount,
     subRunScanLimit: subCapture.scanLimit,
     subRunOwnershipComplete: subCapture.ownershipComplete,
+    subRunWorkerScanComplete: subCapture.workerScanComplete,
     gates,
     blockedReasons,
     warnings,
@@ -1925,30 +1988,65 @@ export async function cancelTask(client: OrcaClient, input: CancelTaskInput): Pr
   // sub-run の worker を走りたままにする(実測: 呼び出し元 Run には子が見えない)。
   // handle 照合で拾った部分木を **sub-run 側が先**に並べる = 呼び出し元 Run の
   // Commander(root)より先に止める。post-order なので各部分木の中も子が先。
+  // sub-run を含む cascade は「配下を全部止める」ことを約束する操作なので、
+  // 探索の前提(worker-list / run-list / handle)が読めないときにそのまま進めると、
+  // 見落とした worker を走りたまま `cancelled: true` で返す(review10 §2)。
+  // 前提の読み取り失敗は warning として残すだけでなく、preflight で断る。
   let subCapture: SubRunCapture = EMPTY_CAPTURE;
+  const discoveryFailures: string[] = [];
   if (cascade && input.includeSubRuns !== false) {
     const handles = commanderHandles(task, []);
+    let callerWorkerRows: JsonObject[] = [];
+    // workerList が無い client(部分的な注入)では探索そのものを走らせない
+    // = 「読めなかった」ではなく「走れない」として、cancel を止めない。
+    const canScanWorkers = typeof client.workerList === "function";
     try {
-      const workersPayload = unwrapResult(
-        await client.workerList({ run: runId ?? undefined, limit: 100 }),
-      );
-      for (const row of extractWorkers(workersPayload).map(toWorkerRow)) {
+      if (canScanWorkers && typeof runId === "string" && runId.length > 0) {
+        const scan = await scanWorkerRows(client, runId);
+        callerWorkerRows = scan.rows;
+        if (!scan.complete) {
+          discoveryFailures.push(
+            `呼び出し元 Run の worker-list を ${scan.pages} ページで打ち切りました(${SCAN_STOP_TEXT[scan.stopReason]})`,
+          );
+        }
+      }
+      for (const row of callerWorkerRows.map(toWorkerRow)) {
         if (row["taskId"] === input.taskId && typeof row["terminalHandle"] === "string") {
           handles.push(row["terminalHandle"] as string);
         }
       }
     } catch (error) {
-      subCapture = { ...EMPTY_CAPTURE, warnings: [`cancel の worker-list に失敗: ${failureLine(error)}`] };
+      discoveryFailures.push(`cancel の worker-list に失敗: ${failureLine(error)}`);
     }
+    if (handles.length === 0 && callerWorkerRows.length > 0) {
+      discoveryFailures.push("worker がいるのに Commander の terminal handle が取得できない(sub-run を照合できない)");
+    }
+    const capture = await captureSubRuns(client, {
+      callerRunId: runId,
+      handles,
+      taskCreatedAt: task["created_at"] ?? task["createdAt"],
+      enabled: true,
+    });
     subCapture = {
-      ...EMPTY_CAPTURE,
-      ...await captureSubRuns(client, {
-        callerRunId: runId,
-        handles,
-        taskCreatedAt: task["created_at"] ?? task["createdAt"],
-        enabled: true,
-      }),
+      ...capture,
+      warnings: [...capture.warnings, ...discoveryFailures.map((line) => `cancel 前提の読み取りに失敗: ${line}`)],
     };
+    if (subCapture.scanFailed) {
+      discoveryFailures.push("sub-run 探索の run-list が読めない");
+    }
+    if (discoveryFailures.length > 0) {
+      throw new JobError(
+        "cancel_discovery_incomplete",
+        `cascade cancel の前提となる探索(worker-list / run-list / handle)が揃わないため、何も変更していません(sub-run を見落とすと「全部止めた」の誤報になります)。${discoveryFailures.join(" / ")}。sub-run を巻き込まずに止めるなら includeSubRuns: false(または cascade: false)`,
+        {
+          taskId: input.taskId,
+          runId,
+          discoveryFailures,
+          subRunsDiscovered: capture.subRuns.length,
+          subRunScanComplete: capture.scanComplete,
+        },
+      );
+    }
   }
 
   // P4 / P5(review9 §6): 所有検証に失敗した sub-run は auto-cancel の対象にしない。
@@ -2131,10 +2229,10 @@ export async function cancelTask(client: OrcaClient, input: CancelTaskInput): Pr
   // P5(review9 §6): 停止後に worker を読み直し、残っている worker を正直に出す。
   // 探索を打ち切った(scanComplete: false / subRunsTruncated)場合は「全部止めた」と宣言しない。
   const cancelledTaskIds = new Set(tasks.map((row) => row["taskId"]).filter((id): id is string => typeof id === "string"));
-  const scanIncomplete = !subCapture.scanComplete || subCapture.subRunsTruncated;
+  const scanIncomplete = !subCapture.scanComplete || subCapture.subRunsTruncated || !subCapture.workerScanComplete;
   const residual = await residualLiveWorkers(client, [runId, ...eligibleRunIds], cancelledTaskIds);
   if (scanIncomplete) {
-    warnings.push("sub-run 探索を打ち切ったため、stop の完了を保証できません(fullyStopped: false)");
+    warnings.push("探索を打ち切ったため、stop の完了を保証できません(fullyStopped: false)");
   }
   if (residual.length > 0) {
     warnings.push(`停止後に読み直したところ ${residual.length} 個の worker が生存しています(pane を確認してください)`);
@@ -2154,6 +2252,7 @@ export async function cancelTask(client: OrcaClient, input: CancelTaskInput): Pr
     subRunScanComplete: subCapture.scanComplete,
     subRunsTruncated: subCapture.subRunsTruncated,
     subRunOwnershipComplete: subCapture.ownershipComplete,
+    subRunWorkerScanComplete: subCapture.workerScanComplete,
     residualWorkers: residual,
     mode,
     reason,
@@ -2181,7 +2280,18 @@ async function residualLiveWorkers(
     }
     seen.add(run);
     try {
-      for (const row of (await scanWorkerRows(client, run)).map(toWorkerRow)) {
+      const scan = await scanWorkerRows(client, run);
+      if (!scan.complete) {
+        // 打ち切り = 残存 worker を検証できない。「読めない」と同じ扱いで正直に残す
+        residual.push({
+          taskId: null,
+          dispatchId: null,
+          runId: run,
+          status: "scan_incomplete",
+          error: `${scan.pages} ページで打ち切り(${SCAN_STOP_TEXT[scan.stopReason]})`,
+        });
+      }
+      for (const row of scan.rows.map(toWorkerRow)) {
         const taskId = row["taskId"];
         const status = row["status"];
         if (typeof taskId !== "string" || !taskIds.has(taskId)) {
@@ -2210,6 +2320,12 @@ export interface ResolveGateInput {
   gateId: string;
   resolution: string;
   run: string;
+  /**
+   * 解決してよいゲートが**この job(親 task)のものか**を点検するための任意指定(review10 §3)。
+   * 指定したゲート task がこの task そのもの、またはその部分木に属さない場合は
+   * `gate_task_mismatch` で**何も変更する前に**拒否する。
+   */
+  taskId?: string;
 }
 
 export async function resolveGate(client: OrcaClient, input: ResolveGateInput): Promise<JsonObject> {
@@ -2241,6 +2357,29 @@ export async function resolveGate(client: OrcaClient, input: ResolveGateInput): 
   }
 
   const runId = gateRunId;
+
+  // 認可の境界(review10 §3): gate-resolve は「Run ID と Gate ID を知る誰でも」解決できる CLI 構造。
+  // MCP 側は単一ユーザー / 信頼できるクライアント前提で認可を持たないので、呼び出し側が
+  // 「自分の job のゲートか」を点検できる口を任意で持つ。指定された task と無関係なゲートを
+  // 解決しないための gate で、部分木(この task が分解した子孫)は許可する。
+  const gateTaskId = pickString(gate, ["task_id", "taskId"]) ?? null;
+  if (input.taskId !== undefined && gateTaskId !== input.taskId) {
+    const related = new Set<string>([input.taskId]);
+    const listed = await client.taskList({ run: input.run, brief: false });
+    for (const row of collectDescendants(listed, input.taskId)) {
+      const id = pickString(row, ID_KEYS);
+      if (id !== undefined) {
+        related.add(id);
+      }
+    }
+    if (gateTaskId === null || !related.has(gateTaskId)) {
+      throw new JobError(
+        "gate_task_mismatch",
+        `ゲート ${input.gateId} の task は ${gateTaskId ?? "無し"} で、指定した task ${input.taskId}(とその部分木)に属しません。何も変更していません。taskId の指定を外すか、poll の gates[].taskId を渡してください`,
+        { gateId: input.gateId, gateTaskId, requestedTaskId: input.taskId, run: input.run },
+      );
+    }
+  }
 
   // 解決済みゲートには触らない(冪等)。CLI は解決の取り消しを支持していない。
   if (status !== undefined && status.toLowerCase() !== "pending") {

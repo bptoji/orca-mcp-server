@@ -286,12 +286,14 @@ orca_get_task_result({ taskId: "task_abc123", includeChildren: true })
   | `unverified` | handle 一致なし / root が特定できない | `false` |
   | `conflicting` | 来歴が矛盾する、または objective のマーカーが別の Run を指す | `false` |
 
-  根拠は `verificationReasons[]`、発見の経路は `discoverySource`(`explicit` / `provenance` / `handle`)。
+- 根拠は `verificationReasons[]`、発見の経路は `discoverySource`(`explicit` / `provenance` / `handle`)。
   objective の `orca-mcp-parent: run=<caller runId> task=<your task id>` マーカーは**発見の候補**に使い、
   これだけで `verified` にはしません(誰でも書けるため)。
 - スキャンの正直さも応答に出します: `subRunScanComplete`(ページ上限で打ち切ったら false)/
   `subRunsTruncated`(照合が `MAX_SUB_RUNS` 超で打ち切られた)/ `subRunScanPageCount` / `subRunScanRunCount` /
-  `subRunOwnershipComplete`(全 sub-run が verified か)。
+  `subRunOwnershipComplete`(全 sub-run が verified か)/ `subRunWorkerScanComplete`(sub-run 側の worker-list を
+  読み切ったか)。`page.hasMore: true` なのに `nextCursor` が無い、同じ cursor が戻る、といった
+  ページングの異常も「打ち切り」として warning に出します(1 ページだけ見て「無い」と言いません)。
 - `attentionRequired` / `attentionNotes` は worker 側の「人間側の対応が必要そう」の合図。
   ゲートが pending でないのに progress が止まる典型は、エージェントのターミナルに出る**ツール承認プロンプト**です
   (`attentionNotes` の `terminal(read) で確認` をたどってください)。
@@ -299,18 +301,21 @@ orca_get_task_result({ taskId: "task_abc123", includeChildren: true })
   `result` と出力も集約します(子 10 件・worker-read 8 件まで)。sub-run の子も `sourceRunId` 付きで集約されます。
 - 大きな欄は既定で切り詰めます(`specPreview` 200 字、worker 出力 4000 字、`orca_list_agents` の `prompt` 200 字)。
 
-**`repo` の渡し方** — `repo` は **repo セレクタ**です。`id:<repoId>` と `path:<repo home>` は解決できますが、
+**`repo` の渡し方**
+- `repo` は **repo セレクタ**です。`id:<repoId>` と `path:<repo home>` は解決できますが、
 worktree の displayName(`name:weever`)や worktree path は `repo_not_found` になります。
-repoId は `orca worktree current --json` の `result.worktree.repoId` で取れます。
+- repoId は `orca worktree current --json` の `result.worktree.repoId` で取れます。
 
-**`commanderAgent` の条件** — 注入されたプロンプトを**非対話で消費できる**エージェントである必要があります。
+**`commanderAgent` の条件** 
+- 注入されたプロンプトを**非対話で消費できる**エージェントである必要があります。
 `claude` / `codex` は supervised worker として動作します(承認設定は上の節)。`dsh` は下の
 [dsh の節](#dsh-を-commander--worker-に使う)の設定が必要です。
 
-**worker-start が失敗してもタスクは消えません** — `state: "queued"` + `warnings` で返ります。
+**worker-start が失敗してもタスクは消えません** 
+- `state: "queued"` + `warnings` で返ります。
 `queued` は放置しても進みません(dispatch が無い = Commander 未起動)。`nextAction` が
 「delegate し直す / cancel する」を明示するので、どちらかを選んでください。
-`worker-start` は worktree 作成 + setup hook + エージェント起動 + 初ターン観測まで同期で走るため、
+- `worker-start` は worktree 作成 + setup hook + エージェント起動 + 初ターン観測まで同期で走るため、
 このコマンドだけ transport 側の timeout を **180 秒**に広げています。
 
 ### 介入(intervene)
@@ -358,6 +363,11 @@ orca_cancel_task({ taskId: "task_abc123", reason: "方針変更" })   // cascade
   ゲートは呼び出し元 Run と違う Run にあり(実測: 呼び出し元 Run の `gate-list` は 0 件、sub-run に pending が 1 件)、
   組が一致しない場合は**何も変更する前に** `gate_run_mismatch` で拒否します(`gate_not_found` と合わせて
   誤った Run のゲートを解決しないための gate)
+- **認可の境界**: `gate-resolve` は「Run ID と Gate ID を知る誰でも」解決できる CLI のコマンドで、MCP 側は
+  単一ユーザー / 信頼できるクライアント前提の認可を持っていません(HTTP で他 PC に公開する運用はトークン必須で、
+  承認権限は運用側で確認してください)。自分の job のゲートだけを解決させたいときは `taskId`
+  (通常は `orca_delegate_task` の `taskId`)を渡します — ゲートの task がその task またはその部分木に
+  属さなければ `gate_task_mismatch` で**何も変更せずに**拒否します(指定なしは点検しません)
 - Commander Prompt は「承認ゲート無しでは merge / push / deploy をしない」と約束しています。
   **ゲートを解決する API がないとジョブは途中で詰まります**(blocked / decision_gate の `nextAction` が指します)
 - **cancel はジョブ単位**(既定 `cascade: true`)。Commander が分解した**子孫タスクとその worker を子から順**に
@@ -381,7 +391,15 @@ orca_cancel_task({ taskId: "task_abc123", reason: "方針変更" })   // cascade
   成功応答の `fullyStopped` が「実プロセスを全部止められたか」です
 - **停止後に worker-list を読み直します**。まだ生きている worker は `residualWorkers[]` に載せ、
   その 1 件でも `fullyStopped: false` にします(論理 cancel と実プロセス停止のズレを正直に出す)。
-  sub-run 探索を打ち切った場合(`subRunScanComplete: false` / `subRunsTruncated`)も `fullyStopped: false` です
+  探索を打ち切った場合(`subRunScanComplete: false` / `subRunsTruncated` / `subRunWorkerScanComplete: false`)も
+  `fullyStopped: false` です。worker-list をページングで読み切れない Run は `residualWorkers[]` に
+  `status: "scan_incomplete"` を残します
+- **探索の前提が揃わなければ cancel は何も変更しません**(`cancel_discovery_incomplete`)。
+  sub-run を巻き込む cancel は、呼び出し元 Run の worker-list・sub-run 探索の run-list・Commander の
+  terminal handle に依存します。これらが読めない / ページングを打ち切ったときにそのまま進めると、
+  見落とした worker を走りたまま `cancelled: true` で返してしまうため、preflight で断ります。
+  `detail.discoveryFailures[]` に理由が出ます。sub-run を巻き込まずに止める逃げ道は
+  `cascade: false` / `includeSubRuns: false`
 - `mode: "abandon"` は `orca orchestration worker-abandon`(資源を残しプロセスにも filesystem にも触らない)に対応します。
   迷ったら `stop` を使ってください
 - worktree やターミナルの削除は行いません(後片付けは人間側の判断)
@@ -409,7 +427,8 @@ orca_cancel_task({ taskId: "task_abc123", reason: "方針変更" })   // cascade
   例: `run_required` / `run_not_found` / `worktree_not_found`(+ `data.nextSteps`)
 - ジョブ層の失敗語彙: `task_not_found` / `task_id_missing` / `run_create_failed` / `outcome_required` /
   `outcome_not_allowed` / `dispatch_id_required` / `cancel_incomplete` / `cancel_scope_too_large` /
-  `cancel_dispatch_scope_too_large` / `gate_not_found` / `gate_run_mismatch` / `cancel_ownership_unverified`
+  `cancel_dispatch_scope_too_large` / `gate_not_found` / `gate_run_mismatch` / `cancel_ownership_unverified` /
+  `cancel_discovery_incomplete` / `gate_task_mismatch`
 - orca CLI は**呼び出し元ターミナルを 1 つの Run にバインド**します。違う Run への変更は `consumer_fenced` で
   拒否されるため、介入ツールだけが必要に応じて `run-use` でバインドを切り替えて 1 回だけ再試行します
   (poll / 観測ツールは切り替えません)。変更系は MCP サーバー内で直列化します
@@ -544,11 +563,13 @@ poll を打ち切る前に数回待ってください。**launcher 運用では�
 | `cancel_incomplete`(`fullyStopped: false`) | Commander の worker を止められなかった | 対象 task は未更新。pane を確認して worker を止めてから cancel し直す |
 | `cancel_scope_too_large` / `cancel_dispatch_scope_too_large` | 子孫 12 件超 / 1 タスク 3 dispatch 超 | 何も変更していません。`cascade: false` か個別 cancel を選ぶ |
 | `cancel_ownership_unverified` | 所有が `verified` でない sub-run がある(来歴の pane key / incarnation が確認できない) | 何も変更していません。`detail.subRuns[]` の `ownership` / `verificationReasons` を確認し、`includeSubRuns: false` で本体だけ止めるか sub-run を Run 名指しで個別 cancel する |
-| cancel が `fullyStopped: false`(`cancelled: true`) | 停止後に読み直して worker が生存している / sub-run 探索を打ち切った | `residualWorkers[]` の task / dispatch を pane で確認。`subRunScanComplete` / `subRunsTruncated` が false / true なら探索が未完 |
+| cancel が `fullyStopped: false`(`cancelled: true`) | 停止後に読み直して worker が生存している / 探索を打ち切った | `residualWorkers[]` の task / dispatch を pane で確認。`subRunScanComplete` / `subRunsTruncated` / `subRunWorkerScanComplete` / `status: "scan_incomplete"` が未完のしるし |
+| `cancel_discovery_incomplete` | cancel の前提(worker-list / run-list / Commander の handle)が読めない・打ち切った | 何も変更していません。`detail.discoveryFailures[]` を確認。sub-run を巻き込まず止めるなら `cascade: false` / `includeSubRuns: false` |
 | poll の `subRunOwnershipComplete: false` | sub-run の来歴が確認できない(terminal list が読めない等) | 観測には出るが auto-cancel はしない。`subRuns[].ownership` を見て判断する |
 | cancel した task が `failed` に見える | `cancelled` は MCP 側の論理状態 | 実体は `status: failed` + `result: "cancelled: <reason>"`。想定どおり |
 | `gate_not_found` | その Run に gate が無い | `run` を対象 Run に直す(`gate-list` は Run バインドスコープ)。sub-run のゲートは `gates[].runId` の Run で見る |
 | `gate_run_mismatch` | 渡した `run` とゲートの所属 Run が違う | 何も変更していません。poll の `gates[].runId` / `blockedReasons[].detail.runId` を `run` に渡す |
+| `gate_task_mismatch` | `taskId` を渡したのに、ゲートの task がその task(とその部分木)に属さない | 何も変更していません。`detail.gateTaskId` を確認し、そのゲートの所属 task を `taskId` に渡すか `taskId` を外す |
 | gate 解決が `run_required`("No Run is bound") | 呼び出し元ターミナルの Run バインドが空(pane の実体化で失われる) | `orca_resolve_gate` は `run` 名義で `run-use` して 1 回再試行するので通常は自動復旧します(実測で復旧)。外から `orca` を直接叩く場合は先に `orca orchestration run-use --id <ゲートの Run>` |
 | gate 解決が `runtime_error: Gate not found` | バインドが別 Run に動いた(同じターミナルで他のプロセスが `run-create` した 等) | 何も変更されていません。ゲートの Run を名指しで `run-use` した直後に**同じプロセスで**解決してください(バインドはターミナル共有の状態) |
 | `orca 起動失敗: orca CLI が見つかりませんでした` | PATH / `ORCA_BIN` | PATH を確認するか `ORCA_BIN` にバイナリパスを指定 |

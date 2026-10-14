@@ -48,6 +48,7 @@ const report = {
   subRunScanPageCount: view["subRunScanPageCount"],
   subRunScanRunCount: view["subRunScanRunCount"],
   subRunOwnershipComplete: view["subRunOwnershipComplete"],
+  subRunWorkerScanComplete: view["subRunWorkerScanComplete"],
   subRuns: subRuns.map((row) => ({
     runId: row["runId"],
     ownership: row["ownership"],
@@ -93,6 +94,9 @@ if (subRuns.length > 0) {
 }
 if (typeof view["subRunScanComplete"] !== "boolean") {
   failures.push("subRunScanComplete が無い(スキャンの完全性を正直に出していない)");
+}
+if (typeof view["subRunWorkerScanComplete"] !== "boolean") {
+  failures.push("subRunWorkerScanComplete が無い(worker ページングの打ち切りを正直に出していない)");
 }
 const gateReasons = reasons.filter((row) => row["kind"] === "gate");
 if (gateReasons.length > 0) {

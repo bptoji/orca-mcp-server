@@ -49,7 +49,7 @@ export function registerInterveneTools(server: McpServer, client: OrcaClient): v
     {
       title: "Orca Cancel Task",
       description:
-        "委譲ジョブをキャンセルする。内部では orca CLI の手順どおり、対象タスクの dispatch を worker-stop(または mode=abandon なら worker-abandon)で fence してから `task-update --status failed --result cancelled` を呼ぶ。既定 cascade: true で、Commander が分解した**子孫タスクとその worker を子から順**に止める(cascade の由来)。まず全対象の dispatch を読み切る preflight を行い、子孫 12 件超は cancel_scope_too_large、1 タスク 3 dispatch 超は cancel_dispatch_scope_too_large で**何も変更する前に**断る。Commander の fence に 1 件でも失敗すれば cancel_incomplete(state: partial / cancelled: false)で対象 task は更新しない。成功応答の fullyStopped は「全 worker を止められたか」を意味する。完了済み・キャンセル済みのタスクには何もしない(冪等)。worktree やターミナルの削除は行わない。**sub-run**: Commander が sub-run を作っている場合、task ツリーだけ追う cascade はその worker を走りたままにする(実測)。既定 includeSubRuns: true は run-list の coordinatorHandle 照合で sub-run の部分木を cascade 対象に組み込み、**呼び出し元 Run の Commander より先に**止める(拾った Run は subRunsDiscovered / subRuns に載せる)。上限 12 件は sub-run 込みの件数で判定する。**所有検証**: auto-cancel は pane key / process incarnation まで一致した verified の sub-run だけ — 検証に失敗した sub-run が 1 件でもあれば preflight で cancel_ownership_unverified を返し、**何も変更しない**(probable を叩くと別 job の worker を止める事故になる)。sub-run を含めずに止める逃げ道は includeSubRuns: false / cascade: false。同一 dispatch は 1 回だけ叩く。停止後は worker-list を読み直し、残っている worker を residualWorkers に載せ、その 1 件でも fullyStopped: false(探索を打ち切った場合も false)。",
+        "委譲ジョブをキャンセルする。内部では orca CLI の手順どおり、対象タスクの dispatch を worker-stop(または mode=abandon なら worker-abandon)で fence してから `task-update --status failed --result cancelled` を呼ぶ。既定 cascade: true で、Commander が分解した**子孫タスクとその worker を子から順**に止める(cascade の由来)。まず全対象の dispatch を読み切る preflight を行い、子孫 12 件超は cancel_scope_too_large、1 タスク 3 dispatch 超は cancel_dispatch_scope_too_large で**何も変更する前に**断る。Commander の fence に 1 件でも失敗すれば cancel_incomplete(state: partial / cancelled: false)で対象 task は更新しない。成功応答の fullyStopped は「全 worker を止められたか」を意味する。完了済み・キャンセル済みのタスクには何もしない(冪等)。worktree やターミナルの削除は行わない。**sub-run**: Commander が sub-run を作っている場合、task ツリーだけ追う cascade はその worker を走りたままにする(実測)。既定 includeSubRuns: true は run-list の coordinatorHandle 照合で sub-run の部分木を cascade 対象に組み込み、**呼び出し元 Run の Commander より先に**止める(拾った Run は subRunsDiscovered / subRuns に載せる)。上限 12 件は sub-run 込みの件数で判定する。**所有検証**: auto-cancel は pane key / process incarnation まで一致した verified の sub-run だけ — 検証に失敗した sub-run が 1 件でもあれば preflight で cancel_ownership_unverified を返し、**何も変更しない**(probable を叩くと別 job の worker を止める事故になる)。sub-run を含めずに止める逃げ道は includeSubRuns: false / cascade: false。同一 dispatch は 1 回だけ叩く。停止後は worker-list を読み直し、残っている worker を residualWorkers に載せ、その 1 件でも fullyStopped: false(探索を打ち切った場合も false)。**探索の完全性**: run-list / worker-list は cursor でページングし、上限到達・hasMore に対して nextCursor 無し・同じ cursor の周回を打ち切りとして検出する(subRunScanComplete / subRunWorkerScanComplete)。worker-list のページングを打ち切ったら完全停止を保証しない(fullyStopped: false)。cascade + includeSubRuns の既定構成では、前提となる読み取り(呼び出し元 Run の worker-list / sub-run 探索の run-list / Commander の terminal handle)が揃わないときに preflight で cancel_discovery_incomplete を返し、**何も変更しない**(見落とした worker を走りたまま cancelled: true で返さないため)。",
       inputSchema: cancelTaskInputSchema,
       annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
     },
@@ -71,7 +71,7 @@ export function registerInterveneTools(server: McpServer, client: OrcaClient): v
     {
       title: "Orca Resolve Gate",
       description:
-        "pending の判断ゲート(Decision Gate)を承認/却下して Commander を進める。内部で gate-list から対象を読み、`orca orchestration gate-resolve --id --resolution --json` を 1 回呼ぶだけ。gate は Run バインドスコープなので run は必須(consumer_fenced 時だけ run-use で切り替えて 1 回再試行)。run には poll(gates[].runId / blockedReasons[].detail.runId)で得た **そのゲートの所属 Run** を渡すこと — Commander が sub-run を作っていると、ゲートは呼び出し元 Run と違う Run に存在する。gateId と run の組が一致しない場合は何も変更せずに gate_run_mismatch で拒否する。解決済みのゲートには何もしない(冪等)。Commander Prompt が「承認ゲート無しでは merge/push/deploy をしない」と約束しているため、これを呼ぶ手段が無いとジョブが途中で止まる。",
+        "pending の判断ゲート(Decision Gate)を承認/却下して Commander を進める。内部で gate-list から対象を読み、`orca orchestration gate-resolve --id --resolution --json` を 1 回呼ぶだけ。gate は Run バインドスコープなので run は必須(consumer_fenced 時だけ run-use で切り替えて 1 回再試行)。run には poll(gates[].runId / blockedReasons[].detail.runId)で得た **そのゲートの所属 Run** を渡すこと — Commander が sub-run を作っていると、ゲートは呼び出し元 Run と違う Run に存在する。gateId と run の組が一致しない場合は何も変更せずに gate_run_mismatch で拒否する。解決済みのゲートには何もしない(冪等)。Commander Prompt が「承認ゲート無しでは merge/push/deploy をしない」と約束しているため、これを呼ぶ手段が無いとジョブが途中で止まる。**認可の境界**: gate-resolve は「Run ID と Gate ID を知る誰でも」解決できる CLI 構造で、MCP 側は単一ユーザー / 信頼できるクライアント前提の認可を持たない。自分の job のゲートだけを解決させたい場合は taskId(通常は orca_delegate_task の taskId)を渡す — ゲートの task がその task またはその部分木に属さなければ gate_task_mismatch で何も変更せずに拒否する。指定なしは所属 task を点検しない。",
       inputSchema: resolveGateInputSchema,
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     },
@@ -81,6 +81,7 @@ export function registerInterveneTools(server: McpServer, client: OrcaClient): v
           gateId: input.gateId,
           resolution: input.resolution,
           run: input.run,
+          taskId: input.taskId,
         }),
       ),
   );

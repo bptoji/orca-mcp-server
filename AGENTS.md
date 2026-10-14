@@ -245,7 +245,7 @@ docs/
 - ジョブ層の語彙は `JobError`(`task_not_found` / `task_id_missing` / `run_create_failed` /
   `outcome_required` / `outcome_not_allowed` / `dispatch_id_required` / `cancel_incomplete` /
   `cancel_scope_too_large` / `cancel_dispatch_scope_too_large` / `gate_not_found` / `gate_run_mismatch` /
-  `cancel_ownership_unverified`)。
+  `cancel_ownership_unverified` / `cancel_discovery_incomplete` / `gate_task_mismatch`)。
   CLI 側の語彙(`run_required` など)はそのまま転送する。
 - `state: "cancelled"` は **MCP 側の論理状態**(CLI に native status が無い)。実体は
   `status: failed` + `result: "cancelled: <reason>"`。README にその旨を 1 行書く。
@@ -307,6 +307,12 @@ orca CLI は **呼び出し元ターミナルを 1 つの Run にバインド**�
   **`run` はゲートの所属 Run**(poll の `gates[].runId`)でなければならない — 行の `run_id` が指定 Run と
   一致しないなら `gate_run_mismatch` で**何も変更する前に**拒否する(`runMutation` が gate 側の Run へ
   binding を切り替え、別 Run のゲートを解決してしまう。実測: ゲートは sub-run にあり呼び出し元 Run は 0 件)。
+- **認可の境界を明文化する**: `gate-resolve` は「Run ID と Gate ID を知る誰でも」解決できる CLI 構造で、
+  MCP 側は単一ユーザー / 信頼できるクライアント前提の認可を持たない(HTTP で他 PC に公開する運用は
+  トークン必須で、承認権限は運用側で確認する)。呼び出し側が「自分の job のゲート」を宣言できる口として
+  `orca_resolve_gate` の `taskId`(任意)を持つ — 指定した task と、その `task-create` 部分木に属さない
+  ゲートは `gate_task_mismatch` で**変更前に**拒否する(指定なしは点検しない。既存 API との互換性を保つため
+  既定の挙動は変えない)。
 
 ### sub-run(Commander が別の Run を作ってしまう事故)の扱い
 
@@ -328,6 +334,10 @@ sub-run の worker を走りたままにした)。設計は `docs/design/sub-run
 - **run-list / worker-list は cursor でページングする**(実測: `run-list --limit 60` は 60 件 + `nextCursor`、
   `worker-list` は 100 件で `page.hasMore` / `page.nextCursor`)。上限は `MAX_SCAN_PAGES = 5` /
   `MAX_WORKER_PAGES = 3` で、打ち切ったら `subRunScanComplete: false` + warning を出す(1 ページだけ見て「無い」と言わない)。
+  ページングは `scanPaged()` に集約し、**完走したかを必ず返す**(`stopReason` は `page_limit` /
+  `has_more_without_cursor` / `cursor_repeat` — `hasMore: true` なのに `nextCursor` が無い、同じ cursor が戻る
+  異常も打ち切りとして扱う)。worker 側の打ち切りは `subRunWorkerScanComplete: false` に載せ、
+  cancel はその場合 `fullyStopped: false` にする(worker 行の取りこぼしはそのまま停止漏れになる)。
 - **所有関係は 4 段階で判定し、破壊的操作には `verified` だけ使う**(`classifySubRunOwnership`):
   `verified` = coordinator_handle 一致 + root の `created_by_pane_key`(tabId:leafId)と
   `created_by_process_incarnation`(ptyId:incarnationId)が `terminal list` と一致し矛盾なし、
@@ -349,7 +359,13 @@ sub-run の worker を走りたままにした)。設計は `docs/design/sub-run
   別 job・別 terminal の worker を止める)。逃げ道は `includeSubRuns: false` / `cascade: false`。
   同一 dispatch は 1 回だけ叩く(`fencedDispatchIds`)。
 - **停止後は worker-list を読み直す**(`residualLiveWorkers`)。生存 worker が 1 件でもあれば
-  `residualWorkers[]` に載せて `fullyStopped: false`。探索を打ち切った場合も `fullyStopped: false`。
+  `residualWorkers[]` に載せて `fullyStopped: false`。探索を打ち切った場合も `fullyStopped: false`
+  (読み直せない Run は `residualWorkers[]` に `status: "scan_incomplete"` を残す)。
+- **cancel は探索の前提が揃わなければ preflight で断る**(`cancel_discovery_incomplete`、変更ゼロ):
+  呼び出し元 Run の worker-list が読めない / ページングを打ち切った / worker がいるのに Commander の
+  terminal handle が取れない / sub-run 探索の run-list が読めない。これらは warning に流すだけでは
+  「見落とした worker を走りたまま `cancelled: true`」になる(実装当初は worker-list 失敗が
+  `captureSubRuns` の結果で上書きされて消えていた)。逃げ道は `cascade: false` / `includeSubRuns: false`。
 - 集約の失敗(run-list 読めず / sub-run の task-list 読めず)は **poll / cancel / result を壊さず `warnings` だけ**添える。
   観測でしかないので cancel では対象を絞る(変更系を sub-run に増やさない)。
 - `run-list` / `run-show` は読み取り専用なので poll / result ハンドラーで呼んでよい(AGENTS.md の読み集めの範囲)。

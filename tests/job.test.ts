@@ -1315,6 +1315,80 @@ describe("resolveGate(介入 / Human-in-the-loop)", () => {
     expect(calls[0]).toContain('"run":"run_sub"');
   });
 
+  it("taskId を渡すと自分の job のゲートか点検し、無関係なら gate_task_mismatch で変更前に拒否する", async () => {
+    // 認可の境界(review10 §3): gate-resolve は「Run ID と Gate ID を知る誰でも」解決できる CLI 構造。
+    // 呼び出し側が「自分の job のゲート」と宣言したなら、その job に属さないゲートを叩かない。
+    const { client, calls } = createFakeClient({
+      gateList: {
+        ok: true,
+        result: {
+          gates: [{ id: "gate_other", run_id: "run_sub", task_id: "task_of_other_job", question: "q", status: "pending" }],
+        },
+      },
+      taskList: {
+        ok: true,
+        result: { tasks: [{ id: "task_cmd", run_id: "run_sub", parent_id: null, status: "dispatched" }] },
+      },
+    });
+    const error = await resolveGate(client, {
+      gateId: "gate_other",
+      resolution: "approve",
+      run: "run_sub",
+      taskId: "task_cmd",
+    }).catch((e) => e);
+    expect(error).toBeInstanceOf(JobError);
+    expect((error as JobError).code).toBe("gate_task_mismatch");
+    expect((error as JobError).detail).toMatchObject({
+      gateId: "gate_other",
+      gateTaskId: "task_of_other_job",
+      requestedTaskId: "task_cmd",
+    });
+    expect(calls.some((call) => call.startsWith("gateResolve:"))).toBe(false);
+    expect(calls.some((call) => call.startsWith("runUse:"))).toBe(false);
+  });
+
+  it("taskId 自身とその部分木(task-create で分解した子)のゲートは解決できる", async () => {
+    const family = {
+      ok: true,
+      result: {
+        tasks: [
+          { id: "task_cmd", run_id: "run_sub", parent_id: null, status: "dispatched" },
+          { id: "task_child", run_id: "run_sub", parent_id: "task_cmd", status: "blocked" },
+        ],
+      },
+    };
+    const gateList = {
+      ok: true,
+      result: { gates: [{ id: "gate_child", run_id: "run_sub", task_id: "task_child", question: "q", status: "pending" }] },
+    };
+
+    const child = createFakeClient({ gateList, taskList: family });
+    const result = await resolveGate(child.client, {
+      gateId: "gate_child",
+      resolution: "approve",
+      run: "run_sub",
+      taskId: "task_cmd",
+    });
+    expect(result).toMatchObject({ gateId: "gate_child", resolved: true, taskId: "task_child" });
+
+    // 自分自身の task のゲートは task-list を読み足しせずに解決できる
+    const own = createFakeClient({
+      gateList: {
+        ok: true,
+        result: { gates: [{ id: "gate_own", run_id: "run_sub", task_id: "task_cmd", question: "q", status: "pending" }] },
+      },
+      taskList: family,
+    });
+    const ownResult = await resolveGate(own.client, {
+      gateId: "gate_own",
+      resolution: "approve",
+      run: "run_sub",
+      taskId: "task_cmd",
+    });
+    expect(ownResult).toMatchObject({ gateId: "gate_own", resolved: true });
+    expect(own.calls.some((call) => call.startsWith("taskList:"))).toBe(false);
+  });
+
   it("解決済みの gate には何もしない(冪等)", async () => {
     const { client, calls } = createFakeClient({
       gateList: {
@@ -2674,17 +2748,51 @@ describe("getTaskStatus(poll) — sub-run の所有判定とスキャンの完�
 
   it("run-list をページ上限で打ち切ったら scanComplete: false + warning", async () => {
     const { client } = createSubRunClient();
+    let seen = 0;
+    client.runList = (async () => {
+      seen += 1;
+      return {
+        ok: true,
+        result: {
+          runs: [{ id: "run_x", objective: "x", coordinator_handle: "term_other", created_at: "2026-10-13T06:53:49Z" }],
+          // 毎回新しい cursor を返す = 上限(MAX_SCAN_PAGES)まで歩き続ける
+          nextCursor: `cursor_next_${seen}`,
+        },
+      };
+    }) as unknown as typeof client.runList;
+    const view = await getTaskStatus(client, { taskId: "task_cmd", run: "run_caller" });
+    expect(view["subRunScanComplete"]).toBe(false);
+    expect(view["subRunScanPageCount"]).toBe(5);
+    expect((view["warnings"] as string[]).join("|")).toContain("打ち切りました(ページ上限に到達)");
+  });
+
+  it("同じ cursor が戻るページングはループとして打ち切る(無限に読み続けない)", async () => {
+    const { client } = createSubRunClient();
     client.runList = (async () => ({
       ok: true,
       result: {
         runs: [{ id: "run_x", objective: "x", coordinator_handle: "term_other", created_at: "2026-10-13T06:53:49Z" }],
-        nextCursor: "cursor_next",
+        nextCursor: "cursor_same",
       },
     })) as unknown as typeof client.runList;
     const view = await getTaskStatus(client, { taskId: "task_cmd", run: "run_caller" });
     expect(view["subRunScanComplete"]).toBe(false);
-    expect(view["subRunScanPageCount"]).toBe(5);
-    expect((view["warnings"] as string[]).join("|")).toContain("打ち切りました");
+    expect(view["subRunScanPageCount"]).toBe(2);
+    expect((view["warnings"] as string[]).join("|")).toContain("同じ cursor が戻った(ループ)");
+  });
+
+  it("hasMore: true に対して nextCursor が無い応答は打ち切りとして出す", async () => {
+    const { client } = createSubRunClient();
+    client.runList = (async () => ({
+      ok: true,
+      result: {
+        runs: [{ id: "run_x", objective: "x", coordinator_handle: "term_other", created_at: "2026-10-13T06:53:49Z" }],
+        page: { hasMore: true },
+      },
+    })) as unknown as typeof client.runList;
+    const view = await getTaskStatus(client, { taskId: "task_cmd", run: "run_caller" });
+    expect(view["subRunScanComplete"]).toBe(false);
+    expect((view["warnings"] as string[]).join("|")).toContain("hasMore: true に対して nextCursor が無い");
   });
 });
 
@@ -2732,5 +2840,82 @@ describe("cancelTask — 所有検証・dispatch 重複・停止後の読み直�
 
     await cancelTask(client, { taskId: "task_cmd", run: "run_caller" });
     expect(calls.filter((call) => call === "workerStop:disp_shared")).toHaveLength(1);
+  });
+
+  it("worker-list をページ上限で打ち切ったら subRunWorkerScanComplete: false + fullyStopped: false", async () => {
+    // review10 §1: worker 行の取りこぼしは停止漏れなので、打ち切りを完走として扱わない。
+    const { client } = createSubRunClient();
+    let seen = 0;
+    client.workerList = (async (input: JsonObject) => {
+      const run = input["run"];
+      const rows =
+        run === "run_sub"
+          ? [
+              { dispatchId: "disp_a", taskId: "task_sub_a", workerState: "stopped" },
+              { dispatchId: "disp_b", taskId: "task_sub_b", workerState: "stopped" },
+            ]
+          : [{ dispatchId: "disp_cmd", taskId: "task_cmd", workerState: "stopped" }];
+      if (run !== "run_sub") {
+        return { ok: true, result: { workers: rows } };
+      }
+      seen += 1;
+      // hasMore: true が続く = 3 ページ(MAX_WORKER_PAGES)で打ち切る
+      return { ok: true, result: { workers: rows, page: { hasMore: true, nextCursor: `cursor_${seen}` } } };
+    }) as unknown as typeof client.workerList;
+
+    const result = await cancelTask(client, { taskId: "task_cmd", run: "run_caller" });
+    expect(result["cancelled"]).toBe(true);
+    expect(result["subRunWorkerScanComplete"]).toBe(false);
+    expect(result["fullyStopped"]).toBe(false);
+    expect((result["residualWorkers"] as JsonObject[]).map((row) => row["status"])).toContain("scan_incomplete");
+    expect((result["warnings"] as string[]).join("|")).toContain("worker-list を 3 ページで打ち切りました");
+  });
+
+  it("cancel 前提の worker-list が読めなければ preflight で断る(cancel_discovery_incomplete / 変更ゼロ)", async () => {
+    // review10 §2: 探索の前提が欠けたまま進めると、見落とした worker を走りたまま cancelled: true で返す。
+    const { client, calls } = createSubRunClient();
+    client.workerList = (async () => {
+      throw new Error("worker list unavailable");
+    }) as unknown as typeof client.workerList;
+
+    const error = await cancelTask(client, { taskId: "task_cmd", run: "run_caller" }).catch((e) => e);
+    expect(error).toBeInstanceOf(JobError);
+    expect((error as JobError).code).toBe("cancel_discovery_incomplete");
+    expect((error as JobError).detail).toMatchObject({
+      taskId: "task_cmd",
+      runId: "run_caller",
+    });
+    expect((((error as JobError).detail as JsonObject)["discoveryFailures"] as string[]).join("|")).toContain("worker-list");
+    expect(calls.some((call) => call.startsWith("workerStop:"))).toBe(false);
+    expect(calls.some((call) => call.startsWith("taskUpdate:"))).toBe(false);
+    expect(calls.some((call) => call.startsWith("runUse:"))).toBe(false);
+  });
+
+  it("sub-run 探索の run-list が読めなければ preflight で断る(「sub-run は無い」と言わない)", async () => {
+    const { client, calls } = createSubRunClient();
+    client.runList = (async () => {
+      throw new Error("run list unavailable");
+    }) as unknown as typeof client.runList;
+
+    const error = await cancelTask(client, { taskId: "task_cmd", run: "run_caller" }).catch((e) => e);
+    expect(error).toBeInstanceOf(JobError);
+    expect((error as JobError).code).toBe("cancel_discovery_incomplete");
+    expect((error as JobError).detail).toMatchObject({ subRunScanComplete: false });
+    expect(calls.some((call) => call.startsWith("workerStop:"))).toBe(false);
+    expect(calls.some((call) => call.startsWith("taskUpdate:"))).toBe(false);
+  });
+
+  it("cascade: false / includeSubRuns: false なら探索を走らせない(逃げ道は生かす)", async () => {
+    const { client, calls } = createSubRunClient();
+    client.workerList = (async () => {
+      throw new Error("worker list unavailable");
+    }) as unknown as typeof client.workerList;
+
+    const cascadeOff = await cancelTask(client, { taskId: "task_cmd", run: "run_caller", cascade: false });
+    expect(cascadeOff["cancelled"]).toBe(true);
+
+    const subRunsOff = await cancelTask(client, { taskId: "task_cmd", run: "run_caller", includeSubRuns: false });
+    expect(subRunsOff["cancelled"]).toBe(true);
+    expect(calls.some((call) => call.startsWith("runList:"))).toBe(false);
   });
 });

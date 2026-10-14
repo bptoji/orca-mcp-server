@@ -219,3 +219,18 @@ review9 の「条件付き実装承認」(`orca-mcp_review9.txt` §2–§7)ど�
   「ゲートの Run を名指しで `run-use` して、そのまま同じプロセスで解決する」が正解(実測で成功)。
 - 残る未検証: sub-run を**作る** goal での verified 判定(検証 A が実データで確認済み)、
   `cancel_ownership_unverified` の実機発火(ユニットテストで固定)。
+
+## 9. review10 対応(2026-10-14、cancel 周辺と gate の境界)
+
+review10 が「Fix 前に優先して修正すること」と挙げた 3 点への対応。テストは 262 → **268**。
+
+| # | 指摘 | 対応 |
+|---|---|---|
+| 1 | worker 一覧のページングが途中で終わっても検知できない | `scanPaged()` に集約し **完走判定と `stopReason` を返す**(`page_limit` / `has_more_without_cursor` / `cursor_repeat`)。worker 側は `subRunWorkerScanComplete` に載せ、cancel は打ち切り時に `fullyStopped: false`。停止後の読み直しは読めない/打ち切った Run を `residualWorkers[]` に `status: "scan_incomplete"` として残す |
+| 2 | cancel 前の worker 一覧取得失敗が握りつぶされる | 失敗を `discoveryFailures` に保持し(従来は `captureSubRuns` の結果で上書きされて消えていた)、cascade + includeSubRuns の構成では **preflight で `cancel_discovery_incomplete` を返して変更ゼロ**。対象は 呼び出し元 Run の worker-list 失敗・ページング打ち切り・worker がいるのに handle が取れない・sub-run 探索の run-list 失敗。逃げ道は `cascade: false` / `includeSubRuns: false` |
+| 3 | gate 解決の job 所有権を検証していない | 認可の前提を README / AGENTS.md / ツール説明に明文化(単一ユーザー・信頼クライアント前提、HTTP 公開はトークン必須で承認権限は運用側)。`orca_resolve_gate` に任意の `taskId` を追加し、指定時はゲートの task がその task または `task-create` 部分木に属さなければ `gate_task_mismatch` で**変更前に**拒否(既定の挙動は変えない = 既存 API との互換) |
+
+- ページング異常のテスト: 同じ cursor が戻る応答は 2 ページで打ち切り(`cursor_repeat`)、
+  `page.hasMore: true` に対して `nextCursor` が無い応答は打ち切りとして warning に出す。
+- 打ち切りの worker scan を持つ cancel は `subRunWorkerScanComplete: false` + `fullyStopped: false`
+  (`residualWorkers[]` に `scan_incomplete`)で返ることをテストで固定。

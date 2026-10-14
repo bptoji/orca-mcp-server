@@ -189,7 +189,7 @@ const main = async () => {
         ` gates=${(last?.gates ?? []).length}` +
         ` subRuns=${last?.subRunsDiscovered ?? 0}` +
         ` scanComplete=${last?.subRunScanComplete}(pages=${last?.subRunScanPageCount}, runs=${last?.subRunScanRunCount})` +
-        ` ownershipComplete=${last?.subRunOwnershipComplete}`,
+        ` ownershipComplete=${last?.subRunOwnershipComplete} workerScanComplete=${last?.subRunWorkerScanComplete}`,
     );
     if (polls === 1 || polls % 5 === 0) {
       record(`poll#${polls}`, {
@@ -206,6 +206,7 @@ const main = async () => {
         subRunScanPageCount: last?.subRunScanPageCount,
         subRunScanRunCount: last?.subRunScanRunCount,
         subRunOwnershipComplete: last?.subRunOwnershipComplete,
+        subRunWorkerScanComplete: last?.subRunWorkerScanComplete,
         blockedReasons: last?.blockedReasons,
         warnings: last?.warnings,
       });
@@ -215,20 +216,24 @@ const main = async () => {
     for (const gate of pendingGates) {
       // gate-resolve には --run が無いので「ゲートの所属 Run」を叩く(sub-run のゲートは呼び出し元 Run と違う)
       const gateRun = typeof gate.runId === "string" && gate.runId.length > 0 ? gate.runId : runId;
+      // taskId を渡すと「自分の job のゲートか」を MCP 側が点検する(gate_task_mismatch で変更前に拒否)
       const resolved = await call("orca_resolve_gate", {
         gateId: gate.id,
         resolution: "approve (e2e)",
         run: gateRun,
+        taskId,
       });
-      log(`gate ${gate.id} → approve (e2e) run=${gateRun} isError=${resolved.isError}`);
+      log(`gate ${gate.id} → approve (e2e) run=${gateRun} taskId=${gate.taskId ?? null} isError=${resolved.isError}`);
       gatesResolved.push({
         gateId: gate.id,
         gateRun,
         callerRun: runId,
+        gateTaskId: gate.taskId ?? null,
+        requestedTaskId: taskId,
         question: gate.question ?? null,
         result: resolved.parsed,
       });
-      record("resolve_gate", { gateId: gate.id, gateRun, callerRun: runId, result: resolved.parsed });
+      record("resolve_gate", { gateId: gate.id, gateRun, callerRun: runId, taskId, result: resolved.parsed });
     }
 
     if (["completed", "failed", "cancelled"].includes(last?.state)) {
@@ -334,11 +339,13 @@ const main = async () => {
     polls,
     gatesResolved: gatesResolved.length,
     gateRuns: gatesResolved.map((gate) => `${gate.gateId}@${gate.gateRun}`),
+    gateTasks: gatesResolved.map((gate) => `${gate.gateId}@${gate.gateTaskId ?? "null"}`),
     subRunsDiscovered: last?.subRunsDiscovered ?? 0,
     subRunOwnership: (last?.subRuns ?? []).map((row) => `${row.runId}:${row.ownership}`),
     subRunScanComplete: last?.subRunScanComplete ?? null,
     subRunScanPageCount: last?.subRunScanPageCount ?? null,
     subRunScanRunCount: last?.subRunScanRunCount ?? null,
+    subRunWorkerScanComplete: last?.subRunWorkerScanComplete ?? null,
     resultChildren: (result.parsed?.children ?? []).length,
     cancelTaskId,
     cancelState: cancelView?.state ?? null,
