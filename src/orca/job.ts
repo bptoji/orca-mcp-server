@@ -622,6 +622,10 @@ export function toChildRow(child: JsonObject, workers: JsonObject[], sourceRunId
 export const MAX_SUB_RUNS = 3;
 /** run-list から読む行数(応答は keyset cursor 付きの作成順)。 */
 const SUB_RUN_SCAN_LIMIT = 50;
+/** run-list のページング上限(1 ページ 50 件 × 5 = 250 行。live で 60+ 件の実測あり)。 */
+const MAX_SCAN_PAGES = 5;
+/** worker-list のページング上限(1 ページ 100 件 × 3)。実測で page.hasMore / nextCursor あり。 */
+const MAX_WORKER_PAGES = 3;
 /** 対象タスクよりこれ以前に作られた run は除外する(TZ 表記ゆれ吸収用の安全策)。 */
 const SUB_RUN_CREATED_SKEW_MS = 24 * 60 * 60 * 1000;
 
@@ -676,6 +680,7 @@ function toEpoch(value: unknown): number | undefined {
 export function matchSubRuns(
   runs: JsonObject[],
   input: { callerRunId: string | null; handles: readonly string[]; taskCreatedAt?: unknown },
+  limit: number = MAX_SUB_RUNS,
 ): JsonObject[] {
   const handles = new Set(input.handles.filter((handle) => typeof handle === "string" && handle.length > 0));
   if (handles.size === 0) {
@@ -708,6 +713,197 @@ export function matchSubRuns(
 }
 
 /**
+ * sub-run の root 配列から「Commander が作った root」を 1 件に絞る(複数 root は信頼度を落とす)。
+ * 実測では 1 件(task_a9c5f6f06805)。複数ある = 同一 handle が複数の job を作っている可能性。
+ */
+function primaryRoot(roots: JsonObject[]): JsonObject | null {
+  return roots.length === 1 ? (roots[0] as JsonObject) : null;
+}
+
+/* ---------------------------------------------------------------------------
+ * sub-run の所有関係(review9 §4 / §6 の方針)
+ *
+ * handle 一致だけでは破壊的操作の対象にしない。実測で使えた来歴(1.4.222):
+ *   task 行  : created_by_terminal_handle / created_by_pane_key(tabId:leafId)
+ *              created_by_process_incarnation(ptyId:incarnationId)
+ *   terminal : handle / tabId / leafId / ptyId / incarnationId
+ * 実測一致(run_8d1d20524d42 の root と Commander terminal):
+ *   created_by_pane_key          == tabId:leafId
+ *   created_by_process_incarnation == ptyId:incarnationId
+ * objective のマーカーは誰でも書けるので「発見の候補」に留め、来歴と組み合わせて判定する。
+ * --------------------------------------------------------------------------- */
+
+/** Commander Prompt に書き込む objective マーカーの接頭辞(両者は同じ文言を使う)。 */
+export const SUB_RUN_MARKER_PREFIX = "orca-mcp-parent:";
+
+const PANE_KEY_KEYS = ["created_by_pane_key", "createdByPaneKey"] as const;
+const PROCESS_INCARNATION_KEYS = ["created_by_process_incarnation", "createdByProcessIncarnation"] as const;
+
+export type SubRunOwnership = "verified" | "probable" | "unverified" | "conflicting";
+
+/** 来歴照合に使う terminal 1 行の identity(terminal list から作る)。 */
+export interface TerminalIdentity {
+  handle: string;
+  tabId: string | null;
+  leafId: string | null;
+  ptyId: string | null;
+  incarnationId: string | null;
+}
+
+/** terminal list 応答から handle → identity の対応表を作る(テスト対象)。 */
+export function buildTerminalIdentities(payload: JsonObject): Map<string, TerminalIdentity> {
+  const source = unwrapResult(payload);
+  const raw = source["terminals"] ?? source["items"];
+  const rows = Array.isArray(raw) ? raw.filter(isJsonObject) : [];
+  const identities = new Map<string, TerminalIdentity>();
+  for (const row of rows) {
+    const handle = pickString(row, ["handle", "terminalHandle", "terminal_handle"]);
+    if (handle === undefined) {
+      continue;
+    }
+    identities.set(handle, {
+      handle,
+      tabId: pickString(row, ["tabId", "tab_id"]) ?? null,
+      leafId: pickString(row, ["leafId", "leaf_id"]) ?? null,
+      ptyId: pickString(row, ["ptyId", "pty_id"]) ?? null,
+      incarnationId: pickString(row, ["incarnationId", "incarnation_id"]) ?? null,
+    });
+  }
+  return identities;
+}
+
+/**
+ * objective へ書き込まれた親 Job マーカーを取り出す(テスト対象)。
+ *
+ * 書式: `orca-mcp-parent: run=<runId> task=<taskId>`(task 省略可)。
+ * マーカーは**誰でも書ける**ので、これだけで所有を確定してはならない(review9 §4)。
+ */
+export function parseParentMarker(objective: unknown): { runId: string | null; taskId: string | null } | null {
+  if (typeof objective !== "string") {
+    return null;
+  }
+  const index = objective.indexOf(SUB_RUN_MARKER_PREFIX);
+  if (index < 0) {
+    return null;
+  }
+  const tail = objective.slice(index + SUB_RUN_MARKER_PREFIX.length, index + SUB_RUN_MARKER_PREFIX.length + 200);
+  const run = /run\s*=\s*([A-Za-z0-9_-]+)/.exec(tail);
+  const task = /task\s*=\s*([A-Za-z0-9_-]+)/.exec(tail);
+  return { runId: run?.[1] ?? null, taskId: task?.[1] ?? null };
+}
+
+export interface OwnershipVerdict {
+  ownership: SubRunOwnership;
+  cancelEligible: boolean;
+  verificationReasons: string[];
+  source: "explicit" | "provenance" | "handle" | "none";
+}
+
+/**
+ * sub-run の所有関係を判定する(テスト対象)。
+ *
+ * verified  : coordinator_handle 一致 + pane key / incarnation の 2 系統が一致、矛盾なし
+ * probable  : handle 一致のみ(来歴の確認が取れない)= 破壊的操作には使わない
+ * unverified: handle 一致が取れない / root が特定できない
+ * conflicting: 来歴が矛盾する、またはマーカーが別の Run を指す
+ */
+export function classifySubRunOwnership(input: {
+  run: JsonObject;
+  roots: JsonObject[];
+  handles: readonly string[];
+  callerRunId: string | null;
+  terminals: Map<string, TerminalIdentity>;
+}): OwnershipVerdict {
+  const handle = pickString(input.run, COORDINATOR_HANDLE_KEYS);
+  if (typeof handle !== "string" || !input.handles.includes(handle)) {
+    return {
+      ownership: "unverified",
+      cancelEligible: false,
+      verificationReasons: ["coordinator_handle が Commander の handle と一致しない"],
+      source: "none",
+    };
+  }
+  const reasons: string[] = ["coordinator_handle 一致"];
+
+  const marker = parseParentMarker(input.run["objective"]);
+  if (marker !== null) {
+    if (input.callerRunId !== null && marker.runId !== null && marker.runId !== input.callerRunId) {
+      return {
+        ownership: "conflicting",
+        cancelEligible: false,
+        verificationReasons: [...reasons, `objective のマーカーが別の Run(${marker.runId})を指す`],
+        source: "explicit",
+      };
+    }
+    reasons.push(marker.taskId !== null ? "objective マーカーの親 run / task が一致" : "objective マーカーの親 Run が一致");
+  }
+
+  const root = primaryRoot(input.roots);
+  if (root === null) {
+    return {
+      ownership: "unverified",
+      cancelEligible: false,
+      verificationReasons: [...reasons, `root が 1 件に特定できない(${input.roots.length} 件)`],
+      source: marker !== null ? "explicit" : "handle",
+    };
+  }
+
+  const createdBy = pickString(root, CREATED_BY_HANDLE_KEYS);
+  if (createdBy !== undefined && createdBy !== handle) {
+    return {
+      ownership: "conflicting",
+      cancelEligible: false,
+      verificationReasons: [...reasons, "root の created_by_terminal_handle が Commander の handle と違う"],
+      source: "provenance",
+    };
+  }
+
+  const identity = input.terminals.get(handle);
+  let matches = 0;
+  let conflicts = 0;
+  const paneKey = pickString(root, PANE_KEY_KEYS);
+  if (paneKey !== undefined) {
+    if (identity?.tabId !== null && identity?.leafId !== null && identity !== undefined) {
+      if (paneKey === `${identity.tabId}:${identity.leafId}`) {
+        matches += 1;
+        reasons.push("pane key(tabId:leafId)一致");
+      } else {
+        conflicts += 1;
+      }
+    }
+  }
+  const incarnation = pickString(root, PROCESS_INCARNATION_KEYS);
+  if (incarnation !== undefined) {
+    if (identity?.ptyId !== null && identity?.incarnationId !== null && identity !== undefined) {
+      if (incarnation === `${identity.ptyId}:${identity.incarnationId}`) {
+        matches += 1;
+        reasons.push("process incarnation(ptyId:incarnationId)一致");
+      } else {
+        conflicts += 1;
+      }
+    }
+  }
+
+  if (conflicts > 0) {
+    return {
+      ownership: "conflicting",
+      cancelEligible: false,
+      verificationReasons: [...reasons, `来歴の不一致が ${conflicts} 件`],
+      source: "provenance",
+    };
+  }
+  if (matches >= 2) {
+    return { ownership: "verified", cancelEligible: true, verificationReasons: reasons, source: "provenance" };
+  }
+  return {
+    ownership: "probable",
+    cancelEligible: false,
+    verificationReasons: [...reasons, "pane key / incarnation の来歴確認が取れない"],
+    source: marker !== null ? "explicit" : "handle",
+  };
+}
+
+/**
  * sub-run の task 配列から、Commander 配下の **root**(sub-run 内で親を持たない行)を拾う(テスト対象)。
  *
  * 実測: Commander は sub-run 内で新しい root task を作り、子 6 件はその root を指す。
@@ -733,7 +929,7 @@ export function selectSubRunRoots(tasks: JsonObject[], handles: readonly string[
 }
 
 interface SubRunCapture {
-  /** 監査用に、何を sub-run として見つけたか(run 行)。 */
+  /** 監査用に、何を sub-run として見つけたか(run 行 + 所有判定)。 */
   subRuns: JsonObject[];
   /** 呼び出し元タスクの direct children として見せる行(sub-run の root)。 */
   childTasks: JsonObject[];
@@ -744,6 +940,18 @@ interface SubRunCapture {
   /** sub-run 内の gate(部分木に紐づくものだけ)。 */
   gates: JsonObject[];
   warnings: string[];
+  /** run-list を cursor で読み切ったか(打ち切ったら false)。 */
+  scanComplete: boolean;
+  /** run-list を何ページ読んだか。 */
+  scanPageCount: number;
+  /** 走査した run 行数(照合前のスキャン総数)。 */
+  scanRunCount: number;
+  /** 1 ページの limit。 */
+  scanLimit: number;
+  /** 照合が MAX_SUB_RUNS で打ち切られたか。 */
+  subRunsTruncated: boolean;
+  /** 見つけた sub-run の所有関係がすべて verified か(0 件なら true)。 */
+  ownershipComplete: boolean;
 }
 
 const EMPTY_CAPTURE: SubRunCapture = {
@@ -753,13 +961,67 @@ const EMPTY_CAPTURE: SubRunCapture = {
   workers: [],
   gates: [],
   warnings: [],
+  scanComplete: true,
+  scanPageCount: 0,
+  scanRunCount: 0,
+  scanLimit: SUB_RUN_SCAN_LIMIT,
+  subRunsTruncated: false,
+  ownershipComplete: true,
 };
+
+/** ページ応答の次カーソル(run-list は result 直下、worker-list は page.nextCursor: 実測)。 */
+function nextCursorOf(payload: JsonObject): string | null {
+  const page = isJsonObject(payload["page"]) ? (payload["page"] as JsonObject) : null;
+  return pickString(payload, ["nextCursor", "cursor"]) ?? (page === null ? null : pickString(page, ["nextCursor", "cursor"]) ?? null);
+}
+
+/**
+ * run-list を cursor で読み集める(P3: 1 ページだけ見て「無い」と判定しない)。
+ * 実測で live の run-list は limit 60 で 60 件 + nextCursor を返す = 打ち切りは現実に起きる。
+ */
+async function scanRunRows(
+  client: OrcaClient,
+): Promise<{ rows: JsonObject[]; pages: number; complete: boolean }> {
+  const rows: JsonObject[] = [];
+  let cursor: string | undefined;
+  let pages = 0;
+  for (let page = 0; page < MAX_SCAN_PAGES; page += 1) {
+    const listed = unwrapResult(await client.runList({ limit: SUB_RUN_SCAN_LIMIT, cursor }));
+    const batch = extractRuns(listed);
+    rows.push(...batch);
+    pages += 1;
+    const next = nextCursorOf(listed);
+    if (next === null || batch.length === 0) {
+      return { rows, pages, complete: next === null };
+    }
+    cursor = next;
+  }
+  return { rows, pages, complete: false };
+}
+
+/** worker-list をページングして全行読む(worker-list は 100 件で page.hasMore を返す: 実測)。 */
+async function scanWorkerRows(client: OrcaClient, runId: string): Promise<JsonObject[]> {
+  const rows: JsonObject[] = [];
+  let cursor: string | undefined;
+  for (let page = 0; page < MAX_WORKER_PAGES; page += 1) {
+    const payload = unwrapResult(await client.workerList({ run: runId, limit: 100, cursor }));
+    const batch = extractWorkers(payload);
+    rows.push(...batch);
+    const next = nextCursorOf(payload);
+    if (next === null || batch.length === 0) {
+      return rows;
+    }
+    cursor = next;
+  }
+  return rows;
+}
 
 /**
  * Commander が自作した sub-run を読み集める(**読み取りだけ**)。
  *
  * 失敗しても poll / cancel / result は壊さない(run-list が読めなければ warning だけ添える)。
  * 呼び出し元 Run には現れない配下を拾うのが目的なので、`sourceRunId` を全結果に載せる。
+ * 所有関係(P2)とスキャンの完全性(P3)を応答に載せ、破壊的操作の対象は cancel 側で絞る。
  */
 async function captureSubRuns(
   client: OrcaClient,
@@ -775,24 +1037,62 @@ async function captureSubRuns(
   }
 
   const warnings: string[] = [];
-  let matched: JsonObject[];
+  let rows: JsonObject[];
+  let pages = 0;
+  let scanComplete = false;
   try {
-    const listed = unwrapResult(
-      await client.runList({ limit: SUB_RUN_SCAN_LIMIT }),
-    );
-    matched = matchSubRuns(extractRuns(listed), {
-      callerRunId: input.callerRunId,
-      handles: input.handles,
-      taskCreatedAt: input.taskCreatedAt,
-    });
+    const scanned = await scanRunRows(client);
+    rows = scanned.rows;
+    pages = scanned.pages;
+    scanComplete = scanned.complete;
   } catch (error) {
-    return { ...EMPTY_CAPTURE, warnings: [`sub-run 探索の run-list に失敗: ${failureLine(error)}`] };
+    return {
+      ...EMPTY_CAPTURE,
+      scanComplete: false,
+      warnings: [`sub-run 探索の run-list に失敗: ${failureLine(error)}`],
+    };
   }
-  if (matched.length === 0) {
-    return { ...EMPTY_CAPTURE, warnings };
+  if (!scanComplete) {
+    warnings.push(`sub-run 探索を ${pages} ページ(1 ページ ${SUB_RUN_SCAN_LIMIT} 件)で打ち切りました`);
   }
 
-  const capture: SubRunCapture = { ...EMPTY_CAPTURE, subRuns: [], childTasks: [], subtreeTasks: [], workers: [], gates: [], warnings };
+  const matchedAll = matchSubRuns(
+    rows,
+    { callerRunId: input.callerRunId, handles: input.handles, taskCreatedAt: input.taskCreatedAt },
+    MAX_SUB_RUNS + 1,
+  );
+  const subRunsTruncated = matchedAll.length > MAX_SUB_RUNS;
+  const matched = matchedAll.slice(0, MAX_SUB_RUNS);
+  if (subRunsTruncated) {
+    warnings.push(`sub-run の照合を ${MAX_SUB_RUNS} 件で打ち切りました(照合候補 ${matchedAll.length} 件)`);
+  }
+  if (matched.length === 0) {
+    return { ...EMPTY_CAPTURE, scanComplete, scanPageCount: pages, scanRunCount: rows.length, subRunsTruncated, warnings };
+  }
+
+  // 来歴(pane key / incarnation)の対応表。terminal list が読めなければ verified にはしない。
+  let terminals = new Map<string, TerminalIdentity>();
+  if (typeof client.terminalList === "function") {
+    try {
+      terminals = buildTerminalIdentities(unwrapResult(await client.terminalList({ limit: 200 })));
+    } catch (error) {
+      warnings.push(`来歴照合の terminal list に失敗: ${failureLine(error)}`);
+    }
+  }
+
+  const capture: SubRunCapture = {
+    ...EMPTY_CAPTURE,
+    subRuns: [],
+    childTasks: [],
+    subtreeTasks: [],
+    workers: [],
+    gates: [],
+    warnings,
+    scanComplete,
+    scanPageCount: pages,
+    scanRunCount: rows.length,
+    subRunsTruncated,
+  };
   for (const run of matched) {
     const runId = run["runId"] as string;
     try {
@@ -800,9 +1100,33 @@ async function captureSubRuns(
       const tasks = extractTasks(list);
       const roots = selectSubRunRoots(tasks, input.handles);
       if (roots.length === 0) {
+        capture.subRuns.push({
+          ...run,
+          taskCount: tasks.length,
+          rootTaskIds: [],
+          ownership: "unverified",
+          cancelEligible: false,
+          verificationReasons: ["sub-run 内に Commander の handle が作った root が見つからない"],
+          discoverySource: "none",
+        });
         continue;
       }
-      capture.subRuns.push({ ...run, taskCount: tasks.length, rootTaskIds: roots.map((row) => pickString(row, ID_KEYS) ?? null) });
+      const verdict = classifySubRunOwnership({
+        run,
+        roots,
+        handles: input.handles,
+        callerRunId: input.callerRunId,
+        terminals,
+      });
+      capture.subRuns.push({
+        ...run,
+        taskCount: tasks.length,
+        rootTaskIds: roots.map((row) => pickString(row, ID_KEYS) ?? null),
+        ownership: verdict.ownership,
+        cancelEligible: verdict.cancelEligible,
+        verificationReasons: verdict.verificationReasons,
+        discoverySource: verdict.source,
+      });
 
       const subtreeIds = new Set<string>();
       for (const root of roots) {
@@ -818,8 +1142,7 @@ async function captureSubRuns(
         }
       }
 
-      const workersPayload = unwrapResult(await client.workerList({ run: runId, limit: 100 }));
-      for (const row of extractWorkers(workersPayload).map(toWorkerRow)) {
+      for (const row of (await scanWorkerRows(client, runId)).map(toWorkerRow)) {
         const taskId = row["taskId"];
         if (typeof taskId === "string" && subtreeIds.has(taskId)) {
           capture.workers.push(row);
@@ -838,6 +1161,7 @@ async function captureSubRuns(
       warnings.push(`sub-run ${runId} の読み集めに失敗: ${failureLine(error)}`);
     }
   }
+  capture.ownershipComplete = capture.subRuns.every((row) => row["ownership"] === "verified");
   return capture;
 }
 
@@ -949,29 +1273,46 @@ Responsibilities:
 Gate ownership:
 You own every human-facing decision gate. Workers must not create gates for
 human approval — a worker that needs approval escalates to you, and you create
-the gate on your own task and resolve it when the human answers.
+the gate on your own task and resolve it when the human answers. Create gates
+inside {{runId}} so the caller can observe and resolve them.
 
-Run ownership:
+If gate-create fails: check the Run binding, retry it once safely, and if it
+still fails, stop the approval-requiring operation, report the exact error, and
+wait for correction or explicit intervention. Never proceed as if approval had
+been granted, and never substitute your own judgement for a missing gate.
+
+Run ownership and sub-run policy:
 The caller polls, collects results and cancels through exactly ONE Run: {{runId}}.
 Your task lives inside it — its id is in your dispatch preamble, and you can
 confirm it with: orca orchestration task-list --run {{runId}} --json
 
-Create every child task inside that Run, with --parent set to your own task id:
+Reuse that Run for ordinary child tasks, supervised workers, and decision gates:
 
   orca orchestration task-create --run {{runId}} --parent <your task id> --spec ...
   orca orchestration worker-start --run {{runId}} --task <child task id> --agent <worker agent>
 
-Never run run-create for sub-workers. A second Run splits the job your caller is
-polling: the tasks, workers and gates inside it stay invisible to the caller's
-orca_get_task_status / orca_cancel_task, so nothing there can stop them.
-If a run-scoped command reports "No Run is bound. Use orchestration run-create or
-run-use first.", that means run-use — NEVER run-create:
+Before any run-scoped operation, verify the current binding and bind to the
+existing Run when appropriate:
 
   orca orchestration run-use --id {{runId}} --json
 
-If binding keeps failing, do not improvise: finish what you can inside {{runId}}
-and report the blocker. If you ever did create another Run, list its exact id in
-your final report so the caller can find and cancel it.
+Do not create a new Run merely because the current terminal has no bound Run.
+Never create a Run to bypass a nested worker depth limit, a circuit-broken
+dispatch, a failed dispatch, or a missing Run binding: the version-matched guide
+says a new Run does not reset depth and must not route around those boundaries.
+
+A worker acting as an autonomous coordinator may create and manage a child Run
+when the guide you loaded supports that shape. Treat legacy Run takeover
+(run-use --takeover-legacy) as a separate operation — it is not permission to
+create a new Run.
+
+When you create a child Run:
+1. Keep the parent Run id and parent task id unchanged.
+2. Record the new Run id.
+3. Put this marker at the start of the child Run objective so the caller can
+   associate it with this job:  orca-mcp-parent: run={{runId}} task=<your task id>
+4. Report the child Run id and its relationship to this job in your final report.
+5. Finish every task inside it, so the caller's poll and cancel cover it.
 
 Completion boundary:
 Before declaring success, verify that every delegated child task has reached a
@@ -1328,6 +1669,12 @@ export async function getTaskStatus(client: OrcaClient, input: TaskStatusInput):
     children,
     subRuns: subCapture.subRuns,
     subRunsDiscovered: subCapture.subRuns.length,
+    subRunScanComplete: subCapture.scanComplete,
+    subRunsTruncated: subCapture.subRunsTruncated,
+    subRunScanPageCount: subCapture.scanPageCount,
+    subRunScanRunCount: subCapture.scanRunCount,
+    subRunScanLimit: subCapture.scanLimit,
+    subRunOwnershipComplete: subCapture.ownershipComplete,
     gates,
     blockedReasons,
     warnings,
@@ -1596,7 +1943,37 @@ export async function cancelTask(client: OrcaClient, input: CancelTaskInput): Pr
     };
   }
 
-  const targets = [...subCapture.subtreeTasks, ...descendants];
+  // P4 / P5(review9 §6): 所有検証に失敗した sub-run は auto-cancel の対象にしない。
+  // verified は coordinator_handle + pane key / incarnation まで一致した Run だけ。
+  // probable(来歴の確認が取れない)/ unverified / conflicting を叩くと、
+  // 別 job・別 terminal の worker を止める事故になる。
+  const eligibleRunIds = new Set(
+    subCapture.subRuns
+      .filter((row) => row["cancelEligible"] === true && typeof row["runId"] === "string")
+      .map((row) => row["runId"] as string),
+  );
+  const unverifiedRuns = subCapture.subRuns.filter((row) => row["cancelEligible"] !== true);
+  if (unverifiedRuns.length > 0) {
+    throw new JobError(
+      "cancel_ownership_unverified",
+      `sub-run ${unverifiedRuns.length} 件の所有関係が verified ではないため、何も変更していません(auto-cancel は verified のみ)。subRuns[].ownership / verificationReasons を確認してください。sub-run を含めずに止めるなら includeSubRuns: false(または cascade: false)、sub-run 側は Run を名指しで個別にキャンセルしてください`,
+      {
+        taskId: input.taskId,
+        runId,
+        subRuns: subCapture.subRuns.map((row) => ({
+          runId: row["runId"] ?? null,
+          ownership: row["ownership"] ?? null,
+          cancelEligible: row["cancelEligible"] ?? false,
+          verificationReasons: row["verificationReasons"] ?? [],
+        })),
+      },
+    );
+  }
+  const subRunTargets = subCapture.subtreeTasks.filter(
+    (row) => typeof row["__runId"] !== "string" || eligibleRunIds.has(row["__runId"]),
+  );
+
+  const targets = [...subRunTargets, ...descendants];
 
   // 上限超過は**何も変更する前に**断る。collectDescendants は post-order なので、
   // 子孫を 12 件で切ると末尾の root(Commander)だけが対象から漏れ、
@@ -1649,18 +2026,21 @@ export async function cancelTask(client: OrcaClient, input: CancelTaskInput): Pr
   const workers: JsonObject[] = [];
   const tasks: JsonObject[] = [];
   let fenceFailures = 0;
+  // 同一 dispatch を 2 回叩かない(sub-run 集約と task ツリーが同じ dispatch を重ねて持つことがある)。
+  const fencedDispatchIds = new Set<string>();
 
   // Phase 2: mutation — 子から順に「worker を fence → task を failed/cancelled」(CLI の手順)
   for (const target of targets) {
     const targetId = pickString(target, ID_KEYS) ?? input.taskId;
-    const dispatchIds = dispatchesByTarget.get(targetId);
-    if (dispatchIds === undefined) {
+    const dispatchIds = (dispatchesByTarget.get(targetId) ?? []).filter((dispatchId) => !fencedDispatchIds.has(dispatchId));
+    if (dispatchesByTarget.get(targetId) === undefined) {
       continue; // preflight で終端と判定した target
     }
 
     const fenced: JsonObject[] = [];
     const failedDispatches: string[] = [];
     for (const dispatchId of dispatchIds) {
+      fencedDispatchIds.add(dispatchId);
       try {
         const fencedResult = unwrapResult(
           mode === "abandon" ? await client.workerAbandon(dispatchId) : await client.workerStop(dispatchId),
@@ -1740,17 +2120,33 @@ export async function cancelTask(client: OrcaClient, input: CancelTaskInput): Pr
     }
   }
 
+  // P5(review9 §6): 停止後に worker を読み直し、残っている worker を正直に出す。
+  // 探索を打ち切った(scanComplete: false / subRunsTruncated)場合は「全部止めた」と宣言しない。
+  const cancelledTaskIds = new Set(tasks.map((row) => row["taskId"]).filter((id): id is string => typeof id === "string"));
+  const scanIncomplete = !subCapture.scanComplete || subCapture.subRunsTruncated;
+  const residual = await residualLiveWorkers(client, [runId, ...eligibleRunIds], cancelledTaskIds);
+  if (scanIncomplete) {
+    warnings.push("sub-run 探索を打ち切ったため、stop の完了を保証できません(fullyStopped: false)");
+  }
+  if (residual.length > 0) {
+    warnings.push(`停止後に読み直したところ ${residual.length} 個の worker が生存しています(pane を確認してください)`);
+  }
+
   return {
     taskId: input.taskId,
     state: "cancelled",
     cancelled: true,
-    // fence に 1 件でも失敗があれば fullyStopped: false(実プロセス停止の保証なし)
-    fullyStopped: fenceFailures === 0,
+    // fence 失敗 / 探索の打ち切り / 停止後も残った worker が 1 つでもあれば fullyStopped: false
+    fullyStopped: fenceFailures === 0 && !scanIncomplete && residual.length === 0,
     cascade,
     taskCount: tasks.length,
     runId,
     subRunsDiscovered: subCapture.subRuns.length,
     subRuns: subCapture.subRuns,
+    subRunScanComplete: subCapture.scanComplete,
+    subRunsTruncated: subCapture.subRunsTruncated,
+    subRunOwnershipComplete: subCapture.ownershipComplete,
+    residualWorkers: residual,
     mode,
     reason,
     tasks,
@@ -1760,6 +2156,39 @@ export async function cancelTask(client: OrcaClient, input: CancelTaskInput): Pr
       ? "CLI のキャンセル手順を子から順に適用しました(worker fence → task failed/cancelled)"
       : "CLI のキャンセル手順を対象タスクにだけ適用しました(cascade: false)",
   };
+}
+
+/** 停止後に読み直して、まだ走っている worker を返す(P5: fullyStopped の根拠を実データにする)。 */
+async function residualLiveWorkers(
+  client: OrcaClient,
+  runs: Array<string | null>,
+  taskIds: Set<string>,
+): Promise<JsonObject[]> {
+  const LIVE = new Set(["running", "blocked", "queued", "unknown"]);
+  const residual: JsonObject[] = [];
+  const seen = new Set<string>();
+  for (const run of runs) {
+    if (typeof run !== "string" || run.length === 0 || seen.has(run)) {
+      continue;
+    }
+    seen.add(run);
+    try {
+      for (const row of (await scanWorkerRows(client, run)).map(toWorkerRow)) {
+        const taskId = row["taskId"];
+        const status = row["status"];
+        if (typeof taskId !== "string" || !taskIds.has(taskId)) {
+          continue;
+        }
+        if (typeof status === "string" && LIVE.has(status)) {
+          residual.push({ taskId, dispatchId: row["dispatchId"] ?? null, runId: run, status });
+        }
+      }
+    } catch (error) {
+      // 読み直せない = 検証できないので、呼び出し側が判断できる形で残す
+      residual.push({ taskId: null, dispatchId: null, runId: run, status: "unreadable", error: failureLine(error) });
+    }
+  }
+  return residual;
 }
 
 /**

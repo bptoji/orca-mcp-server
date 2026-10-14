@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import type { JsonObject, OrcaClient } from "../src/orca/client.js";
 import {
+  buildTerminalIdentities,
   buildWorktreeName,
   cancelTask,
+  classifySubRunOwnership,
   collectDescendants,
   commanderSpec,
   estimatePhase,
@@ -19,9 +21,11 @@ import {
   JobError,
   mapTaskState,
   mapWorkerStatus,
+  parseParentMarker,
   resolveGate,
   selectSubRunRoots,
   sendMessage,
+  SUB_RUN_MARKER_PREFIX,
   toChildRow,
   toRunRow,
   toWorkerRow,
@@ -363,16 +367,23 @@ describe("delegateTask(submit / Commander API)", () => {
     expect(taskCreate).toContain("If loading the guide is blocked by a tool-permission prompt");
     expect(taskCreate).toContain("fall back to");
     expect(taskCreate).toContain("orca orchestration --help");
-    // 自分の Run の中で走る Commander が新しい Run を作って job を分断しない(E2E で実測)
-    expect(taskCreate).toContain("Run ownership:");
-    expect(taskCreate).toContain("Never run run-create for sub-workers");
-    expect(taskCreate).toContain("--parent set to your own task id");
-    // run-create を筆頭に勧げる CLI エラー文への先回り(run-use だと実句で書き込む)
-    expect(taskCreate).toContain("that means run-use — NEVER run-create");
-    expect(taskCreate).toContain("No Run is bound. Use orchestration run-create or");
-    // 逸脱した場合は Run ID の開示義務(sub-run が見つからず poll / cancel が届かないため)
-    expect(taskCreate).toContain("list its exact id in");
-    expect(taskCreate).toContain("your final report so the caller can find and cancel it");
+    // Run 所有権(review9 §3 の文言): 既存 Run を使い、深さ/ circuit-break / 失敗 dispatch /
+    // binding 無しの回避として run-create を作らせない
+    expect(taskCreate).toContain("Run ownership and sub-run policy:");
+    expect(taskCreate).toContain("Reuse that Run for ordinary child tasks");
+    expect(taskCreate).toContain("Do not create a new Run merely because the current terminal has no bound Run");
+    expect(taskCreate).toContain("Never create a Run to bypass a nested worker depth limit");
+    expect(taskCreate).toContain("does not reset depth");
+    // legacy takeover は別操作 = 新しい Run を作る許可ではない
+    expect(taskCreate).toContain("run-use --takeover-legacy");
+    expect(taskCreate).toContain("it is not permission to");
+    // 自律 coordinator は guide が許すときだけ child Run を作り、マーカーと報告で関連付ける
+    expect(taskCreate).toContain("A worker acting as an autonomous coordinator may create and manage a child Run");
+    expect(taskCreate).toContain(`${SUB_RUN_MARKER_PREFIX} run=run_test task=<your task id>`);
+    expect(taskCreate).toContain("Report the child Run id and its relationship to this job");
+    // gate 作成に失敗したら承認を進めない(人間への介入要求までが手順)
+    expect(taskCreate).toContain("If gate-create fails: check the Run binding");
+    expect(taskCreate).toContain("Never proceed as if approval had");
   });
 
   it("spec に runId が注入され、プレースホルダが 1 つも残らない", async () => {
@@ -2167,6 +2178,8 @@ describe("extractRuns / toRunRow", () => {
 /** sub-run を持つ family の fake client(実測ペイロードの形に寄せる)。 */
 function createSubRunClient(options: { runs?: JsonObject[] } = {}) {
   const calls: string[] = [];
+  // workerStop を叩いた dispatch は「stopped」に変わる(停止後の読み直しを実データにするため)
+  const stoppedDispatches = new Set<string>();
   const callerTasks: JsonObject[] = [
     {
       id: "task_cmd",
@@ -2183,6 +2196,9 @@ function createSubRunClient(options: { runs?: JsonObject[] } = {}) {
       run_id: "run_sub",
       parent_id: null,
       created_by_terminal_handle: "term_cmd",
+      // 実測で一致した来歴(terminal list の tabId:leafId / ptyId:incarnationId)
+      created_by_pane_key: "tab_1:leaf_1",
+      created_by_process_incarnation: "pty_1:inc_1",
       status: "blocked",
       result: "blocked: 承認ゲート待ち",
       created_at: "2026-10-13 06:55:24",
@@ -2217,6 +2233,10 @@ function createSubRunClient(options: { runs?: JsonObject[] } = {}) {
     },
     runList: async (input: JsonObject) => {
       calls.push(`runList:${JSON.stringify(input)}`);
+      // 実測の keyset cursor: 2 ページ目以降は空で終端する
+      if (input["cursor"] !== undefined) {
+        return { ok: true, result: { runs: [] } };
+      }
       return {
         ok: true,
         result: {
@@ -2237,16 +2257,20 @@ function createSubRunClient(options: { runs?: JsonObject[] } = {}) {
     workerList: async (input: JsonObject) => {
       const run = input["run"];
       calls.push(`workerList:${run ?? "bind"}`);
+      const rows =
+        run === "run_sub"
+          ? [
+              { dispatchId: "disp_a", taskId: "task_sub_a", workerState: "succeeded", agentTerminalHandle: "term_wa" },
+              { dispatchId: "disp_b", taskId: "task_sub_b", workerState: "in_progress", agentTerminalHandle: "term_wb" },
+            ]
+          : [{ dispatchId: "disp_cmd", taskId: "task_cmd", workerState: "in_progress", agentTerminalHandle: "term_cmd" }];
       return {
         ok: true,
         result: {
-          workers:
-            run === "run_sub"
-              ? [
-                  { dispatchId: "disp_a", taskId: "task_sub_a", workerState: "succeeded", agentTerminalHandle: "term_wa" },
-                  { dispatchId: "disp_b", taskId: "task_sub_b", workerState: "in_progress", agentTerminalHandle: "term_wb" },
-                ]
-              : [{ dispatchId: "disp_cmd", taskId: "task_cmd", workerState: "in_progress", agentTerminalHandle: "term_cmd" }],
+          workers: rows.map((row) => ({
+            ...row,
+            workerState: stoppedDispatches.has(row.dispatchId) ? "stopped" : row.workerState,
+          })),
         },
       };
     },
@@ -2270,6 +2294,7 @@ function createSubRunClient(options: { runs?: JsonObject[] } = {}) {
     },
     workerStop: async (dispatch: string) => {
       calls.push(`workerStop:${dispatch}`);
+      stoppedDispatches.add(dispatch);
       return { ok: true, result: { state: "stopped" } };
     },
     taskUpdate: async (input: JsonObject) => {
@@ -2280,7 +2305,12 @@ function createSubRunClient(options: { runs?: JsonObject[] } = {}) {
       calls.push(`runUse:${runId}`);
       return { ok: true, result: {} };
     },
-    terminalList: async () => ({ ok: true, result: { terminals: [] } }),
+    terminalList: async () => ({
+      ok: true,
+      result: {
+        terminals: [{ handle: "term_cmd", tabId: "tab_1", leafId: "leaf_1", ptyId: "pty_1", incarnationId: "inc_1" }],
+      },
+    }),
   };
   return { client: client as unknown as OrcaClient, calls };
 }
@@ -2415,7 +2445,18 @@ describe("cancelTask — sub-run まで止める cascade", () => {
         result: {
           tasks:
             run === "run_sub"
-              ? [{ id: "task_sub_root", run_id: "run_sub", parent_id: null, created_by_terminal_handle: "term_cmd", status: "dispatched" }, ...many]
+              ? [
+                  {
+                    id: "task_sub_root",
+                    run_id: "run_sub",
+                    parent_id: null,
+                    created_by_terminal_handle: "term_cmd",
+                    created_by_pane_key: "tab_1:leaf_1",
+                    created_by_process_incarnation: "pty_1:inc_1",
+                    status: "dispatched",
+                  },
+                  ...many,
+                ]
               : [{ id: "task_cmd", run_id: "run_caller", parent_id: null, status: "dispatched", assignee_handle: "term_cmd" }],
         },
       };
@@ -2447,5 +2488,215 @@ describe("getTaskResult(result) — sub-run の成果集約", () => {
     const result = await getTaskResult(client, { taskId: "task_cmd", run: "run_caller" });
     expect(result["children"]).toEqual([]);
     expect(calls.some((call) => call.startsWith("runList:"))).toBe(false);
+  });
+});
+
+describe("parseParentMarker / buildTerminalIdentities — 発見の候補と来歴", () => {
+  it("objective のマーカーから親の run / task を取り出す", () => {
+    expect(parseParentMarker(`orca-mcp-parent: run=run_caller task=task_cmd\nsub job`)).toEqual({
+      runId: "run_caller",
+      taskId: "task_cmd",
+    });
+    expect(parseParentMarker("orca-mcp-parent: run=run_x")).toEqual({ runId: "run_x", taskId: null });
+    expect(parseParentMarker("sub job")).toBeNull();
+  });
+
+  it("terminal list から handle → pane key / incarnation の対応表を作る", () => {
+    const identities = buildTerminalIdentities({
+      ok: true,
+      result: {
+        terminals: [
+          { handle: "term_cmd", tabId: "t1", leafId: "l1", ptyId: "p1", incarnationId: "i1" },
+          { tabId: "t2" },
+        ],
+      },
+    });
+    expect(identities.get("term_cmd")).toMatchObject({ tabId: "t1", leafId: "l1", ptyId: "p1", incarnationId: "i1" });
+    expect(identities.size).toBe(1);
+  });
+});
+
+describe("classifySubRunOwnership — handle 一致だけでは verified にしない", () => {
+  const terminals = buildTerminalIdentities({
+    ok: true,
+    result: { terminals: [{ handle: "term_cmd", tabId: "t1", leafId: "l1", ptyId: "p1", incarnationId: "i1" }] },
+  });
+  const run: JsonObject = { runId: "run_sub", coordinatorHandle: "term_cmd", objective: "sub" };
+  const root: JsonObject = {
+    id: "task_sub_root",
+    created_by_terminal_handle: "term_cmd",
+    created_by_pane_key: "t1:l1",
+    created_by_process_incarnation: "p1:i1",
+  };
+
+  it("pane key と incarnation が揃って一致すれば verified(auto-cancel の対象)", () => {
+    const verdict = classifySubRunOwnership({
+      run,
+      roots: [root],
+      handles: ["term_cmd"],
+      callerRunId: "run_caller",
+      terminals,
+    });
+    expect(verdict.ownership).toBe("verified");
+    expect(verdict.cancelEligible).toBe(true);
+    expect(verdict.source).toBe("provenance");
+  });
+
+  it("来歴が読めない handle 一致は probable(破壊的操作には使わない)", () => {
+    const verdict = classifySubRunOwnership({
+      run,
+      roots: [{ id: "task_sub_root", created_by_terminal_handle: "term_cmd" }],
+      handles: ["term_cmd"],
+      callerRunId: "run_caller",
+      terminals: new Map(),
+    });
+    expect(verdict.ownership).toBe("probable");
+    expect(verdict.cancelEligible).toBe(false);
+  });
+
+  it("pane key が一致しても incarnation が違えば conflicting", () => {
+    const verdict = classifySubRunOwnership({
+      run,
+      roots: [{ ...root, created_by_process_incarnation: "p9:i9" }],
+      handles: ["term_cmd"],
+      callerRunId: "run_caller",
+      terminals,
+    });
+    expect(verdict.ownership).toBe("conflicting");
+    expect(verdict.cancelEligible).toBe(false);
+  });
+
+  it("objective のマーカーは来歴と組み合わせてだけ使う(別の Run を指したら conflicting)", () => {
+    const verdict = classifySubRunOwnership({
+      run: { ...run, objective: "orca-mcp-parent: run=run_other task=task_x" },
+      roots: [root],
+      handles: ["term_cmd"],
+      callerRunId: "run_caller",
+      terminals,
+    });
+    expect(verdict.ownership).toBe("conflicting");
+    expect(verdict.verificationReasons.join("|")).toContain("別の Run");
+  });
+
+  it("マーカーだけでは verified にしない(来歴が読めなければ probable)", () => {
+    const verdict = classifySubRunOwnership({
+      run: { ...run, objective: "orca-mcp-parent: run=run_caller task=task_cmd" },
+      roots: [{ id: "task_sub_root", created_by_terminal_handle: "term_cmd" }],
+      handles: ["term_cmd"],
+      callerRunId: "run_caller",
+      terminals: new Map(),
+    });
+    expect(verdict.ownership).toBe("probable");
+    expect(verdict.source).toBe("explicit");
+  });
+
+  it("coordinator_handle が Commander の handle でなければ unverified", () => {
+    const verdict = classifySubRunOwnership({
+      run: { ...run, coordinatorHandle: "term_other" },
+      roots: [root],
+      handles: ["term_cmd"],
+      callerRunId: "run_caller",
+      terminals,
+    });
+    expect(verdict.ownership).toBe("unverified");
+    expect(verdict.cancelEligible).toBe(false);
+  });
+});
+
+describe("getTaskStatus(poll) — sub-run の所有判定とスキャンの完全性", () => {
+  it("subRuns に ownership / cancelEligible / verificationReasons を載せる", async () => {
+    const { client } = createSubRunClient();
+    const view = await getTaskStatus(client, { taskId: "task_cmd", run: "run_caller" });
+    const sub = (view["subRuns"] as JsonObject[])[0]!;
+    expect(sub).toMatchObject({
+      runId: "run_sub",
+      ownership: "verified",
+      cancelEligible: true,
+      discoverySource: "provenance",
+    });
+    expect((sub["verificationReasons"] as string[]).join("|")).toContain("pane key");
+    expect(view["subRunOwnershipComplete"]).toBe(true);
+  });
+
+  it("run-list を cursor でページングし、読み切った件数を応答に載せる", async () => {
+    const { client, calls } = createSubRunClient();
+    const view = await getTaskStatus(client, { taskId: "task_cmd", run: "run_caller" });
+    expect(view["subRunScanComplete"]).toBe(true);
+    expect(view["subRunScanPageCount"]).toBe(2);
+    expect(view["subRunScanRunCount"]).toBe(3);
+    const runListCalls = calls.filter((call) => call.startsWith("runList:"));
+    expect(runListCalls).toHaveLength(2);
+    expect(runListCalls[1]).toContain('"cursor":"cursor_1"');
+  });
+
+  it("来歴が読めない sub-run は probable とし、ownershipComplete を false にする", async () => {
+    const { client } = createSubRunClient();
+    client.terminalList = (async () => ({ ok: true, result: { terminals: [] } })) as unknown as typeof client.terminalList;
+    const view = await getTaskStatus(client, { taskId: "task_cmd", run: "run_caller" });
+    expect((view["subRuns"] as JsonObject[])[0]).toMatchObject({ ownership: "probable", cancelEligible: false });
+    expect(view["subRunOwnershipComplete"]).toBe(false);
+    expect(view["warnings"]).toEqual([]);
+  });
+
+  it("run-list をページ上限で打ち切ったら scanComplete: false + warning", async () => {
+    const { client } = createSubRunClient();
+    client.runList = (async () => ({
+      ok: true,
+      result: {
+        runs: [{ id: "run_x", objective: "x", coordinator_handle: "term_other", created_at: "2026-10-13T06:53:49Z" }],
+        nextCursor: "cursor_next",
+      },
+    })) as unknown as typeof client.runList;
+    const view = await getTaskStatus(client, { taskId: "task_cmd", run: "run_caller" });
+    expect(view["subRunScanComplete"]).toBe(false);
+    expect(view["subRunScanPageCount"]).toBe(5);
+    expect((view["warnings"] as string[]).join("|")).toContain("打ち切りました");
+  });
+});
+
+describe("cancelTask — 所有検証・dispatch 重複・停止後の読み直し", () => {
+  it("所有が verified でない sub-run があれば preflight で断る(何も変更しない)", async () => {
+    const { client, calls } = createSubRunClient();
+    client.terminalList = (async () => ({ ok: true, result: { terminals: [] } })) as unknown as typeof client.terminalList;
+    const error = await cancelTask(client, { taskId: "task_cmd", run: "run_caller" }).catch((e) => e);
+    expect(error).toBeInstanceOf(JobError);
+    expect((error as JobError).code).toBe("cancel_ownership_unverified");
+    expect((error as JobError).detail).toMatchObject({
+      subRuns: [{ runId: "run_sub", ownership: "probable", cancelEligible: false }],
+    });
+    expect(calls.some((call) => call.startsWith("workerStop:"))).toBe(false);
+    expect(calls.some((call) => call.startsWith("taskUpdate:"))).toBe(false);
+    expect(calls.some((call) => call.startsWith("runUse:"))).toBe(false);
+  });
+
+  it("停止後も worker が残っていれば fullyStopped: false で正直に返す", async () => {
+    const { client } = createSubRunClient();
+    // workerStop を叩いても worker-list は in_progress を返し続ける(= 実際に止まっていない)
+    client.workerList = (async (input: JsonObject) => ({
+      ok: true,
+      result: {
+        workers:
+          input["run"] === "run_sub"
+            ? [{ dispatchId: "disp_b", taskId: "task_sub_b", workerState: "in_progress" }]
+            : [{ dispatchId: "disp_cmd", taskId: "task_cmd", workerState: "in_progress" }],
+      },
+    })) as unknown as typeof client.workerList;
+
+    const result = await cancelTask(client, { taskId: "task_cmd", run: "run_caller" });
+    expect(result["cancelled"]).toBe(true);
+    expect(result["fullyStopped"]).toBe(false);
+    expect((result["residualWorkers"] as JsonObject[]).map((row) => row["taskId"])).toEqual(["task_cmd", "task_sub_b"]);
+    expect((result["warnings"] as string[]).join("|")).toContain("生存");
+  });
+
+  it("同じ dispatch を 2 回叩かない(sub-run 集約と task ツリーが同じ dispatch を持つ)", async () => {
+    const { client, calls } = createSubRunClient();
+    client.dispatchShow = (async (task: string) => ({
+      ok: true,
+      result: { dispatch: { id: task === "task_sub_b" ? "disp_b" : "disp_shared" } },
+    })) as unknown as typeof client.dispatchShow;
+
+    await cancelTask(client, { taskId: "task_cmd", run: "run_caller" });
+    expect(calls.filter((call) => call === "workerStop:disp_shared")).toHaveLength(1);
   });
 });

@@ -244,7 +244,8 @@ docs/
   CLI 側で worker_done が通らない。CLI は dispatchId も要求する)。
 - ジョブ層の語彙は `JobError`(`task_not_found` / `task_id_missing` / `run_create_failed` /
   `outcome_required` / `outcome_not_allowed` / `dispatch_id_required` / `cancel_incomplete` /
-  `cancel_scope_too_large` / `cancel_dispatch_scope_too_large` / `gate_not_found` / `gate_run_mismatch`)。
+  `cancel_scope_too_large` / `cancel_dispatch_scope_too_large` / `gate_not_found` / `gate_run_mismatch` /
+  `cancel_ownership_unverified`)。
   CLI 側の語彙(`run_required` など)はそのまま転送する。
 - `state: "cancelled"` は **MCP 側の論理状態**(CLI に native status が無い)。実体は
   `status: failed` + `result: "cancelled: <reason>"`。README にその旨を 1 行書く。
@@ -258,8 +259,10 @@ docs/
   `gateId` / `runId` / `options` を入れる。追加の読み取りは `agent_prompt` の `worker-read`(最大 2 worker)だけで、変更系は呼ばない。
 - poll は worker の `projection.attention.requiresAction` を `attentionRequired` / `attentionNotes`
   (行には `attentionCategories`)として出す。ゲートが pending でないのに止まる典型はエージェント側の
-  ツール承認プロンプト(E2E 実測)。Commander Prompt には「答えられない承認待ちで止めない / 新しい Run を
-  作らない(Run ownership、子 task は `--parent` 自分の task)」を固定で書き込む。
+  ツール承認プロンプト(E2E 実測)。Commander Prompt には「答えられない承認待ちで止めない / 既存 Run を使い
+  深さ・circuit-break・失敗 dispatch・binding 回避で新しい Run を作らない / 自律 coordinator が child Run を
+  作るなら objective マーカーと最終報告で関連付ける / gate 作成失敗は承認を進めず停止して人間に依頼する」を
+  固定で書き込む(`commanderSpec` のテストで文言を固定する)。
 - 出力は既定で切り詰める(`specPreview` 200 字、worker 出力 4000 字、agents の prompt 200 字)。
 
 ## 登録ツール(現状)
@@ -316,6 +319,18 @@ sub-run の worker を走りたままにした)。設計は `docs/design/sub-run
   root は「`parent_id` がその Run 内に無い + `created_by_terminal_handle` が Commander の handle」で選ぶ。
 - **探索を走らせる条件は worker / dispatch が 1 件以上あるとき**(queued で探索を走らせない)。
   `childCount == 0` だけを条件にすると、親 Run にも sub-run にも子がある場合に sub-run が落ちる(実測)。
+- **run-list / worker-list は cursor でページングする**(実測: `run-list --limit 60` は 60 件 + `nextCursor`、
+  `worker-list` は 100 件で `page.hasMore` / `page.nextCursor`)。上限は `MAX_SCAN_PAGES = 5` /
+  `MAX_WORKER_PAGES = 3` で、打ち切ったら `subRunScanComplete: false` + warning を出す(1 ページだけ見て「無い」と言わない)。
+- **所有関係は 4 段階で判定し、破壊的操作には `verified` だけ使う**(`classifySubRunOwnership`):
+  `verified` = coordinator_handle 一致 + root の `created_by_pane_key`(tabId:leafId)と
+  `created_by_process_incarnation`(ptyId:incarnationId)が `terminal list` と一致し矛盾なし、
+  `probable` = handle 一致のみ、`unverified` = handle 一致なし / root 特定不能、
+  `conflicting` = 来歴の矛盾、または objective マーカーが別の Run を指す。行には `ownership` /
+  `cancelEligible` / `verificationReasons` / `discoverySource` を載せる。
+- **objective のマーカーは発見の候補にだけ使う**(書式 `orca-mcp-parent: run=<caller runId> task=<task id>`、
+  定数 `SUB_RUN_MARKER_PREFIX`)。誰でも書けるのでマーカー単独で `verified` にしない。来歴と組み合わせて使い、
+  呼び出し元 Run と違う Run を指していれば `conflicting`。
 - 集約は `includeSubRuns`(既定 true)で、poll / cancel / result すべてに効く。無効化は逃げ道として残す。
   集約で出た子行には必ず `sourceRunId` を載せる(呼び出し元 Run の子と区別するため)。
   `subRunsDiscovered` / `subRuns[]` を応答に載せ、**孫以降は `children` に出さない**(呼び出し元 Run の
@@ -323,6 +338,12 @@ sub-run の worker を走りたままにした)。設計は `docs/design/sub-run
 - **cancel は sub-run の部分木を呼び出し元 Run の Commander より先に止める**(sub-run の worker が
   Commander より生き残ると job が走り続ける)。上限 12 件は sub-run 込みの件数で判定する。
   `task-update` は対象タスクの Run 名義で叩く(`runMutation` は既に Run 名義なので追加の引数で渡す)。
+- **cancel の auto 対象は `verified` の sub-run だけ**。検証に失敗した sub-run が 1 件でもあれば
+  preflight で `cancel_ownership_unverified` を返し、**破壊的操作を一切行わない**(probable を叩くと
+  別 job・別 terminal の worker を止める)。逃げ道は `includeSubRuns: false` / `cascade: false`。
+  同一 dispatch は 1 回だけ叩く(`fencedDispatchIds`)。
+- **停止後は worker-list を読み直す**(`residualLiveWorkers`)。生存 worker が 1 件でもあれば
+  `residualWorkers[]` に載せて `fullyStopped: false`。探索を打ち切った場合も `fullyStopped: false`。
 - 集約の失敗(run-list 読めず / sub-run の task-list 読めず)は **poll / cancel / result を壊さず `warnings` だけ**添える。
   観測でしかないので cancel では対象を絞る(変更系を sub-run に増やさない)。
 - `run-list` / `run-show` は読み取り専用なので poll / result ハンドラーで呼んでよい(AGENTS.md の読み集めの範囲)。

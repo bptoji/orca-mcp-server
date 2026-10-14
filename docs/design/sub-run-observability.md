@@ -158,7 +158,7 @@ Run ownership 節(`COMMANDER_PROMPT` L676-680)差し替え(案A' 最終):
 | 1 | §1-2「子 Task 6件は `--parent task_7ec3d98f5473` 付きで作られていた」 | **事実では無い**。`task-list --run run_8d1d20524d42` の 7 件は root `task_a9c5f6f06805`(`parent_id: null`)+ 子 6 件の `parent_id` は **その root**。呼び出し元 Run の Commander task を指す行は 1 件も無い | Phase 2 の「sub-run 内で `parent == taskId`」は 0 件しか拾えない。照合は `coordinator_handle` → sub-run 内の **root 特定**(`parent` が run 内に無い + `created_by_terminal_handle` が Commander の handle)に置き換えた |
 | 2 | §5-c「`task-update --spec` の有無がブロッカー候補」 | **存在しない**。`task-update` は `--id / --status / --result / --run / --from / --retry-request` のみ(valid status: pending / ready / dispatched / completed / failed / blocked) | Phase 3 の「task-create 後に spec 書き換え」は不可能。`{{taskId}}` は注入しない(`worker-start --spec` でも taskId は起動後に決まるため鶏卵)。`{{runId}}` だけ注入し、自分の task id は dispatch preamble と `task-list --run <run>` で確認させる手順にした |
 | 3 | §5-d「`worker-start` に `--run` があるか」 | **ある**(`--task` / `--spec` / `--run` / `--parent` / `--deps` を確認) | プロンプトの `worker-start --run {{runId}} --task <child>` は実在の構文 |
-| 4 | §5-a「`run-list` の page 挙動」 | 応答は `result.runs[]` + `result.nextCursor`(base64 の keyset `{createdAt,id}`)。help 文の「line cursor」は実体と違う | `--limit` / `--cursor` を client に実装。poll 側は `--limit 50` 1 回(ページングしない) |
+| 4 | §5-a「`run-list` の page 挙動」 | 応答は `result.runs[]` + `result.nextCursor`(base64 の keyset `{createdAt,id}`)。help 文の「line cursor」は実体と違う | 当初は `--limit 50` 1 回(ページング無し)。§8 の P3 で `nextCursor` を辿るページング(`MAX_SCAN_PAGES = 5`)に置き換え、打ち切りは `subRunScanComplete: false` + warning で正直に出す |
 | 5 | §5-b「`coordinator_handle` の一意性」 | live で 5 件中 2 件が `coordinator_handle: null`。terminal 再利用で古い Run が同じ handle を持つリスクは残る | null は照合不能として除外。呼び出し元 Run 自身を除外。対象タスクの `created_at` より **24 分以上前**の Run を除外(task-list はローカル時刻、run-list は UTC なので厳密比較しない)。上限 `MAX_SUB_RUNS = 3` |
 | 6 | Phase 2 が poll / cancel のみ | 目的は「poll / cancel / **結果回収**」なのに `orca_get_task_result` が抜けていた | result にも sub-run 集約を入れた(`includeChildren: true` 時に合算、`sourceRunId` 付き) |
 | 7 | 「`childCount == 0` のときだけ追加探索」 | 親 Run にも sub-run にも子がある場合、childCount > 0 で sub-run が invisible のまま残る | 探索条件を「worker / dispatch が 1 件以上あるとき」に変更(queued では走らせない)。`includeSubRuns: false` で無効化できる |
@@ -178,3 +178,24 @@ Run ownership 節(`COMMANDER_PROMPT` L676-680)差し替え(案A' 最終):
 - `coordinator_handle` 照合は run lineage が無いことへの代替ハック。Orca 本体に `parentRunId` が入れば §6 の要求へ置換できる。
 - gate 行の `runId` は CLI の `run_id` を優先する。行に `run_id` が無い CLI 版では「そのゲートを照合した Run」名義の
   補完になるため、sub-run 集約が動かない環境(caller gate のみ)では呼び出し元 Run 名義で返る。
+
+## 8. review9 承認後の P1–P6 実装(2026-10-14)
+
+review9 の「条件付き実装承認」(`orca-mcp_review9.txt` §2–§7)どおりの実装記録。P7(`orca_get_run` の include*)は
+レビュー9 の指示どおり延期した。
+
+| Phase | 実装 | 要点 |
+|---|---|---|
+| P1 | `COMMANDER_PROMPT` の Run ownership / gate 手順を改修 | 既存 Run を再利用 / 深さ・circuit-break・失敗 dispatch・binding 回避で Run を作らない / `run-use --takeover-legacy` は別操作(新しい Run を作る許可ではない)/ 自律 coordinator が child Run を作れるのは guide が許すときだけ + objective マーカー + 最終報告 / gate 作成失敗は binding 確認 → 1 回だけ安全に再試行 → だめなら承認を進めず停止して人間に依頼 |
+| P2 | 所有関係の判定 `classifySubRunOwnership` | `verified` は coordinator_handle + pane key + incarnation の 2 系統一致・矛盾なし。objective マーカー(`SUB_RUN_MARKER_PREFIX`)は**発見の候補**で、単独では `verified` にしない(誰でも書ける)。別 Run を指すマーカーは `conflicting` |
+| P3 | `scanRunRows` / `scanWorkerRows` の cursor ページング | `MAX_SCAN_PAGES = 5` / `MAX_WORKER_PAGES = 3`。打ち切りは `subRunScanComplete` / `subRunsTruncated` / `subRunScanPageCount` / `subRunScanRunCount` / `subRunOwnershipComplete` と warning で出す |
+| P4 | cancel の対象を `verified` に限定 | 検証失敗の sub-run が 1 件でもあれば preflight で `cancel_ownership_unverified`(**破壊的操作ゼロ**)。逃げ道は `includeSubRuns: false` / `cascade: false`。同一 dispatch は 1 回だけ(`fencedDispatchIds`) |
+| P5 | 停止後の読み直し `residualLiveWorkers` | 生存 worker を `residualWorkers[]` に載せ、1 件でもあれば `fullyStopped: false`。探索を打ち切った場合も `fullyStopped: false` |
+| P6 | gate 作成失敗時の手順を prompt に固定 | 「gate 作成失敗 → binding 確認 → 安全な再試行 → 失敗 → 停止して人間に依頼」までを書き、承認の代행을禁止 |
+
+- 来歴の対応表は `terminal list`(`handle` / `tabId` / `leafId` / `ptyId` / `incarnationId`)から作る 1 回だけ。
+  読めなければ `verified` を出さない(警告だけ添えて `probable`)。
+- 実測で一致した来歴(2026-10-14、`run_8d1d20524d42` の root と Commander terminal):
+  `created_by_pane_key == tabId:leafId`、`created_by_process_incarnation == ptyId:incarnationId`。
+- 未実施: P7(観測 API の include* 拡張)、P8 の実機 E2E(gate 解決 / cancel の実走)。
+  実機 E2E は `gate_e3de81e4d0d4`(master merge / push の承認)を解決する操作を含むため、人間の承認なしには走らせない。
