@@ -64,7 +64,7 @@ docs/
 
 | ツール | 役割 | 内部コマンド |
 | --- | --- | --- |
-| `orca_delegate_task` | submit(**Commander 専用**) | run-create(未指定時) → task-create(固定 Commander 指示 + goal + repo + constraints) → worker-start `--worktree new-child --agent <commanderAgent>` |
+| `orca_delegate_task` | submit(**Commander 専用**) | run-create(未指定時) → task-create(固定 Commander 指示 + goal + repo + constraints) → worker-start `--worktree new-child --name <title または生成名> --agent <commanderAgent>` |
 | `orca_get_task_status` | poll | task-list / dispatch-show / worker-list / gate-list / **run-list**(sub-run 照合)(子タスクは task-list の `parent_id` + sub-run の root 照合で拾う) |
 | `orca_get_task_result` | result | task-list / dispatch-show / worker-read / **run-list**(`includeChildren: true` で子タスクの result と出力も集約) |
 | `orca_send_message` | intervene(非破壊) | `orchestration send`(必要なら run-use でバインド切替) |
@@ -206,6 +206,13 @@ docs/
 - **`repo` は repo セレクタ**(E2E 実機確認): `id:<repoId>` / `path:<repo home>` は解決できるが、
   worktree の displayName(`name:weever`)や worktree path は `repo_not_found`。repoId は
   `orca worktree current --json` の `result.worktree.repoId`。
+- **新しい worktree には `--name` が必須**(2026-10-15 実測)。`worker-start --worktree new-child` に
+  `--name` が無いと CLI は `invalid_argument: New worktrees require --name.` で拒否する(help の usage 行は
+  `--name` を optional に示すが、新規 worktree では必須。既存 worktree には逆に creation flags が拒否される)。
+  `orca_delegate_task` は `title` をそのまま worktree 名に使い(E2E 実測: 日本語 title の worktree が作れる)、
+  `title` を貰えない委譲では `buildWorktreeName` が spec と taskId から短い ASCII 名を作る
+  (32 字 + taskId 末尾 4 字の接尾なので、同じ goal を再委譲しても衝突しない)。`--name` を渡さない経路を
+  残すと **task-create まで成功したうえで worker-start が落ち、state: queued で止まる**(worktree が作れない)。
 - **`worker-start` だけ transport timeout を 180 秒**(`WORKER_START_TIMEOUT_MS`)。worktree 作成 +
   setup hook + エージェント起動 + 初ターン観測まで同期で走るため、既定 30 秒では SIGKILL される(実測)。
 - `queued`(worker-start 失敗)は放置しても進まない。`nextActionHint` が「delegate し直す / cancel する」を
@@ -494,6 +501,9 @@ sub-run の worker を走りたままにした)。設計は `docs/design/sub-run
   --from / --retry-request` のみ)。なので delegate 後に spec へ値を焼き込む書き直しはできない。
   `COMMANDER_PROMPT` へ注入できるのは `task-create` の前に決まる値(`{{runId}}`)だけ。
 - **`worker-start` には `--run` がある**(実測)。`gate-create` / `gate-resolve` には無い。
+  `--name` は usage 行では optional だが、**新しい worktree を作るには必須**(実測 1.4.222:
+  `invalid_argument: New worktrees require --name.`)。逆に既存 / current worktree には
+  creation flags(`--name` / `--repo` / `--base-branch` / `--display-name` / `--comment` / `--setup`)が拒否される。
   `run-list` は `--limit / --cursor`、`run-show` は `--id` を取る。`run-list` の `nextCursor` は
   base64 の keyset(`{createdAt,id}`)で、help 文の「line cursor」とは実体が違う。
 - **公開サイトの掲載は CLI バージョンに追いつかないことがある。** `worker-abandon` は実機 1.4.220 の

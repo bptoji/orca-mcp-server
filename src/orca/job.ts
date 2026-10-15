@@ -1274,18 +1274,43 @@ function toGateRow(gate: JsonObject, fallbackRunId?: string | null): JsonObject 
 
 /**
  * worktree 名を組み立てる(英数字に落とし、末尾に短 ID を足す)。
- * 公開経路(worker-start)は worktree 名を CLI 側に決めさせるため、これは
- * 内部用の足場(`orca_delegate` 系)で worktree を明示するときのヘルパー。
+ *
+ * `worker-start --worktree new-child` に `--name` が無いと CLI が
+ * `invalid_argument: New worktrees require --name.` で拒否する(2026-10-15 実測)。
+ * 新規 worktree を作る経路は名前を省略できないので、公開経路(delegateTask)も
+ * ここで作る。`seed`(taskId)を渡すと同じ goal を再委譲しても衝突しない。
  */
-export function buildWorktreeName(title: string | undefined, spec: string): string {
+export function buildWorktreeName(
+  title: string | undefined,
+  spec: string,
+  seed?: string,
+): string {
   const base = `${title ?? ""} ${spec}`.trim();
   const ascii = base
     .replace(/[^A-Za-z0-9._-]+/g, "-")
     .replace(/^-+|-+$/g, "")
     .slice(0, 32)
     .replace(/-+$/g, "");
-  const suffix = Date.now().toString(36).slice(-4);
-  return `${ascii.length >= 3 ? ascii : "task"}-${suffix}`;
+  return `${ascii.length >= 3 ? ascii : "task"}-${nameSuffix(seed)}`;
+}
+
+/**
+ * 名前の末尾に足す短い接尾辞。`seed`(taskId)があればその末尾を使い、
+ * 短い seed は hash で埋める(取り出し幅が足りず衝突しやすいため)。
+ */
+function nameSuffix(seed: string | undefined): string {
+  if (seed === undefined) {
+    return Date.now().toString(36).slice(-4);
+  }
+  const cleaned = seed.replace(/[^A-Za-z0-9]/g, "");
+  if (cleaned.length >= 4) {
+    return cleaned.slice(-4).toLowerCase();
+  }
+  let hash = 0;
+  for (const char of seed) {
+    hash = (hash * 31 + char.charCodeAt(0)) >>> 0;
+  }
+  return (cleaned + hash.toString(36)).padEnd(4, "0").slice(-4);
 }
 
 export interface DelegateTaskInput {
@@ -1518,13 +1543,17 @@ export async function delegateTask(
   }
 
   // 3) worker-start で Commander を起動する(新規 child worktree の supervised worker)。
+  //    新規 worktree は `--name` が必須(2026-10-15 実測: CLI が
+  //    `invalid_argument: New worktrees require --name.` で拒否する)。title を貰えない
+  //    委譲でも worktree が作れるよう、title 無しは spec と taskId から名前を作る。
+  const worktreeName = input.title ?? buildWorktreeName(input.title, input.spec, taskId);
   try {
     const started = await runMutation(client, runId, () =>
       client.workerStart({
         task: taskId,
         worktree: "new-child",
         agent: commanderAgent,
-        name: input.title,
+        name: worktreeName,
         repo: input.repo,
         run: runId,
       }),

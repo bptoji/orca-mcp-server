@@ -208,6 +208,8 @@ providers 列挙にそのエージェント名は出ない)。`orca_delegate_tas
 | `orca_get_task_status` | **poll** | task-list / dispatch-show / worker-list / gate-list / run-list(sub-run 照合) | 待たない |
 | `orca_get_task_result` | **result** | task-list / dispatch-show / worker-read / run-list(sub-run 照合) | 待たない |
 
+Commander は新しいワークツリーに起動します。その名前は `title` があればそのまま、`title` を省略した場合は `spec` とタスク ID から自動生成します(Orca は新しいワークツリーの名前を要求するため、名無しでは作れません)。`title` は省略できます。
+
 ```
 orca_delegate_task({
   spec: "ユーザー認証機能を追加する",
