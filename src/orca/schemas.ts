@@ -73,7 +73,9 @@ export const delegateTaskInputSchema = z.strictObject({
     .string()
     .min(1)
     .optional()
-    .describe("タスクの表示タイトル(task-title と Commander worker 名に使う)"),
+    .describe(
+      "タスクの表示タイトル(task-title と Commander worker の worktree 名に使う)。省略時は spec とタスク ID から worktree 名を作る",
+    ),
   commanderAgent: z
     .string()
     .min(1)

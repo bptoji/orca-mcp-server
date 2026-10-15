@@ -140,6 +140,16 @@ describe("buildWorktreeName", () => {
   it("英字が足りないときは task 接頭辞にフォールバックする", () => {
     expect(buildWorktreeName(undefined, "日本語の仕様だけ")).toMatch(/^task-[0-9a-z]{1,4}$/);
   });
+
+  it("seed(taskId)を渡すと決定的で、同じ goal の再委譲でも衝突しない", () => {
+    expect(buildWorktreeName(undefined, "日本語の仕様だけ", "task_abc123")).toBe("task-c123");
+    expect(buildWorktreeName(undefined, "日本語の仕様だけ", "task_ff00aa")).toBe("task-00aa");
+  });
+
+  it("seed が短い場合は hash で埋めて接尾を 4 文字に保つ", () => {
+    expect(buildWorktreeName(undefined, "日本語の仕様だけ", "t7")).toMatch(/^task-[0-9a-z]{4}$/);
+    expect(buildWorktreeName(undefined, "日本語の仕様だけ", "___")).toMatch(/^task-[0-9a-z]{4}$/);
+  });
 });
 
 describe("findTaskById", () => {
@@ -432,6 +442,27 @@ describe("delegateTask(submit / Commander API)", () => {
     expect(calls[2]).toContain('"worktree":"new-child"');
     expect(calls[2]).toContain('"name":"Auth"');
     expect(result["commanderAgent"]).toBe("claude");
+  });
+
+  it("title が無くても --name を渡す(実測: New worktrees require --name.)", async () => {
+    // 新規 worktree は --name が必須。title を貰えない委譲でも worktree を作れるようにする。
+    const { client, calls } = createFakeClient();
+    await delegateTask(client, { spec: "日本語のゴールだけ" });
+    const workerStart = calls[2] ?? "";
+    expect(workerStart).toContain('"worktree":"new-child"');
+    expect(workerStart).toContain('"name":"task-c123"');
+  });
+
+  it("title が無いときは spec の ASCII 部分から worktree 名を作る", async () => {
+    const { client, calls } = createFakeClient();
+    await delegateTask(client, { spec: "Update README only" });
+    expect(calls[2]).toContain('"name":"Update-README-only-c123"');
+  });
+
+  it("title を渡したときはその title を worktree 名に使う(既存挙動を変えない)", async () => {
+    const { client, calls } = createFakeClient();
+    await delegateTask(client, { spec: "README を更新する", title: "認証機能の追加" });
+    expect(calls[2]).toContain('"name":"認証機能の追加"');
   });
 
   it("worker-start 失敗時もタスクを生かし state: queued + warnings で返す(例外にしない)", async () => {
