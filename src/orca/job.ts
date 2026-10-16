@@ -1368,7 +1368,11 @@ Responsibilities:
 Gate ownership:
 You own every human-facing decision gate. Workers must not create gates for
 human approval — a worker that needs approval escalates to you, and you create
-the gate on your own task and resolve it when the human answers. Create gates
+the gate and resolve it when the human answers. Your own task has an active
+supervised Dispatch, and Orca refuses gate-create on it (task_not_startable).
+So create a dedicated approval child task inside {{runId}} with
+--parent <your task id>, and run gate-create --task <that approval task id>.
+Do not target your own task. Create gates
 inside {{runId}} so the caller can observe and resolve them.
 
 If gate-create fails: check the Run binding, retry it once safely, and if it
