@@ -495,6 +495,38 @@ sub-run の worker を走りたままにした)。設計は `docs/design/sub-run
 
 ## orca CLI 側の前提
 
+### Windows PowerShell 5.1 から JSON 引数を渡す場合
+
+- この節はエージェントがシェルから CLI を実行するときの規則。MCP サーバー内の
+  `execFile(bin, argvArray)` には適用せず、argv 配列には通常の JSON をそのまま渡す。
+- 実行シェルを `$PSVersionTable.PSVersion` で確認する。Windows PowerShell 5.1 では
+  外部コマンドへ渡す JSON の二重引用符が失われるため、内部の `"` を `\"` にした
+  文字列を変数に格納して渡す。通常の JSON を変数に入れるだけでは回避できない。
+  PowerShell 7 や他のシェルへ、この回避策を一律に適用しない。
+
+  ```powershell
+  $gateOptions = '[\"approve\",\"reject\"]'
+  orca orchestration gate-create --task <承認用子タスクID> --question 'README.mdへの追記を承認しますか？' --options $gateOptions --json
+  ```
+
+- 動的な選択肢は `ConvertTo-Json -Compress` で生成した後、同じ変換を行う。
+  この例は単純な文字列配列向けで、複雑な引用符やバックスラッシュを含む値では
+  変更系コマンドを呼ぶ前に引数の到達値を確認する。
+
+  ```powershell
+  $gateOptions = (@('approve', 'reject') | ConvertTo-Json -Compress).Replace('"', '\"')
+  # 読み取りだけの確認。表示される引数に JSON 内の二重引用符が残ることを確認する。
+  node -e 'process.stdout.write(process.argv[1])' -- $gateOptions
+  # 期待値: ["approve","reject"]
+  ```
+
+- CLI が `--options is not valid JSON: its quotes are missing` と表示しても、
+  「変数経由で渡す」という案内だけを繰り返さず、この節のエスケープ例を使う。
+  選択肢が不要な場合に限り、任意引数の `--options` を省略してよい。
+- 承認ゲートの作成失敗を承認と扱わない。再試行回数や介入待ちの指示は引き続き守る。
+
+### ランタイムとコマンド仕様
+
 - 大半のコマンドは起動中の Orca ランタイムを必要とします(未起動なら `orca open`)。
 - コマンド仕様の確認は `orca --help` / `orca orchestration <cmd> --help` / `orca agent-context --json`。
 - **`task-update` に `--spec` は無い**(実機 1.4.222 help 実測: `--id / --status / --result / --run /
