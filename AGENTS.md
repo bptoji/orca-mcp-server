@@ -269,6 +269,10 @@ docs/
   CLI 側の語彙(`run_required` など)はそのまま転送する。
 - `state: "cancelled"` は **MCP 側の論理状態**(CLI に native status が無い)。実体は
   `status: failed` + `result: "cancelled: <reason>"`。README にその旨を 1 行書く。
+- **ゲートは自分の task に作れない**(2026-10-16 実機): Commander の task は supervised dispatch が生きているので
+  `gate-create --task <自分>` は `task_not_startable` で拒否される。Commander Prompt は「承認用の子 task を
+  `--parent` 自分の task で作り、その task にゲートを作る」と指示する。poll は直接の子のゲートまで拾うので
+  `gates` に出る(`role: child`)。
 - poll の `blockedReasons[]`(設計: `docs/design/blocked-reasons.md`): `kind` は `gate / task_report /
   agent_prompt / unknown`。`blocked` でも gate が無いことがある(Commander の blocked 報告 = `task-update` の `result`、
   エージェントの承認プロンプト)ので、**`blocked` = `decision_gate` と決めつけない**。pending のゲートがあるときだけ

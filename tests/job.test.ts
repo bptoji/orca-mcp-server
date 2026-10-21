@@ -372,6 +372,11 @@ describe("delegateTask(submit / Commander API)", () => {
     // gate は Commander 所有(Worker が人間向け gate を作って良いことにならない)
     expect(taskCreate).toContain("You own every human-facing decision gate");
     expect(taskCreate).toContain("Workers must not create gates");
+    // 自分の task は dispatch が生きていて gate-create を拒否される(実機: task_not_startable)ので承認用の子 task に作らせる
+    expect(taskCreate).toContain("task_not_startable");
+    expect(taskCreate).toContain("dedicated approval child task");
+    expect(taskCreate).toContain("Do not target your own task");
+    expect(taskCreate).not.toContain("the gate on your own task");
     // 完了宣言の前に全 child task の terminal + result 確認を課す
     expect(taskCreate).toContain("verify that every delegated child task has reached a");
     expect(taskCreate).toContain("terminal state and inspect its result");
