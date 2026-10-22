@@ -55,7 +55,7 @@
   しばらく受信箱に残る(2026-10-22 E2E 実測: 完了直後の poll で `asks=1`、2 回目の reply も
   `duplicate: false` / `answer_message_id: null` で通った。のちに peek / `--all` ともに行は消える)。
   そのため **asker task がすでに終端(`completed` / `failed` / `cancelled`)の ask は `asks[]` と
-  `kind: ask` から外し、warnings に記録する**(重ね返信の防止。呼び出し Run の task-list に現れない
+  `kind: ask` から外し、warnings に記録する**(同じ ask への 2 回目以降の返信の防止。呼び出し Run の task-list に現れない
   sub-run 由来の ask は判定不能なので残す)。peek で `consumer_fenced` の意味
   (fenced-on-peek が caller teardown を示すのか)は未確定。
 

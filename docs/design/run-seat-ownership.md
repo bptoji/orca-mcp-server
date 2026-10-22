@@ -420,7 +420,7 @@ MCP 経路 E2E)をこの 1 回で確認した。
   dispatch-show にも無ければ拾えない(handle 無し = 照合不能)。
 - **reply の後も ask 行はしばらく受信箱に残る**(実測: 完了直後の poll で `asks=1` のまま)。
   2 回目の reply は `duplicate: false` / `answer_message_id: null` で**通ってしまう**
-  (§12.2 が想定した「重ね返信は duplicate: true」は実測と違う)。のちに(≈15 分後)
+  (§12.2 が想定した「2 回目の reply は `duplicate: true` で冪等に返る」は実測と違う)。のちに(≈15 分後)
   peek / `--all` ともに行は消える(旧記録「回答済みは peek に現れない」はこの削除後の
   観測と整合)。→ poll は **asker task が終端(completed / failed / cancelled)の ask を
   `asks[]` と `kind: ask` から外し、warnings に記録する**。呼び出し Run の task-list に

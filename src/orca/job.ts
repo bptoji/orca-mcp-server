@@ -1915,7 +1915,7 @@ export async function getTaskStatus(client: OrcaClient, input: TaskStatusInput):
 
   // asker task がすでに終端なら ask はもう答えを待っていない。実測(2026-10-22 E2E):
   // reply の後も ask 行はしばらく peek に残る(完了 task 直後の poll で asks=1)ので、
-  // 終端 asker の行を外さないと poll ループが同じ ask に重ね返信する
+  // 終端 asker の行を外さないと poll ループが同じ ask に 2 回返信してしまう
   // (実測: 2 回目の reply も duplicate: false / answer_message_id: null で通った)。
   const taskStateById = new Map<string, JobState>();
   for (const row of extractTasks(unwrapResult(list))) {
@@ -1935,7 +1935,7 @@ export async function getTaskStatus(client: OrcaClient, input: TaskStatusInput):
     }
     const askMessageId = typeof ask["messageId"] === "string" ? ask["messageId"] : "(id 不明)";
     warnings.push(
-      `ask ${askMessageId} の asker task ${askTaskId} はすでに ${askerState} なので asks から外しました(回答済みの可能性。同じ ask への重ね返信をしないでください)`,
+      `ask ${askMessageId} の asker task ${askTaskId} はすでに ${askerState} なので asks から外しました(回答済みの可能性。同じ ask への 2 回目の返信をしないでください)`,
     );
     return false;
   });

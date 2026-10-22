@@ -3296,9 +3296,9 @@ describe("getTaskStatus(poll) — ask の受信と blockedReasons", () => {
   });
 
   // 2026-10-22 E2E 実測: reply の後も ask 行はしばらく peek に残る(完了 task 直後の poll で
-  // asks=1)ので、asker task が終端なら外さないと poll ループが同じ ask に重ね返信する
+  // asks=1)ので、asker task が終端なら外さないと poll ループが同じ ask に 2 回返信してしまう
   // (実測: 2 回目の reply も duplicate: false / answer_message_id: null で通った)。
-  it("asker task が終端なら ask を外し warnings に残す(重ね返信の防止)", async () => {
+  it("asker task が終端なら ask を外し warnings に残す(同じ ask への 2 回目の返信の防止)", async () => {
     const { client } = createFakeClient({
       taskList: {
         ok: true,
