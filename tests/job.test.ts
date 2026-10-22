@@ -2236,8 +2236,9 @@ describe("getTaskResult(result) — 子タスクの集約", () => {
       dispatchId: "disp_be",
       text: "backend output",
     });
-    // 子行に dispatch_id があるので dispatchShow は Commander 1 回だけ
-    expect(calls.filter((call) => call.startsWith("dispatchShow:")).length).toBe(1);
+    // 子行に dispatch_id があるので子タスクの dispatch-show は足しに行かない。Commander 分は
+    // dispatchIdsOf 1 回 + 完了 task の handle 補完(assignee 消失の 2026-10-22 実測)1 回
+    expect(calls.filter((call) => call.startsWith("dispatchShow:")).length).toBe(2);
     expect(result["childrenTruncated"]).toBe(false);
   });
 
@@ -2398,20 +2399,30 @@ describe("extractRuns / toRunRow", () => {
 });
 
 /** sub-run を持つ family の fake client(実測ペイロードの形に寄せる)。 */
-function createSubRunClient(options: { runs?: JsonObject[] } = {}) {
+function createSubRunClient(
+  options: {
+    runs?: JsonObject[];
+    /** task-list の caller Run 行の上書き(完了 task の assignee_handle 消失などを実測どおりに再現)。 */
+    callerTasks?: JsonObject[];
+    /** dispatch-show の dispatch レコードに assignee_handle を足す(完了後も残る実測)。 */
+    dispatchAssignee?: Record<string, string>;
+  } = {},
+) {
   const calls: string[] = [];
   // workerStop を叩いた dispatch は「stopped」に変わる(停止後の読み直しを実データにするため)
   const stoppedDispatches = new Set<string>();
-  const callerTasks: JsonObject[] = [
-    {
-      id: "task_cmd",
-      run_id: "run_caller",
-      parent_id: null,
-      status: "dispatched",
-      assignee_handle: "term_cmd",
-      created_at: "2026-10-13 06:50:52",
-    },
-  ];
+  const callerTasks: JsonObject[] =
+    options.callerTasks ??
+    [
+      {
+        id: "task_cmd",
+        run_id: "run_caller",
+        parent_id: null,
+        status: "dispatched",
+        assignee_handle: "term_cmd",
+        created_at: "2026-10-13 06:50:52",
+      },
+    ];
   const subTasks: JsonObject[] = [
     {
       id: "task_sub_root",
@@ -2474,7 +2485,18 @@ function createSubRunClient(options: { runs?: JsonObject[] } = {}) {
     dispatchShow: async (task: string) => {
       calls.push(`dispatchShow:${task}`);
       const dispatchId = dispatchesByTask[task];
-      return { ok: true, result: { dispatch: dispatchId === undefined ? null : { id: dispatchId } } };
+      const assignee = options.dispatchAssignee?.[task];
+      return {
+        ok: true,
+        result: {
+          dispatch:
+            dispatchId === undefined
+              ? null
+              : assignee === undefined
+                ? { id: dispatchId }
+                : { id: dispatchId, assignee_handle: assignee },
+        },
+      };
     },
     workerList: async (input: JsonObject) => {
       const run = input["run"];
@@ -2714,6 +2736,37 @@ describe("getTaskResult(result) — sub-run の成果集約", () => {
     const result = await getTaskResult(client, { taskId: "task_cmd", run: "run_caller" });
     expect(result["children"]).toEqual([]);
     expect(calls.some((call) => call.startsWith("runList:"))).toBe(false);
+  });
+
+  // 2026-10-22 E2E 実測: 完了した task 行は assignee_handle: null になり、result の
+  // sub-run 照合が handle 無しで空になった(children: [] / subRunsDiscovered: 0)。
+  // dispatch-show の assignee_handle(完了後も残る)で補う。
+  const completedCallerTasks: JsonObject[] = [
+    {
+      id: "task_cmd",
+      run_id: "run_caller",
+      parent_id: null,
+      status: "completed",
+      assignee_handle: null,
+      created_at: "2026-10-13 06:50:52",
+    },
+  ];
+
+  it("完了 task は dispatch-show の assignee_handle で sub-run の子タスクを拾う", async () => {
+    const { client } = createSubRunClient({
+      callerTasks: completedCallerTasks,
+      dispatchAssignee: { task_cmd: "term_cmd" },
+    });
+    const result = await getTaskResult(client, { taskId: "task_cmd", run: "run_caller", includeChildren: true });
+    expect((result["children"] as JsonObject[]).map((child) => child["taskId"])).toEqual(["task_sub_root"]);
+    expect(result["subRunsDiscovered"]).toBe(1);
+  });
+
+  it("dispatch-show にも assignee が無ければ拾えない(handle 無し = 照合不能)", async () => {
+    const { client } = createSubRunClient({ callerTasks: completedCallerTasks });
+    const result = await getTaskResult(client, { taskId: "task_cmd", run: "run_caller", includeChildren: true });
+    expect(result["children"]).toEqual([]);
+    expect(result["subRunsDiscovered"]).toBe(0);
   });
 });
 
@@ -3240,6 +3293,58 @@ describe("getTaskStatus(poll) — ask の受信と blockedReasons", () => {
     const view = await getTaskStatus(client, { taskId: "task_3208dcf22c18", run: "run_a781f51d4c91" });
     expect(view["asks"]).toEqual([]);
     expect((view["warnings"] as string[]).join("|")).toContain("ask の受信確認");
+  });
+
+  // 2026-10-22 E2E 実測: reply の後も ask 行はしばらく peek に残る(完了 task 直後の poll で
+  // asks=1)ので、asker task が終端なら外さないと poll ループが同じ ask に重ね返信する
+  // (実測: 2 回目の reply も duplicate: false / answer_message_id: null で通った)。
+  it("asker task が終端なら ask を外し warnings に残す(重ね返信の防止)", async () => {
+    const { client } = createFakeClient({
+      taskList: {
+        ok: true,
+        result: { tasks: [{ id: "task_3208dcf22c18", status: "completed", assignee_handle: null }] },
+      },
+      check: checkEnvelope,
+    });
+    const view = await getTaskStatus(client, { taskId: "task_3208dcf22c18", run: "run_a781f51d4c91" });
+    expect(view["asks"]).toEqual([]);
+    expect(view["phase"]).not.toBe("decision_gate");
+    const warnings = view["warnings"] as string[];
+    expect(warnings.join("|")).toContain("asks から外しました");
+    expect(warnings.join("|")).toContain("task_3208dcf22c18");
+  });
+
+  // ask の taskId が呼び出し Run の task-list に無い(sub-run 由来)なら、asker の
+  // 終端判定ができないので残す(回答を待っている可能性を捨てない)。
+  it("asker task が呼び出し Run に現れない(sub-run 由来)なら ask を残す", async () => {
+    const subAskEnvelope: JsonObject = {
+      ok: true,
+      result: {
+        runId: "run_a781f51d4c91",
+        messages: [
+          {
+            id: "msg_sub_ask",
+            thread_id: "msg_sub_ask",
+            type: "question",
+            from_handle: "dispatch:disp_sub",
+            to_handle: "run:run_a781f51d4c91",
+            subject: "Question",
+            payload: '{"taskId":"task_sub_worker","dispatchId":"disp_sub","question":"承認は?","options":["approve"]}',
+          },
+        ],
+        count: 1,
+        acknowledged: null,
+      },
+    };
+    const { client } = createFakeClient({
+      taskList: {
+        ok: true,
+        result: { tasks: [{ id: "task_cmd", status: "dispatched", assignee_handle: "term_cmd" }] },
+      },
+      check: subAskEnvelope,
+    });
+    const view = await getTaskStatus(client, { taskId: "task_cmd", run: "run_a781f51d4c91" });
+    expect((view["asks"] as JsonObject[]).map((ask) => ask["messageId"])).toEqual(["msg_sub_ask"]);
   });
 });
 

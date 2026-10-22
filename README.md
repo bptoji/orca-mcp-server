@@ -274,6 +274,10 @@ orca_get_task_result({ taskId: "task_abc123", includeChildren: true })
   `fromHandle` / `createdAt`。Commander が ask した(= `ask --resume` で答えを待っている)間は
   `phase: decision_gate` に寄ります。答えるには `orca_reply_message({ messageId, body, run })`
   (タイムアウト後も asker は `--resume` で待つので、遅れて届いて構いません)。
+  **asker task がすでに終端(`completed` / `failed` / `cancelled`)の ask は `asks[]` から外します**
+  (実測 2026-10-22: reply の後も ask 行はしばらく受信箱に残るため、外さないと poll ループが
+  同じ ask に重ね返信します。外した行は `warnings` に記録します。sub-run 由来の ask は
+  asker task が呼び出し Run の task-list に現れないため判定不能 — そのまま残します)。
 - `blockedReasons[]` は止まっている理由(`{ kind, taskId, role, summary, detail? }`)。`role` は `commander`(対象タスク自身 = Commander)/
   `child`(直接の子タスク)で、どちらが止まっているかを示します。`kind` は
   `gate`(質問文 + `detail.gateId` / `detail.runId` / `detail.options`)/
@@ -319,6 +323,9 @@ orca_get_task_result({ taskId: "task_abc123", includeChildren: true })
   `result` と出力も集約します(子 10 件・worker-read 8 件まで)。sub-run の子も `sourceRunId` 付きで集約され、
   集約の完全性は poll と同じ `subRunScanComplete` / `subRunsTruncated` / `subRunOwnershipComplete` /
   `subRunWorkerScanComplete` で出します(打ち切ったら `warnings` に理由)。
+  **完了タスクの `assignee_handle` は task 行から消える**(実測 2026-10-22)ため、result / cancel は
+  handle が無いときだけ `dispatch-show` の `assignee_handle`(完了後も残る)で補完します
+  (補完が無いと完走後の `children` が `[]` になる。dispatch-show にも無ければ照合不能のまま)。
 - 大きな欄は既定で切り詰めます(`specPreview` 200 字、worker 出力 4000 字、`orca_list_agents` の `prompt` 200 字)。
 
 **`repo` の渡し方**
@@ -361,8 +368,10 @@ orca_send_message({ subject: "done", body: "実装とテスト完了", type: "wo
 orca_reply_message({ messageId: "msg_5f1c…", body: "approve", run: "run_…" })
   //  ↑ messageId は poll の asks[].messageId(= ask の thread_id)。body は ask の --options の選択肢
   → { "ok": true, "messageId": "msg_5f1c…", "threadId": "msg_5f1c…",
-      "answerMessageId": "msg_…", "answerBody": "approve", "duplicate": false,
+      "answerMessageId": null, "answerBody": "approve", "duplicate": false,
       "taskId": "task_abc123", "runId": "run_…" }
+  // 実測(2026-10-22): answerMessageId は null で返る。重ね返信も duplicate: false のまま
+  // 通ってしまうので、同じ ask への返信は 1 回に絞ること
 
 orca_resolve_gate({ gateId: "gate_e3de81e4d0d4", resolution: "approve", run: "run_8d1d20524d42" })
   //  ↑ poll の gates[].runId(このゲートは sub-run 側に存在する)をそのまま run に渡す
@@ -403,7 +412,10 @@ orca_cancel_task({ taskId: "task_abc123", reason: "方針変更" })   // cascade
   旧契約のジョブ(sub-run 内の承認用子タスクのゲート)は `orca_resolve_gate` のままで解決します
 - **`orca_reply_message` の `run` は必須**(`check` / `reply` も Run バインドスコープ)。
   点検は `check --all` で行い、受信箱に見つからなければ `ask_not_found` で**何も変更せずに**拒否します。
-  解決済みの ask に重ねて返信すると `duplicate: true` を返します(冪等)
+  **重ね返信は冪等ではありません**(実測 2026-10-22: 2 回目の reply も `duplicate: false` /
+  `answerMessageId: null` で通り、回答は複数積まれます。のちに ask 行は peek / `--all` ともに消えます)。
+  poll 側は asker task が終端の ask を `asks[]` から外すので、通常は重ね返信に届きませんが、
+  手動での返信は同じ ask に 1 回に絞ってください
 - **`taskId`(任意)は ask の点検口です**(resolveGate と同じ形)。ask の payload(`taskId` / `dispatchId` /
   `question` / `options` の JSON)がその task またはその部分木に属さなければ `ask_task_mismatch` で
   **reply の前に**拒否します(指定なしは点検しません)。
@@ -633,7 +645,7 @@ poll を打ち切る前に数回待ってください。**launcher 運用では�
 | `gate_not_found` | その Run に gate が無い | `run` を対象 Run に直す(`gate-list` は Run バインドスコープ)。sub-run のゲートは `gates[].runId` の Run で見る |
 | `gate_run_mismatch` | 渡した `run` とゲートの所属 Run が違う | 何も変更していません。poll の `gates[].runId` / `blockedReasons[].detail.runId` を `run` に渡す |
 | `gate_task_mismatch` | `taskId` を渡したのに、ゲートの task がその task(とその部分木)に属さない | 何も変更していません。`detail.gateTaskId` を確認し、そのゲートの所属 task を `taskId` に渡すか `taskId` を外す。**sub-run のゲートは呼び出し元 Run の task 部分木に属さないので `taskId` を渡さない**(実測: sub-run 内のゲート解決がこれで止まった) |
-| `ask_not_found` | 指定した `messageId` の ask が呼び出し Run の受信箱に無い(別 Run の ask / 回答済み・既読済みの行) | 何も変更していません。poll の `asks[].messageId` と `run` を確認(reply の点検は `check --all` で読みます)。回答済みの ask への重ね返しは `duplicate: true` で冪等に返ります |
+| `ask_not_found` | 指定した `messageId` の ask が呼び出し Run の受信箱に無い(別 Run の ask / 削除済みの行) | 何も変更していません。poll の `asks[].messageId` と `run` を確認(reply の点検は `check --all` で読みます)。重ね返信は冪等ではないので、同じ ask への返信は 1 回に絞る(実測 2026-10-22: 2 回目も `duplicate: false` で通る) |
 | `ask_task_mismatch` | `taskId` を渡したのに、ask の payload.taskId がその task(とその部分木)に属さない | 何も変更していません。sub-run 由来の ask は呼び出し元 Run の task 部分木に属さないので、その場合は `taskId` を外して解決する |
 | gate 解決が `run_required`("No Run is bound") | 呼び出し元ターミナルの Run バインドが空(pane の実体化で失われる) | `orca_resolve_gate` は `run` 名義で `run-use` して 1 回再試行するので通常は自動復旧します(実測で復旧)。外から `orca` を直接叩く場合は先に `orca orchestration run-use --id <ゲートの Run>` |
 | gate 解決が `runtime_error: Gate not found` | バインドが別 Run に動いた(同じターミナルで他のプロセスが `run-create` した 等) | 何も変更されていません。ゲートの Run を名指しで `run-use` した直後に**同じプロセスで**解決してください(バインドはターミナル共有の状態) |

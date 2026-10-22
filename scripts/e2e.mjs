@@ -1,4 +1,4 @@
-// E2E: readiness → delegate → poll → gate → result → cancel(実 Orca / 実エージェント)
+// E2E: readiness → delegate → poll → ask/reply → result → cancel(実 Orca / 実エージェント)
 //
 // 使い方:
 //   node scripts/e2e.mjs [--repo name:weever] [--goal "<goal>"] [--minutes 30] [--cleanup]
@@ -8,12 +8,13 @@
 //   - Orca ランタイムが起動していること(未起動なら orca open)
 //   - commanderAgent の既定は claude(このホストの orchestration skill は providers: agent-skills, claude)
 //
-// やっていること(レビュー指摘の E2E と同じ手順):
+// やっていること(座分離契約・ask 承認の E2E、設計: docs/design/run-seat-ownership.md §10):
 //   1. orca_readiness          … 前提確認(準備でなければここで中止)
 //   2. orca_delegate_task      … Commander 起動(submit)。この worktree から child worktree を作るので
 //                                 本体の作業ツリーは触らない
-//   3. orca_get_task_status    … 30 秒間隔の poll(他作業を挟む想定の挙動)。children / gates を記録
-//   4. orca_resolve_gate       … pending gate を "approve (e2e)" で解決(Human-in-the-loop の代替)
+//   3. orca_get_task_status    … 30 秒間隔の poll(他作業を挟む想定の挙動)。children / gates / asks を記録
+//   4. orca_reply_message      … pending ask に "approve" で回答(Human-in-the-loop の代替)。
+//                                 旧契約のゲートが pending のときだけ orca_resolve_gate で互換解決
 //   5. orca_get_task_result    … includeChildren: true で子タスクの成果まで集約
 //   6. orca_cancel_task        … 2 本目を途中で cascade cancel → fullyStopped と子孫停止を確認
 //   7. 後片付け               … 作られた child worktree を表示(--cleanup なら orca worktree rm)
@@ -40,8 +41,11 @@ const options = {
   cleanup: hasFlag("cleanup"),
   goal: readFlag(
     "goal",
-    "README.md の末尾に「E2E 検証記録」セクションを 1 つ追記する(実施日と、実行した MCP ツール名を 3〜5 行の箇条書き)。" +
-      "追記後に npm test を実行して結果を報告する。変更は README.md のみに限定する。",
+    "README.md の末尾に「E2E ask 承認検証」セクションを 1 つ追記する(実施日と、実行した MCP ツール名を 3〜5 行の箇条書き)。" +
+      "追記後に npm test を実行して結果を報告する。変更は README.md のみに限定する。" +
+      "完了前に、親 Run へ orca orchestration ask --to run:<親RunId> --options approve,redo --timeout-ms 600000 " +
+      "で人間の承認を 1 回求め、回答が返るまで ask --resume <messageId> で待つ。" +
+      "redo の場合は追記を差し戻してから完了報告する。",
   ),
   cancelGoal: readFlag(
     "cancel-goal",
@@ -174,8 +178,10 @@ const main = async () => {
     return;
   }
 
-  // ---------------------------------------------------------------- 3-4. poll / gate
+  // ---------------------------------------------------------------- 3-4. poll / ask / gate
   const gatesResolved = [];
+  const asksSeen = [];
+  let asksAnswered = 0;
   const deadline = Date.now() + options.minutes * 60_000;
   let last = null;
   let polls = 0;
@@ -187,6 +193,7 @@ const main = async () => {
     log(
       `poll#${polls} state=${last?.state} phase=${last?.phase} children=${last?.childCount ?? 0}` +
         ` gates=${(last?.gates ?? []).length}` +
+        ` asks=${(last?.asks ?? []).length}` +
         ` subRuns=${last?.subRunsDiscovered ?? 0}` +
         ` scanComplete=${last?.subRunScanComplete}(pages=${last?.subRunScanPageCount}, runs=${last?.subRunScanRunCount})` +
         ` ownershipComplete=${last?.subRunOwnershipComplete} workerScanComplete=${last?.subRunWorkerScanComplete}`,
@@ -198,6 +205,7 @@ const main = async () => {
         childCount: last?.childCount,
         children: last?.children,
         gates: last?.gates,
+        asks: last?.asks,
         workers: last?.workers,
         subRunsDiscovered: last?.subRunsDiscovered,
         subRuns: last?.subRuns,
@@ -210,6 +218,24 @@ const main = async () => {
         blockedReasons: last?.blockedReasons,
         warnings: last?.warnings,
       });
+    }
+
+    // 新契約の承認: pending ask に orca_reply_message で答える。
+    // sub-run 由来の ask は呼び出し元 Run の task 部分木に属さないので taskId は渡さない(§12.4)
+    for (const ask of last?.asks ?? []) {
+      const reply = await call("orca_reply_message", { messageId: ask.messageId, body: "approve", run: runId });
+      asksAnswered += 1;
+      log(`ask ${ask.messageId} → reply approve isError=${reply.isError} duplicate=${reply.parsed?.duplicate ?? "?"}`);
+      asksSeen.push({
+        messageId: ask.messageId,
+        question: ask.question ?? null,
+        options: ask.options ?? null,
+        askTaskId: ask.taskId ?? null,
+        fromHandle: ask.fromHandle ?? null,
+        replyRun: runId,
+        result: reply.parsed,
+      });
+      record("reply_message", { messageId: ask.messageId, askTaskId: ask.taskId ?? null, result: reply.parsed });
     }
 
     const pendingGates = (last?.gates ?? []).filter((gate) => gate.status === "pending");
@@ -246,7 +272,16 @@ const main = async () => {
     await sleep(30_000);
   }
 
-  log(`poll 終了(state=${last?.state} polls=${polls} gates=${gatesResolved.length})`);
+  log(`poll 終了(state=${last?.state} polls=${polls} gates=${gatesResolved.length} asks=${asksAnswered})`);
+
+  // 期限到来でも完了していなければ 1 本目を sweep cancel(残留 running job の清掃)。
+  // 2026-10-22 実測: Commander が何もせず running のまま 31 分経過 → これが無いと job が残る
+  if (!["completed", "failed", "cancelled"].includes(last?.state)) {
+    log(`期限到来でも ${last?.state} のまま。1 本目を sweep cancel する`);
+    const swept = await call("orca_cancel_task", { taskId, run: runId, reason: "E2E: 期限到来(進捗なし)" });
+    log(`sweep cancel isError=${swept.isError} cancelled=${swept.parsed?.cancelled} fullyStopped=${swept.parsed?.fullyStopped}`);
+    record("sweep_cancel", swept.parsed);
+  }
 
   // ---------------------------------------------------------------- 5. result
   const result = await call("orca_get_task_result", { taskId, run: runId, includeChildren: true });
@@ -344,6 +379,9 @@ const main = async () => {
     gatesResolved: gatesResolved.length,
     gateRuns: gatesResolved.map((gate) => `${gate.gateId}@${gate.gateRun}`),
     gateTasks: gatesResolved.map((gate) => `${gate.gateId}@${gate.gateTaskId ?? "null"}`),
+    asksAnswered,
+    asks: asksSeen.map((ask) => `${ask.messageId}@${ask.askTaskId ?? "null"}`),
+    askResults: asksSeen.map((ask) => ({ messageId: ask.messageId, question: ask.question, duplicate: ask.result?.duplicate ?? null })),
     subRunsDiscovered: last?.subRunsDiscovered ?? 0,
     subRunOwnership: (last?.subRuns ?? []).map((row) => `${row.runId}:${row.ownership}`),
     subRunScanComplete: last?.subRunScanComplete ?? null,

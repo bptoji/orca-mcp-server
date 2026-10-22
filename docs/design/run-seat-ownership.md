@@ -287,27 +287,32 @@ intervention. Never proceed as if approval had been granted.
 
 ## 10. 検証項目・残る未実測
 
-- [ ] 子 Run の座を保持した terminal から親 Run 宛の `ask`(`--to run:<親Run>`)が
-      通るか(§3 では座なし・dispatch 中の ask のみ実測。T4 は unbound だった)。
-      併せて「--to を省略した場合に dispatch の owning Run(= 親 Run)が宛先になる」
-      という help 記述の実機確認。
-- [ ] 子 Run の座を保った terminal から**親 Run 宛の `worker_done` / heartbeat** が
-      届くか(既存 E2E では Commander は同 Run にいたため未検証)。
+- [x] 子 Run の座を保持した terminal から親 Run 宛の `ask`(`--to run:<親Run>`)が
+      通るか → **§13 E2E で確認**(Commander は子 Run の座から `ask --to run:<親>` を送り、
+      行は親 Run の受信箱に届いた。行の `payload.taskId` は親 Run の Commander task を指す)。
+      併せての「--to を省略した場合に dispatch の owning Run(= 親 Run)が宛先になる」
+      という help 記述の実機確認は未実施(E2E は明示指定だった)。
+- [x] 子 Run の座を保った terminal から**親 Run 宛の `worker_done` / heartbeat** が
+      届くか → **§13 E2E で確認**(結果の `provenance: worker_report` が届き、
+      報告に「ask への approve 回答を受領して完了」とある。heartbeat は未確認)。
 - [ ] worker の自分の task への `task-update`(事後報告)が座なしで通るか。
       通らない場合も、worker_done が本体なので契約は「worker は報告のみ」で成立するが、
       cancel 機構の「worker fence → task failed」が呼び出し側 run-use 前提であることは
       変わらない。
 - [ ] `ask` のタイムアウト上限(artifacts AGENTS.md の「30 分」の根拠)。
       実測は resume 時の既定 10 分のみ。
-- [ ] ~~`check` の pending 判定(回答済みスレッドが check に含まれることの確認 —
+- [x] ~~`check` の pending 判定(回答済みスレッドが check に含まれることの確認 —
       §3 で過去スレッドも表示された)~~ → §12 で実装済み: `--peek --types question` は
       unread のみを返す(回答済み・既読済みは現れない)。§3 で過去スレッドも見えたのは
       `--all` 相当の表示。reply の点検は `--all` で読む(回答済み行の確認に使う)。
+      **§13 で再修正**: reply 直後も回答済みの行はしばらく受信箱に残る(peek に現れる)、
+      のちに peek / `--all` ともに消える。旧記録の「回答済みは peek に現れない」は
+      この削除後の観測と整合する。
 - [ ] 座を「離す」操作の存在(契約では使わないが、記録しておく)。
 - [ ] peek(受信箱読み取り)に対する `consumer_fenced` の意味 — fenced が caller
       teardown を示すのか(読み取りは本来座と無関係 §3.2 のため、§12 の runMutation
       経由は「呼び出し元自身の Run への再バインド」だけを許す方針で実装)。
-- [ ] ask → reply までの MCP 経路 E2E(asker の `answer` 確認までの実機確認)。
+- [x] ask → reply までの MCP 経路 E2E(asker の `answer` 確認までの実機確認) → **§13**。
 
 ## 11. 測定痕跡(記録用)
 
@@ -319,6 +324,9 @@ intervention. Never proceed as if approval had been granted.
 - 2026-10-22 追加分: Run `run_1e32ec292d45`(座分離 + ask/gate 挙動の再測)、
   check 応答(`messages` 平坦行 / `type: question` / payload JSON 文字列)の fixture は
   `tests/job.test.ts` の 2026-10-22 実測 fixture として固定。
+- 2026-10-22 E2E 追加分: Run `run_8e8a0f8a48e4`(claude Commander が停滞 → 失敗例)、
+  Run `run_5d8a736c0196`(ask → reply → 完了の成功例、子 Run `run_093f793a0c47`)。
+  詳細は §13。
 
 ## 12. 実装記録(2026-10-22、orca-mcp 側)
 
@@ -347,7 +355,9 @@ intervention. Never proceed as if approval had been granted.
 - inputSchema は設計の `{ messageId, body, taskId? }` に **`run` を必須で追加**
   (resolveGate と同じ先例)。check / reply も Run バインドスコープで、点検で読んだ
   受信箱の Run と reply 先が一致しなければ誤返信になる。
-- reply の前点検は `check --all` で読む(peek だと回答済み・既読済みが拾えない)。
+- reply の前点検は `check --all` で読む(§13 の実測で修正: reply 直後も回答済みの行は
+  しばらく受信箱に残るため、--all の利点は限定的。存在点検としては peek / --all
+  どちらでも通る。--all は旧記録に合わせた保守)。
   見つからなければ `ask_not_found`(JobError 新語彙)で**変更前に**拒否。
 - `taskId` 点検は呼び出し元 Run の task 部分木(`collectDescendants`)に
   `payload.taskId` が属するかで判定し、属さなければ `ask_task_mismatch`。
@@ -370,6 +380,65 @@ intervention. Never proceed as if approval had been granted.
 
 ### 12.4 orca-artifacts 側(§8)
 
-- §8 の行別修正表は**実装の依頼を受けていない**(未実施)。`orca_reply_message` の
-  API 名と引数(`{ messageId, body, run }` — 設計の `{ messageId, body }` に `run`
-  が増えた)を §8 の表に反映するのは、artifacts 側の修正時にこの記録を参照する。
+- §8 の行別修正表は **2026-10-22 に実装済み**(orca-artifacts リポジトリ PR #1、マージ
+  `08cea34`)。AGENTS.md / README を座分離契約 + ask / reply に合わせ、ルート adr/ に
+  `20261022-1350-follow-orca-mcp-seat-separation-and-reply.md`(前回 `20261018-1741` を
+  supersedes)を追加。誤りと確定した旧記録(`orca_resolve_gate` での回答、30 分上限、
+  `graceful`、`cancel requested` 自動送信)は ADR に列挙した。reqs/<ID>/ フォルダは
+  依頼フローを通していないため設けていない。
+
+## 13. 実機 E2E 記録(2026-10-22、ask → reply の MCP 経路)
+
+scripts/e2e.mjs を ask 契約対応に更新して実機実行(runtime 1.4.229)。2 回走らせた。
+
+### 13.1 走らせた経路(成功例: `run_5d8a736c0196` / Commander = codex)
+
+1. `orca_delegate_task`(goal に「完了前に親 Run へ ask(--options approve,redo)で
+   承認を求め、approve が返るまで --resume で待つ」を明記)→ `state: running`。
+2. poll#3 から sub-run を発見(`run_093f793a0c47`、ownership は `verified` に確定)、
+   子タスク 1 件が `children[]` に現れる。
+3. poll#10 で **`asks[]` に ask が届き `phase: decision_gate`**(asker = 親 Run の
+   Commander task、`fromHandle: "dispatch:ctx_…"`、`toHandle: "run:<親Run>"`)。
+   行の形は §12.1 の fixture どおり(payload JSON 文字列の正規化も一致)。
+4. `orca_reply_message({ messageId, body: "approve", run })` → `ok: true`。
+5. 次の poll で `state: completed` / `phase: finished`。結果の `provenance: worker_report`
+   には「**親 Run への ask は 1 回のみ、msg_a4abd33034ab に approve 回答を受領して
+   追記を保持**」と明記されていた(asker 側が answer を消費した実機確認)。
+6. 2 本目の cancel ジョブは `fullyStopped: true` で停止、`--cleanup` で子 worktree を削除。
+
+§10 の 3 項目(子 Run 座からの ask 通達、子 Run 座からの worker_done、ask → reply の
+MCP 経路 E2E)をこの 1 回で確認した。
+
+### 13.2 E2E で見つかった欠陥と修正(実装済み、テスト 297 件 green)
+
+- **完了 task の `assignee_handle` は null になる**(実測: 完了 task 行は
+  `assignee_handle: null`)。そのままだと result / cancel の sub-run 照合が handle 無しで
+  空になり、**完走後の result で `children: []` / `subRunsDiscovered: 0` になる**(実測)。
+  → `commanderHandlesWithDispatch()` を追加: task 行に handle が無いときだけ
+  `dispatch-show` の `assignee_handle`(完了後も残る)で補う。result と cancelTask の
+  両方に適用。テスト: 完了 task でも dispatch-show 経由で sub-run の子を拾う /
+  dispatch-show にも無ければ拾えない(handle 無し = 照合不能)。
+- **reply の後も ask 行はしばらく受信箱に残る**(実測: 完了直後の poll で `asks=1` のまま)。
+  2 回目の reply は `duplicate: false` / `answer_message_id: null` で**通ってしまう**
+  (§12.2 が想定した「重ね返信は duplicate: true」は実測と違う)。のちに(≈15 分後)
+  peek / `--all` ともに行は消える(旧記録「回答済みは peek に現れない」はこの削除後の
+  観測と整合)。→ poll は **asker task が終端(completed / failed / cancelled)の ask を
+  `asks[]` と `kind: ask` から外し、warnings に記録する**。呼び出し Run の task-list に
+  現れない sub-run 由来の ask は判定不能なので残す(回答待ちの可能性を捨てない)。
+  クライアント側の規則も README に追記: 同じ ask への返信は 1 回に絞る。
+
+### 13.3 副次の所見
+
+- **claude Commander は 31 分間何もしなかった**(1 回目の E2E: `run_8e8a0f8a48e4`、
+  poll 40 回すべて `children=0 / asks=0`、worker は `rawStatus: ready` / `activity: done` /
+  出力 0 行、子 Run も ask も作らず、worker_done も無し。dispatch は `--cleanup` の
+  worktree 削除(`operator_close`)で死んだ)。同 goal は codex では完走。
+  → scripts/e2e.mjs の既定 commanderAgent は codex を明示して使う。原因(注入未達 /
+  auth / モデル側の問題)は未確定で、§10 には載せない(別の再現待ち)。
+- **E2E 後片付けの実機確認**: pane は cancel ジョブの Run にバインドされており、
+  別 Run(`run_8e8a0f8a48e4`)への `task-update` が `consumer_fenced` で拒否 →
+  `run-use --id run_8e8a0f8a48e4` → 再実行で成功。MCP の runMutation が実装する
+  fenced → run-use → 再試行の手順がそのまま実機で効くことを確認した(残留 job の
+  task は `failed` に確定)。
+- scripts/e2e.mjs に **sweep cancel** を追加(期限到来でも 1 本目が完了していなければ
+  cascade cancel。1 回目の E2E で残留 running job が残った教訓)。
