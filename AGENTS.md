@@ -25,7 +25,7 @@ src/
   orca/
     command.ts      # orca CLI を子プロセスで実行する最下層(runOrca / buildArgs / OrcaCommandError)
     client.ts       # OrcaClient: コマンド単位の型付きメソッド。runner 注入可能(テストでモック)
-    job.ts          # 非同期 Job API の内部モデル(正規化 + delegateTask / getTaskStatus / getTaskResult / sendMessage / cancelTask / resolveGate)
+    job.ts          # 非同期 Job API の内部モデル(正規化 + delegateTask / getTaskStatus / getTaskResult / sendMessage / cancelTask / resolveGate / replyMessage)
     schemas.ts      # 各ツールの zod inputSchema
   server/
     config.ts       # 環境変数の解釈(純粋関数)+ 起動可否の判定(ループバック外 + トークン無しは拒否)
@@ -34,7 +34,7 @@ src/
   tools/
     result.ts       # 共通の CallToolResult ヘルパー(textResult / errorResult / resultOf)
     job.ts          # orca_delegate_task / orca_get_task_status / orca_get_task_result
-    intervene.ts    # orca_send_message / orca_resolve_gate / orca_cancel_task(変更系コマンドはここに集約)
+    intervene.ts    # orca_send_message / orca_resolve_gate / orca_cancel_task / orca_reply_message(変更系コマンドはここに集約)
     status.ts       # orca_status          … status
     readiness.ts    # orca_readiness       … status + skills installed の前提チェック(インストールはしない)
     worktrees.ts    # orca_list_worktrees  … worktree list / orca_get_worktree … worktree show
@@ -65,10 +65,11 @@ docs/
 | ツール | 役割 | 内部コマンド |
 | --- | --- | --- |
 | `orca_delegate_task` | submit(**Commander 専用**) | run-create(未指定時) → task-create(固定 Commander 指示 + goal + repo + constraints) → worker-start `--worktree new-child --name <title または生成名> --agent <commanderAgent>` |
-| `orca_get_task_status` | poll | task-list / dispatch-show / worker-list / gate-list / **run-list**(sub-run 照合)(子タスクは task-list の `parent_id` + sub-run の root 照合で拾う) |
+| `orca_get_task_status` | poll | task-list / dispatch-show / worker-list / gate-list / **run-list**(sub-run 照合)/ **check**(呼び出し Run の受信箱から pending の ask を読む。子タスクは task-list の `parent_id` + sub-run の root 照合で拾う) |
 | `orca_get_task_result` | result | task-list / dispatch-show / worker-read / **run-list**(`includeChildren: true` で子タスクの result と出力も集約) |
 | `orca_send_message` | intervene(非破壊) | `orchestration send`(必要なら run-use でバインド切替) |
 | `orca_resolve_gate` | intervene(非破壊 / Human-in-the-loop) | gate-list → `orchestration gate-resolve`(必要なら run-use でバインド切替) |
+| `orca_reply_message` | intervene(非破壊 / Human-in-the-loop) | `orchestration check`(--all で点検) → `orchestration reply`(必要なら run-use でバインド切替) |
 | `orca_cancel_task` | intervene(破壊的 / 既定 cascade) | 子孫を**子から順**に worker-stop/abandon → `task-update --status failed` |
 | `orca_status` | 観測 | `orca status --json` |
 | `orca_readiness` | 観測 | `orca status --json` + `orca skills installed --json`(`commanderAgent` で providers まで見る) |
@@ -89,6 +90,10 @@ docs/
   `COMMANDER_PROMPT` の Constraints 欄に箇条書きで書き込む。
 - `COMMANDER_PROMPT` には「orchestration を変更する前に `orca skills get orchestration --full` を
   読み、記憶した CLI 構文を使わない」という Orca 公式の推奨を固定で書き込む。
+  さらに **座分離契約**(2026-10-21 実測・設計: `docs/design/run-seat-ownership.md`)を固定で書き込む:
+  親 Run は 1 つで seat は呼び出し元のまま(`run-use --id {{runId}}` 禁止)、作業は Commander が作る
+  子 Run に限定(objective に `orca-mcp-parent:` マーカー)、承認は ask(`--to run:{{runId}}`)で
+  ゲートを作らせない。`commanderSpec` のテストで文言を固定する。
 - 作業ワーカーの選択は Commander 側。MCP 側の語彙は `commanderAgent`(= どの Commander を起動するか)。
 - **`commanderAgent` は Orca 側で設定されたエージェント名のみ**(`worker-start --agent` の制約)。
   実機で `"dsh headless"` は `agent_unconfigured`。launcher 登録前の `dsh`(dsh-tui 直接起動)は
@@ -265,47 +270,63 @@ docs/
 - ジョブ層の語彙は `JobError`(`task_not_found` / `task_id_missing` / `run_create_failed` /
   `outcome_required` / `outcome_not_allowed` / `dispatch_id_required` / `cancel_incomplete` /
   `cancel_scope_too_large` / `cancel_dispatch_scope_too_large` / `gate_not_found` / `gate_run_mismatch` /
-  `cancel_ownership_unverified` / `cancel_discovery_incomplete` / `gate_task_mismatch`)。
+  `cancel_ownership_unverified` / `cancel_discovery_incomplete` / `gate_task_mismatch` /
+  `ask_not_found` / `ask_task_mismatch`)。
   CLI 側の語彙(`run_required` など)はそのまま転送する。
 - `state: "cancelled"` は **MCP 側の論理状態**(CLI に native status が無い)。実体は
   `status: failed` + `result: "cancelled: <reason>"`。README にその旨を 1 行書く。
 - **ゲートは自分の task に作れない**(2026-10-16 実機): Commander の task は supervised dispatch が生きているので
-  `gate-create --task <自分>` は `task_not_startable` で拒否される。Commander Prompt は「承認用の子 task を
-  `--parent` 自分の task で作り、その task にゲートを作る」と指示する。poll は直接の子のゲートまで拾うので
-  `gates` に出る(`role: child`)。
-- poll の `blockedReasons[]`(設計: `docs/design/blocked-reasons.md`): `kind` は `gate / task_report /
+  `gate-create --task <自分>` は `task_not_startable` で拒否される。承認経路は ask に統一したので
+  Commander Prompt はゲートを作らせない(詳細は下の `blockedReasons[]` の項)。`orca_resolve_gate` は
+  旧契約のジョブ(sub-run 内の承認用子 task のゲート)との互換用に残す。
+- poll の `blockedReasons[]`(設計: `docs/design/blocked-reasons.md`): `kind` は `gate / ask / task_report /
   agent_prompt / unknown`。`blocked` でも gate が無いことがある(Commander の blocked 報告 = `task-update` の `result`、
-  エージェントの承認プロンプト)ので、**`blocked` = `decision_gate` と決めつけない**。pending のゲートがあるときだけ
-  phase は `decision_gate`、無ければ `blocked`。gates は `gate-list --run` で全件取り、対象タスク + 直接の子タスクに絞る。
-  **gate 行には必ず `runId` を載せる**(行の `run_id` を優先、無いときは照合した Run 名義で補う)。
+  エージェントの承認プロンプト)ので、**`blocked` = `decision_gate` と決めつけない**。pending のゲート**か ask**
+  があるときだけ phase は `decision_gate`、無ければ `blocked`。gates は `gate-list --run` で全件取り、対象タスク +
+  直接の子タスクに絞る。**gate 行には必ず `runId` を載せる**(行の `run_id` を優先、無いときは照合した Run 名義で補う)。
   `gate-resolve` に `--run` が無く `orca_resolve_gate` は `run` 必須なので、呼び出し側が所属 Run を知れていなければ
   解決に使えない(sub-run のゲートは呼び出し元 Run と違う Run にある)。`blockedReasons` の gate `detail` にも
   `gateId` / `runId` / `options` を入れる。追加の読み取りは `agent_prompt` の `worker-read`(最大 2 worker)だけで、変更系は呼ばない。
+- poll は **呼び出し Run の受信箱から pending の ask(`type: question`)を読む**(`orchestration check --run <run>
+  --peek --types question`。check は Run バインドスコープなので runMutation 経由 — 復旧の run-use は
+  呼び出し元自身の Run への再バインドだけ)。応答には `asks[]`(`messageId` = `thread_id` / `question` /
+  `options` / `taskId` / `dispatchId` / `fromHandle` / `createdAt`)を載せ、`kind: ask` の `blockedReasons`
+  (`detail` に `messageId` / `question` / `options`)を添える。**asker は回答までブロック中**なので、
+  ask が pending の asker の worker は `agent_prompt` に出さない(二重掲載の排除)。
+  回答は `orca_reply_message({ messageId, body, run })`(asker はタイムアウト後も `ask --resume` で待つので遅れて届く)。
+  asker task の payload.taskId が呼び出し元 Run の task 部分木に属さない sub-run 由来の ask は taskId 点検の外側
+  (呼び出し元 Run の task-list に現れない)なので、その場合は `taskId` を外して解決する。
+  check の失敗は `warnings` に留めて poll を壊さない。ask の「まだ pending か」の確定は受信箱の unread(peek)
+  が根拠 — 回答済み・既読済みの行は peek に現れない(2026-10-22 実測、§10 の未確定事項)。
 - poll は worker の `projection.attention.requiresAction` を `attentionRequired` / `attentionNotes`
   (行には `attentionCategories`)として出す。ゲートが pending でないのに止まる典型はエージェント側の
-  ツール承認プロンプト(E2E 実測)。Commander Prompt には「答えられない承認待ちで止めない / 既存 Run を使い
-  深さ・circuit-break・失敗 dispatch・binding 回避で新しい Run を作らない / 自律 coordinator が child Run を
-  作るなら objective マーカーと最終報告で関連付ける / gate 作成失敗は承認を進めず停止して人間に依頼する」を
-  固定で書き込む(`commanderSpec` のテストで文言を固定する)。
+  ツール承認プロンプト(E2E 実測)。Commander Prompt には「答えられない承認待ちで止めない / 親 Run は
+  1 つで seat は呼び出し元のまま、作業は子 Run に限定し `run-use --id {{runId}}` を禁止 /
+  深さ・circuit-break・失敗 dispatch・binding 回避で新しい Run を作らない / 承認は ask でゲートを作らせない /
+  ask 失敗は承認を進めず停止して人間に依頼する」を固定で書き込む(`commanderSpec` のテストで文言を固定する)。
 - 出力は既定で切り詰める(`specPreview` 200 字、worker 出力 4000 字、agents の prompt 200 字)。
 
 ## 登録ツール(現状)
 
-`createServer()` は上記 13 個だけを登録する。`delegate.ts` / `message.ts` は足場として
+`createServer()` は上記 14 個だけを登録する。`delegate.ts` / `message.ts` は足場として
 ファイルを残す(テストは生かす)。登録を外したツールのファイルは削除しない。
 
 読み取り・poll 系の決まり:
 
 - 観測ツールの `annotations` は `{ readOnlyHint: true, openWorldHint: false }` 固定。
   `orca_delegate_task` / `orca_cancel_task` は `readOnlyHint: false` + `destructiveHint: true`、
-  `orca_send_message` / `orca_resolve_gate` は `readOnlyHint: false` + `destructiveHint: false`。
+  `orca_send_message` / `orca_resolve_gate` / `orca_reply_message` は `readOnlyHint: false` +
+  `destructiveHint: false`。
 - 大きな欄は既定で省略する(`orca_list_agents` は `prompt` を 200 文字で切り詰め、
   `lastAssistantMessage` は `full: true` のときだけ)。
 - 1 ハンドラーで複数の orca コマンドを呼んでよいのは **poll / result の読み集め**
-  (`task-list` + `dispatch-show` + `worker-list` + `gate-list` + `run-list`)、submit の既定フロー、
-  観測の `orca_readiness`(`status` + `skills installed`)、
-  そして **介入ツール(`orca_send_message` / `orca_resolve_gate` / `orca_cancel_task`)だけ**。
+  (`task-list` + `dispatch-show` + `worker-list` + `gate-list` + `run-list` + **check**〔ask 受信〕)、
+  submit の既定フロー、観測の `orca_readiness`(`status` + `skills installed`)、
+  そして **介入ツール(`orca_send_message` / `orca_resolve_gate` / `orca_cancel_task` /
+  `orca_reply_message`)だけ**。
   poll / result / 観測ツールが変更系コマンド(task-update / worker-stop / gate-resolve / run-use)を呼ぶことは禁止。
+  ただし poll の ask 受信(`check`)と `orca_reply_message` の点検は runMutation 経由を許す —
+  復旧の run-use は**呼び出し元自身の Run への再バインド**だけ(sub-run 集約で他人の Run に奪わない)。
 - poll の応答に生の JSON をそのまま入れず、正規化した上で `rawStatus` 等の生値を添える。
 
 ### Run バインドと `consumer_fenced`
@@ -337,6 +358,10 @@ orca CLI は **呼び出し元ターミナルを 1 つの Run にバインド**�
   `orca_resolve_gate` の `taskId`(任意)を持つ — 指定した task と、その `task-create` 部分木に属さない
   ゲートは `gate_task_mismatch` で**変更前に**拒否する(指定なしは点検しない。既存 API との互換性を保つため
   既定の挙動は変えない)。
+- **`check` / `reply` も Run バインドスコープ**(2026-10-22 実測: 別 Run にバインドされた terminal から
+  `check --run <run>` は `consumer_fenced`)。poll の ask 受信と `orca_reply_message` の点検・reply は
+  runMutation 経由で対象 Run への再バインドを 1 回だけ許す(reply は `run` 必須 — 点検で読んだ受信箱の
+  Run と reply 先が一致しなければ誤返信になる)。点検は `--all` で読む(peek だと回答済み・既読済みが拾えない)。
 
 ### sub-run(Commander が別の Run を作ってしまう事故)の扱い
 

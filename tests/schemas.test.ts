@@ -12,6 +12,7 @@ import {
   listWorktreesInputSchema,
   messageInputSchema,
   readinessInputSchema,
+  replyMessageInputSchema,
   resolveGateInputSchema,
   sendMessageInputSchema,
 } from "../src/orca/schemas.js";
@@ -83,6 +84,27 @@ describe("resolveGateInputSchema", () => {
     expect(
       resolveGateInputSchema.safeParse({ gateId: "g1", resolution: "approve", run: "r1" }).success,
     ).toBe(true);
+  });
+});
+
+describe("replyMessageInputSchema", () => {
+  it("messageId / body / run が必須(reply は Run バインドスコープなので run は必須)", () => {
+    expect(replyMessageInputSchema.safeParse({}).success).toBe(false);
+    expect(replyMessageInputSchema.safeParse({ messageId: "msg_1", body: "approve" }).success).toBe(false);
+    expect(replyMessageInputSchema.safeParse({ messageId: "", body: "approve", run: "r1" }).success).toBe(false);
+    expect(replyMessageInputSchema.safeParse({ messageId: "msg_1", body: "", run: "r1" }).success).toBe(false);
+    expect(replyMessageInputSchema.safeParse({ messageId: "msg_1", body: "approve", run: "r1" }).success).toBe(
+      true,
+    );
+  });
+
+  it("taskId は任意の点検口(strictObject で余計な入力は拒否)", () => {
+    expect(replyMessageInputSchema.safeParse({ messageId: "msg_1", body: "approve", run: "r1", taskId: "t1" }).success).toBe(
+      true,
+    );
+    expect(replyMessageInputSchema.safeParse({ messageId: "msg_1", body: "approve", run: "r1", gate: "g1" }).success).toBe(
+      false,
+    );
   });
 });
 

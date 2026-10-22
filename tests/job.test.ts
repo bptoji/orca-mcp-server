@@ -9,6 +9,7 @@ import {
   commanderSpec,
   estimatePhase,
   extractApprovalPrompt,
+  extractMessages,
   extractRuns,
   matchSubRuns,
   outputHashOf,
@@ -22,9 +23,11 @@ import {
   mapTaskState,
   mapWorkerStatus,
   parseParentMarker,
+  replyMessage,
   resolveGate,
   selectSubRunRoots,
   sendMessage,
+  toAskRow,
   SUB_RUN_MARKER_PREFIX,
   toChildRow,
   toRunRow,
@@ -217,6 +220,9 @@ function createFakeClient(options: {
   runList?: JsonObject;
   gateList?: JsonObject;
   gateResolve?: JsonObject;
+  /** orchestration check の応答(ask 受信の fixture)。既定は空の受信箱。 */
+  check?: JsonObject;
+  checkThrows?: Error;
   workerRead?: JsonObject;
   send?: JsonObject;
   taskUpdate?: JsonObject;
@@ -295,6 +301,13 @@ function createFakeClient(options: {
         }
       );
     },
+    check: async (input: JsonObject) => {
+      calls.push(`check:${JSON.stringify(input)}`);
+      if (options.checkThrows !== undefined) {
+        throw options.checkThrows;
+      }
+      return options.check ?? { ok: true, result: { runId: "run_test", messages: [], count: 0, acknowledged: null } };
+    },
     workerRead: async (input: JsonObject) => {
       calls.push(`workerRead:${JSON.stringify(input)}`);
       return options.workerRead ?? { ok: true, result: { text: "done", source: "transcript" } };
@@ -369,14 +382,11 @@ describe("delegateTask(submit / Commander API)", () => {
     // orchestration 変更の前に version-matched guide を読ませる(公式の推奨)
     expect(taskCreate).toContain("orca skills get orchestration --full");
     expect(taskCreate).toContain("worker-start");
-    // gate は Commander 所有(Worker が人間向け gate を作って良いことにならない)
-    expect(taskCreate).toContain("You own every human-facing decision gate");
+    // 承認は ask 承認経路に統一(gate は作らせない)
+    expect(taskCreate).toContain("You own the human-facing decisions");
     expect(taskCreate).toContain("Workers must not create gates");
-    // 自分の task は dispatch が生きていて gate-create を拒否される(実機: task_not_startable)ので承認用の子 task に作らせる
-    expect(taskCreate).toContain("task_not_startable");
-    expect(taskCreate).toContain("dedicated approval child task");
-    expect(taskCreate).toContain("Do not target your own task");
-    expect(taskCreate).not.toContain("the gate on your own task");
+    expect(taskCreate).toContain("Do not create gates for human approval");
+    expect(taskCreate).toContain("gate-list does not show asks");
     // 完了宣言の前に全 child task の terminal + result 確認を課す
     expect(taskCreate).toContain("verify that every delegated child task has reached a");
     expect(taskCreate).toContain("terminal state and inspect its result");
@@ -387,22 +397,19 @@ describe("delegateTask(submit / Commander API)", () => {
     expect(taskCreate).toContain("If loading the guide is blocked by a tool-permission prompt");
     expect(taskCreate).toContain("fall back to");
     expect(taskCreate).toContain("orca orchestration --help");
-    // Run 所有権(review9 §3 の文言): 既存 Run を使い、深さ/ circuit-break / 失敗 dispatch /
-    // binding 無しの回避として run-create を作らせない
-    expect(taskCreate).toContain("Run ownership and sub-run policy:");
-    expect(taskCreate).toContain("Reuse that Run for ordinary child tasks");
-    expect(taskCreate).toContain("Do not create a new Run merely because the current terminal has no bound Run");
+    // Run 所有権(座分離): 親 Run は 1 つで seat は呼び出し元のまま。作業は全て子 Run で。
+    // task-id は dispatch preamble / task-list で確認する
+    expect(taskCreate).toContain("Run ownership:");
+    expect(taskCreate).toContain("confirm it with");
+    expect(taskCreate).toContain("task-list --run run_test --json");
     expect(taskCreate).toContain("Never create a Run to bypass a nested worker depth limit");
     expect(taskCreate).toContain("does not reset depth");
-    // legacy takeover は別操作 = 新しい Run を作る許可ではない
-    expect(taskCreate).toContain("run-use --takeover-legacy");
-    expect(taskCreate).toContain("it is not permission to");
-    // 自律 coordinator は guide が許すときだけ child Run を作り、マーカーと報告で関連付ける
-    expect(taskCreate).toContain("A worker acting as an autonomous coordinator may create and manage a child Run");
+    expect(taskCreate).toContain("Workers must not create Runs at all");
+    // 子 Run は objective マーカーで関連付ける(SUB_RUN_MARKER_PREFIX)
     expect(taskCreate).toContain(`${SUB_RUN_MARKER_PREFIX} run=run_test task=<your task id>`);
-    expect(taskCreate).toContain("Report the child Run id and its relationship to this job");
-    // gate 作成に失敗したら承認を進めない(人間への介入要求までが手順)
-    expect(taskCreate).toContain("If gate-create fails: check the Run binding");
+    expect(taskCreate).toContain("Record the child Run id in your final report");
+    // 承認 ask が失敗したら承認を進めない(人間への介入要求までが手順)
+    expect(taskCreate).toContain("If ask fails (for example dispatch_inactive)");
     expect(taskCreate).toContain("Never proceed as if approval had");
   });
 
@@ -413,10 +420,12 @@ describe("delegateTask(submit / Commander API)", () => {
     const taskCreate = calls[1] ?? "";
     // {{runId}} は複数箇所に出る(global 置換で全部埋める)
     expect(taskCreate).toContain("exactly ONE Run: run_test");
-    expect(taskCreate).toContain("task-list --run run_test --json");
-    expect(taskCreate).toContain("task-create --run run_test --parent");
-    expect(taskCreate).toContain("worker-start --run run_test --task");
-    expect(taskCreate).toContain("run-use --id run_test --json");
+    // 親 Run の seat は呼び出し元のまま: run-use で共有 Run を奪わせない
+    expect(taskCreate).toContain("run-use --id run_test");
+    expect(taskCreate).not.toContain("run-use --id run_test --json");
+    expect(taskCreate).toContain("orca orchestration ask --to run:run_test");
+    expect(taskCreate).not.toContain("task-create --run run_test");
+    expect(taskCreate).not.toContain("worker-start --run run_test");
     expect(taskCreate).not.toContain("{{");
     // taskId は task-create の後にしか決まらず task-update に --spec が無い(実機 help 実測)
     // ので注入しない → 注入漏れを warnings で黙らない
@@ -2500,6 +2509,10 @@ function createSubRunClient(options: { runs?: JsonObject[] } = {}) {
         },
       };
     },
+    check: async (input: JsonObject) => {
+      calls.push(`check:${JSON.stringify(input)}`);
+      return { ok: true, result: { runId: "run_caller", messages: [], count: 0, acknowledged: null } };
+    },
     workerRead: async (input: JsonObject) => {
       const dispatch = String(input["dispatch"]);
       calls.push(`workerRead:${dispatch}`);
@@ -3094,5 +3107,341 @@ describe("cancelTask — 所有検証・dispatch 重複・停止後の読み直�
     expect(result["cancelled"]).toBe(true);
     expect(result["fullyStopped"]).toBe(false);
     expect((result["warnings"] as string[]).join("|")).toContain("worker-list を読み直せる Run");
+  });
+});
+
+describe("extractMessages / toAskRow — check 応答の正規化(2026-10-22 実測 fixture)", () => {
+  // 実測: `orchestration check --peek` の result.messages[] はフラットで、
+  // thread_id が ask の messageId、payload は { taskId, dispatchId, question, options } の JSON 文字列、
+  // from_handle に asker の dispatch(dispatch:ctx_…)が入る。
+  const messageRow: JsonObject = {
+    id: "msg_9342c625c55d",
+    run_id: "run_1e32ec292d45",
+    delivery_contract: "current_delivery",
+    from_handle: "dispatch:ctx_69caaa5b5236",
+    to_handle: "run:run_1e32ec292d45",
+    subject: "Question",
+    body: "structure-test",
+    type: "question",
+    priority: "normal",
+    thread_id: "msg_9342c625c55d",
+    payload:
+      '{"taskId":"task_fd39f658ccba","dispatchId":"ctx_69caaa5b5236","question":"structure-test","options":["approve","reject"]}',
+    created_at: "2026-10-22T01:59:16Z",
+    delivered_at: null,
+  };
+
+  it("messages 配列を取り出す(キー名の揺れを吸収)", () => {
+    expect(extractMessages({ messages: [messageRow] })).toEqual([messageRow]);
+    expect(extractMessages({ items: [messageRow] })).toEqual([messageRow]);
+    expect(extractMessages({ data: [messageRow] })).toEqual([messageRow]);
+    expect(extractMessages({})).toEqual([]);
+  });
+
+  it("payload(JSON 文字列)を展開して question / options / taskId / dispatchId を正規化する", () => {
+    const row = toAskRow(messageRow);
+    expect(row).toMatchObject({
+      messageId: "msg_9342c625c55d",
+      threadId: "msg_9342c625c55d",
+      type: "question",
+      subject: "Question",
+      question: "structure-test",
+      options: ["approve", "reject"],
+      taskId: "task_fd39f658ccba",
+      dispatchId: "ctx_69caaa5b5236",
+      fromHandle: "dispatch:ctx_69caaa5b5236",
+      toHandle: "run:run_1e32ec292d45",
+      createdAt: "2026-10-22T01:59:16Z",
+    });
+  });
+
+  it("payload が壊れていても row を壊さず raw を残す", () => {
+    const row = toAskRow({ thread_id: "msg_x", type: "question", payload: "not-json" });
+    expect(row["payload"]).toBe("not-json");
+    expect(row["messageId"]).toBe("msg_x");
+    expect(row["question"]).toBeNull();
+    expect(row["taskId"]).toBeNull();
+  });
+});
+
+describe("estimatePhase — pending の ask も decision_gate", () => {
+  it("ask があれば decision_gate、無ければ従来どおり", () => {
+    expect(estimatePhase("running", [], [], [{ messageId: "msg_1", taskId: "task_1" }])).toBe("decision_gate");
+    expect(estimatePhase("running", [], [], [])).toBe("starting");
+    expect(estimatePhase("running", [], [])).toBe("starting");
+  });
+});
+
+describe("getTaskStatus(poll) — ask の受信と blockedReasons", () => {
+  const checkEnvelope = {
+    ok: true,
+    result: {
+      runId: "run_a781f51d4c91",
+      messages: [
+        {
+          id: "msg_9342c625c55d",
+          run_id: "run_a781f51d4c91",
+          from_handle: "dispatch:disp_cmd",
+          to_handle: "run:run_a781f51d4c91",
+          subject: "Question",
+          type: "question",
+          thread_id: "msg_9342c625c55d",
+          payload:
+            '{"taskId":"task_3208dcf22c18","dispatchId":"disp_cmd","question":"README を更新してよいか","options":["approve","reject"]}',
+          created_at: "2026-10-22T01:59:16Z",
+          delivered_at: null,
+        },
+      ],
+      count: 1,
+      acknowledged: null,
+    },
+  };
+
+  it("asks と kind: ask の blockedReasons を返し、phase は decision_gate", async () => {
+    const { client, calls } = createFakeClient({
+      taskList: { ok: true, result: { tasks: [{ id: "task_3208dcf22c18", status: "dispatched" }] } },
+      check: checkEnvelope,
+    });
+    const view = await getTaskStatus(client, { taskId: "task_3208dcf22c18", run: "run_a781f51d4c91" });
+    expect(view["phase"]).toBe("decision_gate");
+    expect(view["asks"]).toEqual([
+      expect.objectContaining({
+        messageId: "msg_9342c625c55d",
+        question: "README を更新してよいか",
+        options: ["approve", "reject"],
+        taskId: "task_3208dcf22c18",
+      }),
+    ]);
+    const reasons = view["blockedReasons"] as JsonObject[];
+    expect(reasons.find((reason) => reason["kind"] === "ask")).toMatchObject({
+      kind: "ask",
+      role: "commander",
+      taskId: "task_3208dcf22c18",
+      detail: { messageId: "msg_9342c625c55d", options: ["approve", "reject"] },
+    });
+    // check は --run + --peek + --types question で読む(既読に触れない)
+    const checkCall = calls.find((call) => call.startsWith("check:"));
+    expect(checkCall).toContain('"run":"run_a781f51d4c91"');
+    expect(checkCall).toContain('"mode":"peek"');
+    expect(checkCall).toContain('"types":["question"]');
+  });
+
+  it("check が失敗しても poll を壊さず warnings に留める", async () => {
+    const { client } = createFakeClient({
+      taskList: { ok: true, result: { tasks: [{ id: "task_3208dcf22c18", status: "dispatched" }] } },
+      checkThrows: new OrcaCommandError(
+        {
+          code: "consumer_fenced",
+          message: "This coordinator terminal is bound to run_other, not run_a781f51d4c91.",
+        },
+        { ok: false, args: ["orchestration", "check"], exitCode: 1, stdout: "", stderr: "" },
+      ),
+    });
+    const view = await getTaskStatus(client, { taskId: "task_3208dcf22c18", run: "run_a781f51d4c91" });
+    expect(view["asks"]).toEqual([]);
+    expect((view["warnings"] as string[]).join("|")).toContain("ask の受信確認");
+  });
+});
+
+describe("replyMessage — ask への回答(実測経路: reply でブロックが解ける)", () => {
+  const messageRow: JsonObject = {
+    id: "msg_1",
+    thread_id: "msg_1",
+    type: "question",
+    run_id: "run_caller",
+    from_handle: "dispatch:disp_cmd",
+    to_handle: "run:run_caller",
+    subject: "Question",
+    payload:
+      '{"taskId":"task_cmd","dispatchId":"disp_cmd","question":"よいか","options":["approve","reject"]}',
+  };
+
+  function makeReplyClient(options: {
+    check?: JsonObject;
+    replyThrows?: Error;
+    reply?: JsonObject;
+    taskList?: JsonObject;
+  } = {}) {
+    const calls: string[] = [];
+    const client = {
+      check: async (input: JsonObject) => {
+        calls.push(`check:${JSON.stringify(input)}`);
+        return options.check ?? { ok: true, result: { runId: "run_caller", messages: [messageRow], count: 1 } };
+      },
+      reply: async (input: JsonObject) => {
+        calls.push(`reply:${JSON.stringify(input)}`);
+        if (options.replyThrows !== undefined) {
+          throw options.replyThrows;
+        }
+        return (
+          options.reply ?? {
+            ok: true,
+            result: {
+              answer_message_id: "msg_answer",
+              answer_body: input["body"],
+              duplicate: false,
+              mutation: { requestId: "r", replayed: false },
+            },
+          }
+        );
+      },
+      taskList: async (input: JsonObject) => {
+        calls.push(`taskList:${JSON.stringify(input)}`);
+        return options.taskList ?? { ok: true, result: { tasks: [{ id: "task_cmd", status: "dispatched" }] } };
+      },
+      runUse: async (runId: string) => {
+        calls.push(`runUse:${runId}`);
+        return { ok: true, result: { run: { id: runId } } };
+      },
+    } as unknown as OrcaClient;
+    return { client, calls };
+  }
+
+  it("点検のうえ reply を 1 回呼び、answer を正規化して返す", async () => {
+    const { client, calls } = makeReplyClient();
+    const result = await replyMessage(client, {
+      messageId: "msg_1",
+      body: "approve",
+      run: "run_caller",
+      taskId: "task_cmd",
+    });
+    expect(result).toMatchObject({
+      ok: true,
+      messageId: "msg_1",
+      threadId: "msg_1",
+      answerMessageId: "msg_answer",
+      answerBody: "approve",
+      duplicate: false,
+      taskId: "task_cmd",
+      runId: "run_caller",
+    });
+    // 点検(check --all → taskList で部分木確認)→ reply の順。check は既読に触れない
+    expect(calls[0]).toContain('"mode":"all"');
+    const replyCall = calls.find((call) => call.startsWith("reply:"));
+    expect(replyCall).toContain('"id":"msg_1"');
+    expect(replyCall).toContain('"body":"approve"');
+    expect(calls.filter((call) => call.startsWith("reply:")).length).toBe(1);
+  });
+
+  it("messageId が指定 Run の受信箱に無ければ ask_not_found(変更ゼロ)", async () => {
+    const { client, calls } = makeReplyClient({
+      check: { ok: true, result: { runId: "run_caller", messages: [], count: 0 } },
+    });
+    const error = await replyMessage(client, { messageId: "msg_other", body: "approve", run: "run_caller" }).catch(
+      (e) => e,
+    );
+    expect(error).toBeInstanceOf(JobError);
+    expect((error as JobError).code).toBe("ask_not_found");
+    expect(calls.some((call) => call.startsWith("reply:"))).toBe(false);
+  });
+
+  it("payload.taskId が指定 task(と部分木)に属さなければ ask_task_mismatch(変更ゼロ)", async () => {
+    const { client, calls } = makeReplyClient();
+    const error = await replyMessage(client, {
+      messageId: "msg_1",
+      body: "approve",
+      run: "run_caller",
+      taskId: "task_root",
+    }).catch((e) => e);
+    expect(error).toBeInstanceOf(JobError);
+    expect((error as JobError).code).toBe("ask_task_mismatch");
+    expect(calls.some((call) => call.startsWith("reply:"))).toBe(false);
+  });
+
+  it("sub-run の worker からの ask(task-list に現れない)は taskId を外せば解決できる", async () => {
+    const { client, calls } = makeReplyClient({
+      check: {
+        ok: true,
+        result: {
+          runId: "run_caller",
+          messages: [
+            {
+              id: "msg_sub",
+              thread_id: "msg_sub",
+              type: "question",
+              payload: '{"taskId":"task_sub_worker","question":"sub の確認"}',
+            },
+          ],
+        },
+      },
+    });
+    const result = await replyMessage(client, { messageId: "msg_sub", body: "approve", run: "run_caller" });
+    expect(result["taskId"]).toBe("task_sub_worker");
+    expect(calls.some((call) => call.startsWith("reply:"))).toBe(true);
+  });
+
+  it("reply が consumer_fenced でも run-use して 1 回再試行する", async () => {
+    const calls: string[] = [];
+    let attempts = 0;
+    const client = {
+      check: async (input: JsonObject) => {
+        calls.push(`check:${JSON.stringify(input)}`);
+        return { ok: true, result: { runId: "run_caller", messages: [messageRow], count: 1 } };
+      },
+      reply: async (input: JsonObject) => {
+        calls.push(`reply:${JSON.stringify(input)}`);
+        attempts += 1;
+        if (attempts === 1) {
+          throw new OrcaCommandError(
+            {
+              code: "consumer_fenced",
+              message: "This coordinator terminal is bound to run_other, not run_caller.",
+            },
+            { ok: false, args: ["orchestration", "reply"], exitCode: 1, stdout: "", stderr: "" },
+          );
+        }
+        return { ok: true, result: { answer_message_id: "msg_answer", answer_body: "approve", duplicate: false } };
+      },
+      taskList: async (input: JsonObject) => {
+        calls.push(`taskList:${JSON.stringify(input)}`);
+        return { ok: true, result: { tasks: [] } };
+      },
+      runUse: async (runId: string) => {
+        calls.push(`runUse:${runId}`);
+        return { ok: true, result: { run: { id: runId } } };
+      },
+    } as unknown as OrcaClient;
+
+    const result = await replyMessage(client, {
+      messageId: "msg_1",
+      body: "approve",
+      run: "run_caller",
+    });
+    expect(result["answerMessageId"]).toBe("msg_answer");
+    // run-use の直後に再試行が続く
+    const runUseIndex = calls.findIndex((call) => call.includes("runUse:"));
+    expect(runUseIndex).toBeGreaterThan(0);
+    expect(calls[runUseIndex + 1]).toContain("reply:");
+  });
+});
+
+describe("commanderSpec — 座分離と ask 承認の固定文言", () => {
+  it("共有 Run の撤廄: 子 Run 必須・親 Run への run-use / mutation 禁止", () => {
+    const { spec, leaked } = commanderSpec({ spec: "goal", repo: "id:repo1" }, "run_abc");
+    expect(leaked).toEqual([]);
+    expect(spec).toContain("Do all of your work inside your own child Run");
+    expect(spec).toContain('never run "run-use --id run_abc"');
+    expect(spec).toContain("orca-mcp-parent: run=run_abc task=<your task id>");
+    expect(spec).toContain("orca orchestration task-create --run <childRunId> --spec ...");
+    expect(spec).toContain("Workers must not create Runs at all");
+    // 旧文言(共有 Run 前提・run-use 指示)は残さない
+    expect(spec).not.toContain("Reuse that Run");
+    expect(spec).not.toContain("Before any run-scoped operation");
+  });
+
+  it("fence と binding の扱い(fenced は停止報告、run_required だけ 1 回の再バインド)", () => {
+    const { spec } = commanderSpec({ spec: "goal" }, "run_abc");
+    expect(spec).toContain('re-bind once with "run-use --id <childRunId>" and\nretry once');
+    expect(spec).toContain("Do not fight for the seat");
+  });
+
+  it("承認は ask(--to run:<親Run>)で、ゲートを作らせない", () => {
+    const { spec } = commanderSpec({ spec: "goal" }, "run_abc");
+    expect(spec).toContain("orca orchestration ask --to run:run_abc");
+    expect(spec).toContain("--options approve,reject");
+    expect(spec).toContain("orca orchestration ask --resume <messageId>");
+    expect(spec).toContain("Do not create gates for human approval");
+    expect(spec).toContain("gate-list does not show asks");
+    expect(spec).toContain("Never proceed without the answer");
   });
 });

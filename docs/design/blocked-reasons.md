@@ -27,13 +27,47 @@
 | kind | 条件 | summary / detail |
 | --- | --- | --- |
 | `gate` | pending のゲート | 質問文 / `{ gateId, options }` |
+| `ask` | 呼び出し Run の受信箱に pending の ask(`type: question`) | 質問文 / `{ messageId, question, options, taskId?, fromHandle, createdAt }` |
 | `task_report` | task または子 task が `blocked` で `result` が非空 | `result`(2000 字まで) |
-| `agent_prompt` | worker が `requiresAttention`(終端 / exited の worker は除く) | 入力待ちの説明 / `detail.outputTail`(30 行 / 1500 字)、`outputHash`、`looksLikePrompt`、`observedAt`、`activity` |
+| `agent_prompt` | worker が `requiresAttention`(終端 / exited の worker は除く。**pending の asker は除外**) | 入力待ちの説明 / `detail.outputTail`(30 行 / 1500 字)、`outputHash`、`looksLikePrompt`、`observedAt`、`activity` |
 | `unknown` | 上のどれにも当たらない | 根拠なし |
 
 - `agent_prompt` の `worker-read` は、`blocked` またはゲート無しの attention のときだけ、最大 2 worker。
   失敗しても poll は壊さず `warnings` に残す。
 - 親が `running` でも、子 task が `blocked` なら拾う。
+
+### ask(2026-10-22 追加・実装済み)
+
+- 座分離契約(`docs/design/run-seat-ownership.md` §7)では承認を ask(`orchestration ask --to run:<run>`)に
+  統一し、ゲートを作らせない。ask はメッセージ承認で、asker は `--resume` で回答まで待つため
+  `blocked` の典型原因になる。
+- poll は `orchestration check --run <run> --peek --types question`(runMutation 経由。check は
+  Run バインドスコープのため、復旧の run-use は呼び出し元自身の Run への再バインドだけ)で読み、
+  `type === "question"` の行を `asks[]` に正規化する(`messageId` = `thread_id` / `question` /
+  `options` / `taskId` / `dispatchId` / `fromHandle` / `createdAt`)。
+- **ask が pending の asker worker は `agent_prompt` に出さない**(二重掲載の排除。asker は ask の
+  `--resume` 中なので pane ではなく ask の回答が先)。`taskId` は payload の JSON(`{taskId, dispatchId, …}`)から
+  取り、asker task が sub-run 由来(呼び出し元 Run の task 部分木に属さない)でも行は出す。
+- 回答は `orca_reply_message({ messageId, body, run })`。ask が見つからなければ `ask_not_found`、
+  `taskId` 点検で親 Run の部分木に属さなければ `ask_task_mismatch`(変更前に拒否。sub-run 由来は
+  `taskId` を外して解決する)。
+- ask の「まだ pending か」の確定は受信箱の unread(peek)が根拠 — 回答済み・既読済みの行は peek に
+  現れない(実測)。peek で `consumer_fenced` の意味(fenced-on-peek が caller teardown を示すのか)は未確定。
+
+### phase
+
+- pending のゲート**か ask** があるときだけ `decision_gate`。
+- `blocked` でどちらも無いときは新しい phase `blocked`(人間の判断とは限らない停止)。
+
+### nextAction
+
+| kind | 案内 |
+| --- | --- |
+| `gate` | `question` / `options` を確認し `orca_resolve_gate` |
+| `ask` | `question` / `options` を確認し `orca_reply_message({ messageId, body, run })` で回答する(タイムアウト後も asker は `--resume` で待つので遅れて届いてよい) |
+| `task_report` | 報告を読み、`orca_send_message` で指示するか `orca_cancel_task` |
+| `agent_prompt` | エージェントが入力待ち(承認プロンプトまたは Commander の待機)。MCP からは解除できない。`detail.outputTail` と `looksLikePrompt` で見極める。待機中なら `orca_send_message` / cancel |
+| `unknown` | `orca_get_task_result` と terminal を確認 |
 
 ### 入力待ちの見分け方(`agent_prompt`)
 
@@ -58,20 +92,6 @@ agent hooks の通知から作る projection で、画面の描画とは別経�
   (Commander が子の完了待ちで waiting のときの誤検知を避ける)。
 
 - `looksLikePrompt` が `false` で hash が変化し続けるなら動作中、`true` なら pane で人間が答える。
-
-### phase
-
-- pending ゲートがあるときだけ `decision_gate`。
-- `blocked` でゲートが無いときは新しい phase `blocked`(人間の判断とは限らない停止)。
-
-### nextAction
-
-| kind | 案内 |
-| --- | --- |
-| `gate` | `question` / `options` を確認し `orca_resolve_gate` |
-| `task_report` | 報告を読み、`orca_send_message` で指示するか `orca_cancel_task` |
-| `agent_prompt` | エージェントが入力待ち(承認プロンプトまたは Commander の待機)。MCP からは解除できない。`detail.outputTail` と `looksLikePrompt` で見極める。待機中なら `orca_send_message` / cancel |
-| `unknown` | `orca_get_task_result` と terminal を確認 |
 
 ## 前提(実機で未確認)
 

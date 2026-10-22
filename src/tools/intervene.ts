@@ -1,9 +1,10 @@
 import type { McpServer } from "@modelcontextprotocol/server";
 import type { CallToolResult } from "@modelcontextprotocol/server";
 import type { OrcaClient } from "../orca/client.js";
-import { cancelTask, resolveGate, sendMessage } from "../orca/job.js";
+import { cancelTask, replyMessage, resolveGate, sendMessage } from "../orca/job.js";
 import {
   cancelTaskInputSchema,
+  replyMessageInputSchema,
   resolveGateInputSchema,
   sendMessageInputSchema,
 } from "../orca/schemas.js";
@@ -12,9 +13,10 @@ import { resultOf } from "./result.js";
 export const SEND_MESSAGE_TOOL_NAME = "orca_send_message";
 export const CANCEL_TASK_TOOL_NAME = "orca_cancel_task";
 export const RESOLVE_GATE_TOOL_NAME = "orca_resolve_gate";
+export const REPLY_MESSAGE_TOOL_NAME = "orca_reply_message";
 
 /**
- * 介入(intervene)ツール: 委譲したジョブに対して明示的に頼まれたときだけ変更を加える 3 個。
+ * 介入(intervene)ツール: 委譲したジョブに対して明示的に頼まれたときだけ変更を加える 4 個。
  * poll / result / 観測ツールが変更系コマンドを呼ぶことはなく、ここだけに集約する。
  */
 export function registerInterveneTools(server: McpServer, client: OrcaClient): void {
@@ -80,6 +82,26 @@ export function registerInterveneTools(server: McpServer, client: OrcaClient): v
         resolveGate(client, {
           gateId: input.gateId,
           resolution: input.resolution,
+          run: input.run,
+          taskId: input.taskId,
+        }),
+      ),
+  );
+
+  server.registerTool(
+    REPLY_MESSAGE_TOOL_NAME,
+    {
+      title: "Orca Reply Message",
+      description:
+        "pending の ask(質問メッセージ)に回答して asker のブロックを解く(Human-in-the-loop)。asker は `orchestration ask --to run:<親Run>` でブロックして回答を待っているので、reply すると ask が answer 付きで解ける(タイムアウト済みでも asker 側は ask --resume で受け続ける)。内部で check(--all)から対象メッセージを読み点検したうえで、`orca orchestration reply --id --body --json` を 1 回呼ぶだけ。body には ask の --options で出した選択肢の値(例: approve / reject)を書く。run は ask の宛先 Run(--to run:<id> の親 Run。orca_delegate_task が返した runId)で必須(reply は Run バインドスコープ。consumer_fenced 時だけ run-use で切り替えて 1 回再試行)。messageId が指定 Run の受信箱に無ければ何も変更せず ask_not_found で拒否、taskId を渡して asker の payload.taskId がその task と部分木に属さなければ何も変更せず ask_task_mismatch で拒否する(sub-run の worker からの ask は呼び出し元 Run の task-list に現れないので、その場合は taskId を外す)。点検は任意の誤操作防止で、厳密な Job 単位の認可ではない。",
+      inputSchema: replyMessageInputSchema,
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    },
+    async (input): Promise<CallToolResult> =>
+      resultOf(() =>
+        replyMessage(client, {
+          messageId: input.messageId,
+          body: input.body,
           run: input.run,
           taskId: input.taskId,
         }),

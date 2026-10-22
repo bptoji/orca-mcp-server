@@ -16,7 +16,12 @@ import {
   TASK_RESULT_TOOL_NAME,
   TASK_STATUS_TOOL_NAME,
 } from "../src/tools/job.js";
-import { CANCEL_TASK_TOOL_NAME, RESOLVE_GATE_TOOL_NAME, SEND_MESSAGE_TOOL_NAME } from "../src/tools/intervene.js";
+import {
+  CANCEL_TASK_TOOL_NAME,
+  REPLY_MESSAGE_TOOL_NAME,
+  RESOLVE_GATE_TOOL_NAME,
+  SEND_MESSAGE_TOOL_NAME,
+} from "../src/tools/intervene.js";
 import { READINESS_TOOL_NAME, evaluateReadiness } from "../src/tools/readiness.js";
 
 // SDK 内部の登録テーブルにアクセスするための薄い型(スモークテスト用)。
@@ -59,7 +64,7 @@ function createStubClient() {
 }
 
 describe("createServer", () => {
-  it("Job API 3 + 介入 3 + 観測 read-only 7 が登録されている", () => {
+  it("Job API 3 + 介入 4 + 観測 read-only 7 が登録されている", () => {
     const { stub } = createStubClient();
     const server = createServer(stub);
     expect(server).toBeInstanceOf(McpServer);
@@ -74,6 +79,7 @@ describe("createServer", () => {
         SEND_MESSAGE_TOOL_NAME,
         CANCEL_TASK_TOOL_NAME,
         RESOLVE_GATE_TOOL_NAME,
+        REPLY_MESSAGE_TOOL_NAME,
         STATUS_TOOL_NAME,
         READINESS_TOOL_NAME,
         LIST_WORKTREES_TOOL_NAME,
@@ -109,7 +115,7 @@ describe("createServer", () => {
     }
   });
 
-  it("変更系ツールの annotations: submit と cancel は destructive、send / resolve_gate は非破壊", () => {
+  it("変更系ツールの annotations: submit と cancel は destructive、send / resolve_gate / reply_message は非破壊", () => {
     const { stub } = createStubClient();
     const tools = (createServer(stub) as unknown as RegisteredToolsAccess)._registeredTools;
     const annotationsOf = (name: string) =>
@@ -127,6 +133,10 @@ describe("createServer", () => {
       destructiveHint: false,
     });
     expect(annotationsOf(RESOLVE_GATE_TOOL_NAME)).toMatchObject({
+      readOnlyHint: false,
+      destructiveHint: false,
+    });
+    expect(annotationsOf(REPLY_MESSAGE_TOOL_NAME)).toMatchObject({
       readOnlyHint: false,
       destructiveHint: false,
     });
