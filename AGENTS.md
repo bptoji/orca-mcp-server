@@ -44,7 +44,7 @@ src/
     message.ts      # orca_message         … send / check / reply / inbox(未登録の足場)
 tests/              # vitest。子プロセスを実際に起動しない(モック runner / 偽 client)
 scripts/
-  e2e.mjs           # 実ランタイム E2E(stdio でサーバーを起動し submit→poll→gate→result→cancel)
+  e2e.mjs           # 実ランタイム E2E(stdio でサーバーを起動し submit→poll→ask/reply→result→cancel + sweep cancel)
   dsh-tui-launcher.mjs    # dsh worker の既定: dsh-tui を起動して待つだけの最小 launcher
   copilot-launcher.mjs    # copilot worker 用: COPILOT_ALLOW_ALL=true を設定して copilot を起動する最小 launcher
   dsh-acp-worker.mjs      # Orca 注入 → ACP session/prompt に載せ直すブリッジ(ACP 機能が要る時)
@@ -264,6 +264,10 @@ docs/
 - **result の子集約は明示されたときだけ**: `orca_get_task_result` の既定は Commander だけ。
   `includeChildren: true` で子 10 件・worker-read 8 件まで(応答サイズと CLI 呼び出し数の抑制)。
   子行に `dispatch_id` があれば dispatch-show を足しにいかない。
+  **完了 task の `assignee_handle` は task 行から消える**(2026-10-22 E2E 実測: 完了 task 行は
+  `assignee_handle: null`)ので、result / cancelTask は handle が無いときだけ `dispatch-show` の
+  `assignee_handle`(完了後も残る)で補完する(`commanderHandlesWithDispatch`。無いと完走後の
+  result で sub-run の子が `[]` になる実測)。
 - `outcome` は `worker_done` 専用: 缺失は `outcome_required`、他種別への付与は `outcome_not_allowed`、
   `dispatchId` 欠けは `dispatch_id_required` で CLI へ叩き合う前に弾く(`--outcome` を client が渡さないと
   CLI 側で worker_done が通らない。CLI は dispatchId も要求する)。
@@ -297,7 +301,12 @@ docs/
   asker task の payload.taskId が呼び出し元 Run の task 部分木に属さない sub-run 由来の ask は taskId 点検の外側
   (呼び出し元 Run の task-list に現れない)なので、その場合は `taskId` を外して解決する。
   check の失敗は `warnings` に留めて poll を壊さない。ask の「まだ pending か」の確定は受信箱の unread(peek)
-  が根拠 — 回答済み・既読済みの行は peek に現れない(2026-10-22 実測、§10 の未確定事項)。
+  が根拠 — **ただし reply の後も ask 行はしばらく受信箱に残る**(2026-10-22 E2E 実測: 完了直後の
+  poll で `asks=1`、2 回目の reply も `duplicate: false` / `answer_message_id: null` で通った。
+  のちに peek / `--all` ともに行は消える)。そのため **asker task がすでに終端
+  (`completed` / `failed` / `cancelled`)の ask は `asks[]` と `kind: ask` から外し、
+  warnings に記録する**。呼び出し Run の task-list に現れない sub-run 由来の ask は
+  判定不能なので残す(回答待ちの可能性を捨てない)。
 - poll は worker の `projection.attention.requiresAction` を `attentionRequired` / `attentionNotes`
   (行には `attentionCategories`)として出す。ゲートが pending でないのに止まる典型はエージェント側の
   ツール承認プロンプト(E2E 実測)。Commander Prompt には「答えられない承認待ちで止めない / 親 Run は
@@ -361,7 +370,9 @@ orca CLI は **呼び出し元ターミナルを 1 つの Run にバインド**�
 - **`check` / `reply` も Run バインドスコープ**(2026-10-22 実測: 別 Run にバインドされた terminal から
   `check --run <run>` は `consumer_fenced`)。poll の ask 受信と `orca_reply_message` の点検・reply は
   runMutation 経由で対象 Run への再バインドを 1 回だけ許す(reply は `run` 必須 — 点検で読んだ受信箱の
-  Run と reply 先が一致しなければ誤返信になる)。点検は `--all` で読む(peek だと回答済み・既読済みが拾えない)。
+  Run と reply 先が一致しなければ誤返信になる)。点検は `--all` で読む(実測 2026-10-22: reply 直後も
+  回答済みの行はしばらく受信箱に残るので peek / `--all` の差は小さいが、存在点検としては
+  どちらでも通る。`--all` は旧記録に合わせた保守)。
 
 ### sub-run(Commander が別の Run を作ってしまう事故)の扱い
 
@@ -372,6 +383,8 @@ sub-run の worker を走りたままにした)。設計は `docs/design/sub-run
 
 - **照合キーは `coordinator_handle` だけ**。sub-run の `coordinator_handle` はその Run を作った terminal の
   handle なので、Commander の handle(タスクの `assignee_handle` + worker の `agentTerminalHandle`)と一致する。
+  **完了 task は `assignee_handle` が消える**(2026-10-22 E2E 実測)ので、handle が無いときは
+  dispatch-show の `assignee_handle` で補完する(`commanderHandlesWithDispatch` — §12・§13 参照)。
   `coordinator_handle` が `null` の Run は照合不能なので除外し、呼び出し元 Run 自身も除外する。
   対象タスクの `created_at` より **24 分以上前**の Run は除外(terminal 再利用で古い Run が同じ handle を
   持つリスク。task-list はローカル時刻、run-list は UTC なので厳密比較はしない)。照合は最大 `MAX_SUB_RUNS = 3`。

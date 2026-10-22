@@ -1381,6 +1381,39 @@ function commanderHandles(task: JsonObject, workers: JsonObject[]): string[] {
 }
 
 /**
+ * task 行の `assignee_handle` は**完了すると消える**(2026-10-22 E2E 実測: 完了 task の
+ * task-list 行は `assignee_handle: null`)。そのままだと result / cancel の sub-run 照合が
+ * handle 無しで空になり、完走後の sub-run 子タスクが拾えない(実測: result の
+ * `children: []` / `subRunsDiscovered: 0`)。task 行に handle が無いときだけ
+ * dispatch-show で補う(dispatch レコードの assignee_handle は完了後も残る)。
+ * 読めないときは空配列を返す(sub-run 照合の前提不足は各呼び出し側の warning / preflight が扱う)。
+ */
+async function commanderHandlesWithDispatch(
+  client: OrcaClient,
+  task: JsonObject,
+  taskId: string,
+  workers: JsonObject[] = [],
+): Promise<string[]> {
+  const handles = commanderHandles(task, workers);
+  if (handles.length > 0) {
+    return handles;
+  }
+  try {
+    const shown = unwrapResult(await client.dispatchShow(taskId));
+    const assignee = pickString(
+      isJsonObject(shown["dispatch"]) ? (shown["dispatch"] as JsonObject) : shown,
+      ["assignee_handle", "assigneeHandle"],
+    );
+    if (assignee !== undefined) {
+      return [assignee];
+    }
+  } catch {
+    // 読み失敗は黙って空配列。sub-run 照合の前提不足は呼び出し側の warning / preflight が扱う。
+  }
+  return [];
+}
+
+/**
  * gate 行を Job API 用の 1 行に正規化する(poll / sub-run 共通)。
  *
  * `runId` は**必須で載せる**。`gate-resolve` には `--run` が無く(Run スコープは
@@ -1880,6 +1913,33 @@ export async function getTaskStatus(client: OrcaClient, input: TaskStatusInput):
   // 失敗は warnings に留めて poll を壊さない。
   const asks = callerRunName !== null ? await collectPendingAsks(client, callerRunName, warnings) : [];
 
+  // asker task がすでに終端なら ask はもう答えを待っていない。実測(2026-10-22 E2E):
+  // reply の後も ask 行はしばらく peek に残る(完了 task 直後の poll で asks=1)ので、
+  // 終端 asker の行を外さないと poll ループが同じ ask に重ね返信する
+  // (実測: 2 回目の reply も duplicate: false / answer_message_id: null で通った)。
+  const taskStateById = new Map<string, JobState>();
+  for (const row of extractTasks(unwrapResult(list))) {
+    const id = pickString(row, ID_KEYS);
+    if (id !== undefined) {
+      taskStateById.set(id, mapTaskState(pickString(row, ["status", "state", "taskStatus"])));
+    }
+  }
+  const pendingAsks = asks.filter((ask) => {
+    const askTaskId = typeof ask["taskId"] === "string" ? ask["taskId"] : null;
+    if (askTaskId === null) {
+      return true;
+    }
+    const askerState = taskStateById.get(askTaskId);
+    if (askerState === undefined || !TERMINAL_STATES.includes(askerState)) {
+      return true;
+    }
+    const askMessageId = typeof ask["messageId"] === "string" ? ask["messageId"] : "(id 不明)";
+    warnings.push(
+      `ask ${askMessageId} の asker task ${askTaskId} はすでに ${askerState} なので asks から外しました(回答済みの可能性。同じ ask への重ね返信をしないでください)`,
+    );
+    return false;
+  });
+
   const commander =
     workers.length > 0
       ? {
@@ -1889,14 +1949,14 @@ export async function getTaskStatus(client: OrcaClient, input: TaskStatusInput):
         }
       : null;
 
-  const phase = estimatePhase(state, [...workers, ...childWorkers], gates, asks);
+  const phase = estimatePhase(state, [...workers, ...childWorkers], gates, pendingAsks);
   const blockedReasons = await collectBlockedReasons(
     client,
     {
       state,
       tasks: [task, ...childTasks],
       gates,
-      asks,
+      asks: pendingAsks,
       workers: [...workers, ...childWorkers],
       rootTaskId: input.taskId,
     },
@@ -1940,7 +2000,7 @@ export async function getTaskStatus(client: OrcaClient, input: TaskStatusInput):
     subRunOwnershipComplete: subCapture.ownershipComplete,
     subRunWorkerScanComplete: subCapture.workerScanComplete,
     gates,
-    asks,
+    asks: pendingAsks,
     blockedReasons,
     warnings,
     workerReportPending,
@@ -2196,7 +2256,7 @@ export async function cancelTask(client: OrcaClient, input: CancelTaskInput): Pr
   let subCapture: SubRunCapture = EMPTY_CAPTURE;
   const discoveryFailures: string[] = [];
   if (cascade && input.includeSubRuns !== false) {
-    const handles = commanderHandles(task, []);
+    const handles = await commanderHandlesWithDispatch(client, task, input.taskId);
     let callerWorkerRows: JsonObject[] = [];
     // review11 §4: 探索機能が無い / Run が特定できないときは「走れないので止まらない」ではなく
     // **安全側で断る**(worker 一覧を読めない状態で fullyStopped: true を返さない)。
@@ -2660,7 +2720,9 @@ export interface ReplyMessageInput {
 }
 
 export async function replyMessage(client: OrcaClient, input: ReplyMessageInput): Promise<JsonObject> {
-  // **変更前に**対象メッセージを点検する(--all: 既読に触れない。peek だと回答済み・既読済みが拾えない)。
+  // **変更前に**対象メッセージを点検する(--all で読む)。実測(2026-10-22 E2E): reply 直後も
+  // 回答済みの ask 行はしばらく受信箱に残る(後刻、peek / --all ともに消える)ので、
+  // 「存在するか」の点検はどちらでもできる。存在しなければ ask_not_found で変更前に拒否する。
   // check はバインドスコープなので runMutation 経由(fenced / run_required なら run-use で再バインドして 1 回再試行)。
   const listed = unwrapResult(
     await runMutation(client, input.run, () => client.check({ run: input.run, mode: "all" })),
@@ -2776,7 +2838,7 @@ export async function getTaskResult(client: OrcaClient, input: TaskResultInput):
     // task-list に無いので result からも消える(実測: 結果回収が壊れる)。拾って合算する。
     subCapture = await captureSubRuns(client, {
       callerRunId: runId,
-      handles: commanderHandles(task, []),
+      handles: await commanderHandlesWithDispatch(client, task, input.taskId),
       taskCreatedAt: task["created_at"] ?? task["createdAt"],
       enabled: input.includeSubRuns !== false,
     });

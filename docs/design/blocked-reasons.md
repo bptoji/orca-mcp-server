@@ -51,8 +51,13 @@
 - 回答は `orca_reply_message({ messageId, body, run })`。ask が見つからなければ `ask_not_found`、
   `taskId` 点検で親 Run の部分木に属さなければ `ask_task_mismatch`(変更前に拒否。sub-run 由来は
   `taskId` を外して解決する)。
-- ask の「まだ pending か」の確定は受信箱の unread(peek)が根拠 — 回答済み・既読済みの行は peek に
-  現れない(実測)。peek で `consumer_fenced` の意味(fenced-on-peek が caller teardown を示すのか)は未確定。
+- ask の「まだ pending か」の確定は受信箱の unread(peek)が根拠 — ただし reply の後も ask 行は
+  しばらく受信箱に残る(2026-10-22 E2E 実測: 完了直後の poll で `asks=1`、2 回目の reply も
+  `duplicate: false` / `answer_message_id: null` で通った。のちに peek / `--all` ともに行は消える)。
+  そのため **asker task がすでに終端(`completed` / `failed` / `cancelled`)の ask は `asks[]` と
+  `kind: ask` から外し、warnings に記録する**(重ね返信の防止。呼び出し Run の task-list に現れない
+  sub-run 由来の ask は判定不能なので残す)。peek で `consumer_fenced` の意味
+  (fenced-on-peek が caller teardown を示すのか)は未確定。
 
 ### phase
 
