@@ -242,6 +242,43 @@ export const resolveGateInputSchema = z.strictObject({
 });
 export type ResolveGateInputSchema = z.infer<typeof resolveGateInputSchema>;
 
+/**
+ * ask(質問メッセージ)への回答: Human-in-the-loop の ask 承認経路。
+ * asker は `orchestration ask --to run:<親Run>` でブロックして回答を待っているので、
+ * reply するとブロックが解け、`answer` として届く(実測: `timedOut: false` で返る)。
+ * タイムアウト済みの ask は asker 側が `ask --resume` で受け続ける。
+ */
+export const replyMessageInputSchema = z.strictObject({
+  messageId: z
+    .string()
+    .min(1)
+    .describe(
+      "返信先の ask のメッセージ ID(orca_get_task_status の asks[].messageId / blockedReasons[].detail.messageId)",
+    ),
+  body: z
+    .string()
+    .min(1)
+    .describe("回答の本文(ask の --options で出した選択肢の値を書く。例: approve / reject)"),
+  run: z
+    .string()
+    .min(1)
+    .describe(
+      "ask の宛先 Run の ID(--to run:<id> の親 Run。orca_delegate_task が返した runId)。" +
+        "reply は Run バインドスコープなので必須(consumer_fenced 時だけ run-use で切り替えて 1 回再試行)",
+    ),
+  taskId: z
+    .string()
+    .min(1)
+    .optional()
+    .describe(
+      "任意: この回答が自分の job の ask かを点検させる task ID(通常は orca_delegate_task の taskId)。" +
+        "ask の payload.taskId がこの task またはその部分木に属さない場合は ask_task_mismatch で拒否する(何も変更しない)。" +
+        "sub-run の worker からの ask は呼び出し元 Run の task-list に現れないので、その場合は taskId を外して解決する。" +
+        "指定なしは点検しない。これは誤操作防止の任意チェックで、厳密な Job 単位の認可ではない",
+    ),
+});
+export type ReplyMessageInputSchema = z.infer<typeof replyMessageInputSchema>;
+
 /** 委譲の前提チェック。commanderAgent を渡すとそのエージェント向けの準備まで見る。 */
 export const readinessInputSchema = z.strictObject({
   commanderAgent: z

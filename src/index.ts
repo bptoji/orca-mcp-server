@@ -31,7 +31,7 @@ export function createServer(client: OrcaClient = new OrcaClient()): McpServer {
   );
   // 主軸: 非同期 Job API(submit / poll / result)。1 呼び出しでワーカーを待たせない。
   registerJobTools(server, client);
-  // 介入: 明示的に頼まれたときだけ変更する 2 個(変更系コマンドはここに集約する)。
+  // 介入: 明示的に頼まれたときだけ変更する 4 個(変更系コマンドはここに集約する)。
   registerInterveneTools(server, client);
   // 観測用 read-only(デバッグ・状況確認用)。低レベルの作成系は登録しない。
   registerStatusTool(server, client);

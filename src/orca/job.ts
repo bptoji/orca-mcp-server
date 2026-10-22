@@ -311,7 +311,12 @@ export function toWorkerRow(worker: JsonObject): JsonObject {
  * state だけでは見えない「いま何をしているか」を worker / gate から推定する(テスト対象)。
  * 根拠が無いときは starting に寄せる(過大な主張をしない)。
  */
-export function estimatePhase(state: JobState, workers: JsonObject[], gates: JsonObject[]): JobPhase {
+export function estimatePhase(
+  state: JobState,
+  workers: JsonObject[],
+  gates: JsonObject[],
+  asks: JsonObject[] = [],
+): JobPhase {
   if (state === "queued") {
     return "queued";
   }
@@ -325,7 +330,9 @@ export function estimatePhase(state: JobState, workers: JsonObject[], gates: Jso
     const status = pickString(gate, ["status", "state"]);
     return status === undefined || status.toLowerCase() === "pending";
   });
-  if (pendingGates.length > 0) {
+  // pending の ask も人間の判断待ち(asker は回答までブロックしている)なので
+  // ゲートと同じ decision_gate に寄せる。pending 判定の根拠は受信箱の unread(peek)。
+  if (pendingGates.length > 0 || asks.length > 0) {
     return "decision_gate";
   }
   // ゲートが無い blocked は人間の判断待ちとは限らない(Commander の blocked 報告など)
@@ -345,11 +352,13 @@ export function estimatePhase(state: JobState, workers: JsonObject[], gates: Jso
   return "starting";
 }
 
-export type BlockedKind = "gate" | "task_report" | "agent_prompt" | "unknown";
+export type BlockedKind = "gate" | "ask" | "task_report" | "agent_prompt" | "unknown";
 
 const BLOCKED_HINTS: Record<BlockedKind, string> = {
   gate:
     "判断ゲートが pending。blockedReasons の question / options を確認し、承認/却下は orca_resolve_gate({ gateId, resolution, run }) — run には blockedReasons[].detail.runId(gates[].runId)を使う。sub-run 内のゲートは呼び出し元 Run と違う Run に属する",
+  ask:
+    "ask(質問メッセージ)が pending で asker が回答待ち。blockedReasons の detail.messageId / question / options を確認し、orca_reply_message({ messageId, body: <選択肢の値>, run }) で答える(run には orca_delegate_task の runId)。asker はタイムアウト後も --resume で待っているので、遅れて回答しても届く",
   task_report:
     "Commander / 子タスクが blocked を報告している。blockedReasons の内容を読み、orca_send_message で指示するか orca_cancel_task で止める",
   agent_prompt:
@@ -358,7 +367,7 @@ const BLOCKED_HINTS: Record<BlockedKind, string> = {
     "blocked の理由が特定できない。orca_get_task_result と terminal の出力を確認する",
 };
 
-const BLOCKED_KIND_ORDER: BlockedKind[] = ["gate", "task_report", "agent_prompt", "unknown"];
+const BLOCKED_KIND_ORDER: BlockedKind[] = ["gate", "ask", "task_report", "agent_prompt", "unknown"];
 const MAX_REASON_TEXT = 2000;
 const MAX_ATTENTION_READS = 2;
 const ATTENTION_READ_LINES = 30;
@@ -420,6 +429,100 @@ function isPendingGate(gate: JsonObject): boolean {
   return status === undefined || status.toLowerCase() === "pending";
 }
 
+/** check 応答からメッセージ配列を取り出す(テスト対象。実測のキーは result.messages[])。 */
+export function extractMessages(result: JsonObject): JsonObject[] {
+  const candidates = [result["messages"], result["items"], result["data"]];
+  for (const candidate of candidates) {
+    if (Array.isArray(candidate)) {
+      return candidate.filter(
+        (item): item is JsonObject => item !== null && typeof item === "object" && !Array.isArray(item),
+      );
+    }
+  }
+  return [];
+}
+
+/**
+ * ask(type: question)の正規化行(テスト対象)。
+ *
+ * 実測の受信箱行(2026-10-22): `messages[]` はフラットで、`thread_id` が ask の
+ * messageId(ask --resume はこの ID を使う)、`payload` は
+ * `{ taskId, dispatchId, question, options }` の JSON 文字列、
+ * `from_handle` に asker の dispatch(`dispatch:ctx_…`)が入る。
+ */
+export function toAskRow(message: JsonObject): JsonObject {
+  const row: JsonObject = {
+    messageId: pickString(message, ["thread_id", "threadId", "id"]) ?? null,
+    threadId: pickString(message, ["thread_id", "threadId"]) ?? null,
+    type: pickString(message, ["type"]) ?? null,
+    subject: pickString(message, ["subject"]) ?? null,
+    question: null,
+    options: null,
+    taskId: null,
+    dispatchId: null,
+    fromHandle: pickString(message, ["from_handle", "fromHandle"]) ?? null,
+    toHandle: pickString(message, ["to_handle", "toHandle"]) ?? null,
+    createdAt: pickString(message, ["created_at", "createdAt"]) ?? null,
+    deliveredAt: pickString(message, ["delivered_at", "deliveredAt"]) ?? null,
+  };
+  const rawPayload = message["payload"];
+  if (typeof rawPayload === "string" && rawPayload.length > 0) {
+    try {
+      const payload = JSON.parse(rawPayload);
+      if (isJsonObject(payload)) {
+        row["payload"] = payload;
+        row["question"] = pickString(payload, ["question"]) ?? null;
+        if (Array.isArray(payload["options"])) {
+          row["options"] = payload["options"];
+        }
+        row["taskId"] = pickString(payload, ["taskId", "task_id"]) ?? null;
+        row["dispatchId"] = pickString(payload, ["dispatchId", "dispatch_id"]) ?? null;
+      } else {
+        row["payload"] = rawPayload;
+      }
+    } catch {
+      row["payload"] = rawPayload;
+    }
+  } else if (isJsonObject(rawPayload)) {
+    row["payload"] = rawPayload;
+    row["question"] = pickString(rawPayload, ["question"]) ?? null;
+    if (Array.isArray(rawPayload["options"])) {
+      row["options"] = rawPayload["options"];
+    }
+    row["taskId"] = pickString(rawPayload, ["taskId", "task_id"]) ?? null;
+    row["dispatchId"] = pickString(rawPayload, ["dispatchId", "dispatch_id"]) ?? null;
+  }
+  return row;
+}
+
+/**
+ * 呼び出し Run の受信箱から pending の ask(type: question)を読む。
+ *
+ * check は **Run バインドスコープ**(実測: 別 Run にバインドされた terminal から
+ * `check --run <run>` は consumer_fenced)なので runMutation 経由で読む —
+ * fenced / run_required のときだけ run-use で呼び出し Run に再バインドして 1 回再試行する。
+ * peek なので既読に触れない。失敗は poll を壊さず warnings に留める。
+ */
+export async function collectPendingAsks(
+  client: OrcaClient,
+  runId: string,
+  warnings: string[],
+): Promise<JsonObject[]> {
+  try {
+    const payload = unwrapResult(
+      await runMutation(client, runId, () =>
+        client.check({ run: runId, mode: "peek", types: ["question"] }),
+      ),
+    );
+    return extractMessages(payload)
+      .filter((message) => pickString(message, ["type"]) === "question")
+      .map(toAskRow);
+  } catch (error) {
+    warnings.push(`ask の受信確認(check)に失敗: ${failureLine(error)}`);
+    return [];
+  }
+}
+
 /**
  * blocked の理由を kind 別に集める(読み取りのみ)。
  * gate / task_report は task-list と gate-list の内容だけで決まる。agent_prompt は worker-read を足す。
@@ -430,12 +533,31 @@ export async function collectBlockedReasons(
     state: JobState;
     tasks: JsonObject[];
     gates: JsonObject[];
+    /** 呼び出し Run の受信箱に届いた pending の ask(type: question)。 */
+    asks: JsonObject[];
     workers: JsonObject[];
     rootTaskId: string;
   },
   warnings: string[],
 ): Promise<JsonObject[]> {
   const reasons: JsonObject[] = [];
+
+  for (const ask of input.asks) {
+    reasons.push({
+      kind: "ask",
+      taskId: ask["taskId"] ?? null,
+      summary: ask["question"] ?? ask["subject"] ?? null,
+      // ask の回答手段は reply(メッセージ経路)。gate-list に ask は現れない(実測)。
+      detail: {
+        messageId: ask["messageId"] ?? null,
+        threadId: ask["threadId"] ?? null,
+        question: ask["question"] ?? null,
+        options: ask["options"] ?? null,
+        fromHandle: ask["fromHandle"] ?? null,
+        createdAt: ask["createdAt"] ?? null,
+      },
+    });
+  }
 
   for (const gate of input.gates.filter(isPendingGate)) {
     reasons.push({
@@ -461,13 +583,20 @@ export async function collectBlockedReasons(
   // 終端(completed / failed)や exited の worker に残った attention は拾わない。
   // Orca が requiresAction を立てない承認プロンプトもあるので、activity が waiting の worker も候補にし、
   // 出力末尾がプロンプトらしいときだけ採用する(flagged = Orca が attention を立てたもの)
+  // ask が pending の asker の worker は二重掲載しない(ask が一次情報。asker は回答までブロック中)。
+  const askTaskIds = new Set(
+    input.asks
+      .map((ask) => (typeof ask["taskId"] === "string" ? ask["taskId"] : undefined))
+      .filter((value): value is string => value !== undefined),
+  );
   const candidates = input.workers
     .filter(
       (worker) =>
         worker["status"] !== "completed" &&
         worker["status"] !== "failed" &&
         worker["liveness"] !== "exited" &&
-        (worker["requiresAttention"] === true || worker["activity"] === "waiting"),
+        (worker["requiresAttention"] === true || worker["activity"] === "waiting") &&
+        !askTaskIds.has(worker["taskId"] as string),
     )
     .sort((a, b) => Number(b["requiresAttention"] === true) - Number(a["requiresAttention"] === true));
   const gateFound = reasons.some((reason) => reason["kind"] === "gate");
@@ -1362,56 +1491,76 @@ Responsibilities:
 1. Inspect the repository and break the goal into well-scoped subtasks.
 2. Delegate independent work to supervised workers, preferably in parallel.
 3. Review worker outputs and diffs, request corrections, and run applicable tests.
-4. Do not merge, push, deploy, delete branches, or modify production resources without an explicit approval gate.
+4. Do not merge, push, deploy, delete branches, or modify production resources
+   without an explicit human approval (see "Human approval" below).
 5. Report completed work, tests, changed files, and unresolved risks.
 
-Gate ownership:
-You own every human-facing decision gate. Workers must not create gates for
-human approval — a worker that needs approval escalates to you, and you create
-the gate and resolve it when the human answers. Your own task has an active
-supervised Dispatch, and Orca refuses gate-create on it (task_not_startable).
-So create a dedicated approval child task inside {{runId}} with
---parent <your task id>, and run gate-create --task <that approval task id>.
-Do not target your own task. Create gates
-inside {{runId}} so the caller can observe and resolve them.
+Run ownership:
+The caller observes, approves, and cancels through exactly ONE Run: {{runId}}.
+Its coordinator seat stays with the caller for the whole job. Your terminal
+never holds it: never run "run-use --id {{runId}}", and never perform
+mutations against {{runId}} (task-create, worker-start, gate-create, send).
+Your terminal holds no seat there, so those mutations are refused with
+consumer_fenced — and taking the seat would block the caller.
 
-If gate-create fails: check the Run binding, retry it once safely, and if it
-still fails, stop the approval-requiring operation, report the exact error, and
-wait for correction or explicit intervention. Never proceed as if approval had
-been granted, and never substitute your own judgement for a missing gate.
+Your task id is in your dispatch preamble; confirm it with:
 
-Run ownership and sub-run policy:
-The caller polls, collects results and cancels through exactly ONE Run: {{runId}}.
-Your task lives inside it — its id is in your dispatch preamble, and you can
-confirm it with: orca orchestration task-list --run {{runId}} --json
+   orca orchestration task-list --run {{runId}} --json
 
-Reuse that Run for ordinary child tasks, supervised workers, and decision gates:
+Do all of your work inside your own child Run:
 
-  orca orchestration task-create --run {{runId}} --parent <your task id> --spec ...
-  orca orchestration worker-start --run {{runId}} --task <child task id> --agent <worker agent>
+1. Create it once, with the caller's job marker at the start of the objective:
 
-Before any run-scoped operation, verify the current binding and bind to the
-existing Run when appropriate:
+   orca orchestration run-create --objective "orca-mcp-parent: run={{runId}} task=<your task id> <short objective>" --json
 
-  orca orchestration run-use --id {{runId}} --json
+   The terminal that creates a Run becomes its coordinator seat; the seat of
+   your child Run is yours and stays with you.
 
-Do not create a new Run merely because the current terminal has no bound Run.
+2. Create every child task and start every worker inside that child Run
+   (parent ids from {{runId}} are not visible there — the child Run has its
+   own task tree, rooted in the tasks you create):
+
+   orca orchestration task-create --run <childRunId> --spec ...
+   orca orchestration worker-start --run <childRunId> --task <child task id> --agent <worker agent>
+
+3. Record the child Run id in your final report, and finish every task inside
+   it, so the caller's poll and cancel cover it.
+
 Never create a Run to bypass a nested worker depth limit, a circuit-broken
-dispatch, a failed dispatch, or a missing Run binding: the version-matched guide
-says a new Run does not reset depth and must not route around those boundaries.
+dispatch, a failed dispatch, or a missing Run binding: the version-matched
+guide says a new Run does not reset depth and must not route around those
+boundaries. Workers must not create Runs at all — they report and escalate
+instead.
 
-A worker acting as an autonomous coordinator may create and manage a child Run
-when the guide you loaded supports that shape. Treat legacy Run takeover
-(run-use --takeover-legacy) as a separate operation — it is not permission to
-create a new Run.
+A mutation that fails with "No Run is bound" or run_required means your own
+terminal lost its binding: re-bind once with "run-use --id <childRunId>" and
+retry once. A mutation that fails with consumer_fenced means someone else
+holds the seat — for your child Run that is the caller tearing the job down.
+Stop, report the exact error, and wait. Do not fight for the seat.
 
-When you create a child Run:
-1. Keep the parent Run id and parent task id unchanged.
-2. Record the new Run id.
-3. Put this marker at the start of the child Run objective so the caller can
-   associate it with this job:  orca-mcp-parent: run={{runId}} task=<your task id>
-4. Report the child Run id and its relationship to this job in your final report.
-5. Finish every task inside it, so the caller's poll and cancel cover it.
+Human approval — ask the caller:
+You own the human-facing decisions. Request approval with an ask. An ask is
+message-based, needs no seat, and blocks until the caller replies:
+
+  orca orchestration ask --to run:{{runId}} --question '<question>' --options approve,reject --timeout-ms <n> --json
+
+- An ask is only available while your supervised Dispatch is active.
+- Workers must not create gates, must not create Runs, and must not ask the
+  caller directly: a worker that needs approval escalates to you (message
+  level, into your child Run), and you decide and ask the caller.
+- Do not create gates for human approval, and do not create a gate on your
+  own task. gate-list does not show asks.
+- If the ask times out, keep waiting with the same message id:
+
+   orca orchestration ask --resume <messageId> --json
+
+  Do not re-ask the same question.
+- Never proceed without the answer, and never substitute your own judgement
+  for a missing answer.
+
+If ask fails (for example dispatch_inactive) or fails repeatedly, stop the
+approval-requiring operation, report the exact error, and wait for explicit
+intervention. Never proceed as if approval had been granted.
 
 Completion boundary:
 Before declaring success, verify that every delegated child task has reached a
@@ -1725,6 +1874,12 @@ export async function getTaskStatus(client: OrcaClient, input: TaskStatusInput):
 
   await enrichAgentNames(client, [...workers, ...childWorkers]);
 
+  const warnings: string[] = [...subCapture.warnings];
+
+  // 呼び出し Run の受信箱の pending ask(check はバインドスコープなので runMutation 経由)。
+  // 失敗は warnings に留めて poll を壊さない。
+  const asks = callerRunName !== null ? await collectPendingAsks(client, callerRunName, warnings) : [];
+
   const commander =
     workers.length > 0
       ? {
@@ -1734,12 +1889,17 @@ export async function getTaskStatus(client: OrcaClient, input: TaskStatusInput):
         }
       : null;
 
-  const phase = estimatePhase(state, [...workers, ...childWorkers], gates);
-
-  const warnings: string[] = [...subCapture.warnings];
+  const phase = estimatePhase(state, [...workers, ...childWorkers], gates, asks);
   const blockedReasons = await collectBlockedReasons(
     client,
-    { state, tasks: [task, ...childTasks], gates, workers: [...workers, ...childWorkers], rootTaskId: input.taskId },
+    {
+      state,
+      tasks: [task, ...childTasks],
+      gates,
+      asks,
+      workers: [...workers, ...childWorkers],
+      rootTaskId: input.taskId,
+    },
     warnings,
   );
   const blockedKind = primaryBlockedKind(blockedReasons);
@@ -1780,6 +1940,7 @@ export async function getTaskStatus(client: OrcaClient, input: TaskStatusInput):
     subRunOwnershipComplete: subCapture.ownershipComplete,
     subRunWorkerScanComplete: subCapture.workerScanComplete,
     gates,
+    asks,
     blockedReasons,
     warnings,
     workerReportPending,
@@ -2393,6 +2554,7 @@ export interface ResolveGateInput {
   taskId?: string;
 }
 
+
 export async function resolveGate(client: OrcaClient, input: ResolveGateInput): Promise<JsonObject> {
   const listed = unwrapResult(await client.gateList({ run: input.run }));
   const gates = extractGates(listed);
@@ -2475,6 +2637,82 @@ export async function resolveGate(client: OrcaClient, input: ResolveGateInput): 
     resolvedAt: gateRow["resolved_at"] ?? gateRow["resolvedAt"] ?? null,
     warnings: [],
     note: "gate-resolve を実行しました。Commander はこの結論を受けて進みます",
+  };
+}
+
+/**
+ * 介入: ask(質問メッセージ)に回答して asker のブロックを解く(Human-in-the-loop)。
+ *
+ * ask はメッセージ経路で gate-list に現れない(実測)ため、回答は `orchestration reply`
+ * で行う。reply は Run バインドスコープなので、consumer_fenced / run_required のときだけ
+ * runMutation が run-use で切り替えて 1 回再試行する。
+ * 点検は**変更前に**: 指定 Run の受信箱(--all で既読に触れない)から対象メッセージを読み、
+ * payload.taskId が指定 task またはその部分木に属することを確認する。
+ * sub-run の worker からの ask は呼び出し元 Run の task-list に現れないため、
+ * taskId 点検は Commander 自身の ask で使う(sub-run 由来なら taskId を外す)。
+ */
+export interface ReplyMessageInput {
+  messageId: string;
+  body: string;
+  /** ask の宛先 Run(--to run:<id> の親 Run)。reply はバインドスコープなので必須。 */
+  run: string;
+  taskId?: string;
+}
+
+export async function replyMessage(client: OrcaClient, input: ReplyMessageInput): Promise<JsonObject> {
+  // **変更前に**対象メッセージを点検する(--all: 既読に触れない。peek だと回答済み・既読済みが拾えない)。
+  // check はバインドスコープなので runMutation 経由(fenced / run_required なら run-use で再バインドして 1 回再試行)。
+  const listed = unwrapResult(
+    await runMutation(client, input.run, () => client.check({ run: input.run, mode: "all" })),
+  );
+  const messages = extractMessages(listed);
+  const message = messages.find(
+    (row) => pickString(row, ["thread_id", "threadId", "id"]) === input.messageId,
+  );
+  if (message === undefined) {
+    throw new JobError(
+      "ask_not_found",
+      `メッセージ ${input.messageId} が Run ${input.run} の受信箱に見つかりません。別 Run の ask を reply しようとしていないか(poll の asks[].messageId と run の組を確認)、または id が正しいかを確認してください。何も変更していません`,
+      { messageId: input.messageId, run: input.run, messageCount: messages.length },
+    );
+  }
+  const askRow = toAskRow(message);
+  const askTaskId = typeof askRow["taskId"] === "string" ? askRow["taskId"] : null;
+  if (input.taskId !== undefined) {
+    const related = new Set<string>([input.taskId]);
+    const tasksListed = await client.taskList({ run: input.run, brief: false });
+    for (const row of collectDescendants(tasksListed, input.taskId)) {
+      const id = pickString(row, ID_KEYS);
+      if (id !== undefined) {
+        related.add(id);
+      }
+    }
+    if (askTaskId === null || !related.has(askTaskId)) {
+      throw new JobError(
+        "ask_task_mismatch",
+        `ask ${input.messageId} の asker task は ${askTaskId ?? "無し"} で、指定した task ${input.taskId}(とその部分木)に属しません。何も変更していません。sub-run の worker からの ask は呼び出し元 Run の task 部分木に属さないので、その場合は taskId を外して解決してください`,
+        { messageId: input.messageId, askTaskId, requestedTaskId: input.taskId, run: input.run },
+      );
+    }
+  }
+
+  const replied = unwrapResult(
+    await runMutation(client, input.run, () => client.reply({ id: input.messageId, body: input.body })),
+  );
+  const replyRow = isJsonObject(replied["message"]) ? (replied["message"] as JsonObject) : replied;
+
+  return {
+    ok: true,
+    messageId: input.messageId,
+    threadId: pickString(message, ["thread_id", "threadId"]) ?? input.messageId,
+    answerMessageId: pickString(replyRow, ["answer_message_id", "answerMessageId"]) ?? null,
+    answerBody: pickString(replyRow, ["answer_body", "answerBody"]) ?? input.body,
+    duplicate: replyRow["duplicate"] === true,
+    taskId: askTaskId,
+    runId: input.run,
+    body: input.body,
+    warnings: [],
+    note: "reply を実行しました。asker の ask は回答を受け取りブロックが解けます(タイムアウト済みなら ask --resume で受け取れます)",
   };
 }
 
