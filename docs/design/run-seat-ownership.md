@@ -310,8 +310,8 @@ intervention. Never proceed as if approval had been granted.
       この削除後の観測と整合する。
 - [ ] 座を「離す」操作の存在(契約では使わないが、記録しておく)。
 - [ ] peek(受信箱読み取り)に対する `consumer_fenced` の意味 — fenced が caller
-      teardown を示すのか(読み取りは本来座と無関係 §3.2 のため、§12 の runMutation
-      経由は「呼び出し元自身の Run への再バインド」だけを許す方針で実装)。
+      teardown を示すのか(読み取りは本来座と無関係 §3.2 のため。§12 の runMutation 経由は
+      2026-10-31 に撤回し、poll は再バインドせず warnings に留める)。
 - [x] ask → reply までの MCP 経路 E2E(asker の `answer` 確認までの実機確認) → **§13**。
 
 ## 11. 測定痕跡(記録用)
@@ -342,10 +342,12 @@ intervention. Never proceed as if approval had been granted.
   dispatchId / fromHandle / toHandle / createdAt / deliveredAt`)。
 - pending 判定は `--peek` + `--types question` の **unread だけ**が根拠(§10 の確定)。
 - check は Run バインドスコープ(2026-10-22 実測: 別 Run にバインドされた terminal から
-  `check --run <run>` は `consumer_fenced`)なので、poll の ask 受信は runMutation 経由。
-  復旧の run-use は**呼び出し元自身の Run への再バインド**だけを許す(runMutation の
-  recovery はその引数の Run 名義でしか打たないため、sub-run 集約で他人の Run に奪われない)。
-  失敗は `warnings` に留めて poll を壊さない。
+  `check --run <run>` は `consumer_fenced`)。当初は poll の ask 受信を runMutation 経由にし、
+  復旧の run-use を「呼び出し元自身の Run への再バインド」と位置づけたが、runMutation は渡された Run が
+  呼び出し元のものかを確かめない。**2026-10-31 実測**: 他人の Run ID で poll しただけで run-use が走り、
+  その Run の `coordinator_handle` が呼び出し元ターミナルに書き換わった(`consumer_generation` 1 → 2、
+  元の担当は受信箱を失った)。是正後は poll の check は runMutation を通さず、`consumer_fenced` /
+  `run_required` は ask を読まずに `warnings` に残す。他の失敗も `warnings` に留めて poll を壊さない。
 - poll 応答には `asks[]`(正規化行)+ `kind: "ask"` の `blockedReasons` 両方を出す
   (§7.2 の「どちらか」は両方に確定)。pending asker の worker は `agent_prompt`
   から除外(二重掲載の排除)。

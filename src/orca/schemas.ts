@@ -83,6 +83,20 @@ export const delegateTaskInputSchema = z.strictObject({
     .describe(
       "起動する Commander Agent の id(既定 codex)。実際の作業ワーカーを選ぶのは Commander 側",
     ),
+  commanderModel: z
+    .string()
+    .min(1)
+    .optional()
+    .describe(
+      "Commander の provider model id(worker-start --model)。Orca が対応するのは claude / codex / cursor / antigravity / muse で、他のエージェントは自分の設定の model で起動する。省略時はエージェントの既定",
+    ),
+  commanderEffort: z
+    .string()
+    .min(1)
+    .optional()
+    .describe(
+      "Commander の推論レベル(worker-start --effort)。commanderModel と一緒に指定する(単独指定は effort_requires_model で拒否)",
+    ),
   constraints: z
     .array(z.string().min(1))
     .optional()
@@ -209,6 +223,26 @@ export const cancelTaskInputSchema = z.strictObject({
     ),
 });
 export type CancelTaskInputSchema = z.infer<typeof cancelTaskInputSchema>;
+
+/**
+ * 完了したジョブの後片付け: settled な worker の agent terminal を worker-release で閉じる。
+ * 走っている worker・ユーザーが worker-retain した worker・所有確認が取れない sub-run には触らない。
+ */
+export const releaseTaskInputSchema = z.strictObject({
+  taskId: z.string().min(1).describe("後片付けするジョブのタスク ID(通常は orca_delegate_task の taskId)"),
+  run: z.string().min(1).optional().describe("対象の orchestration Run ID"),
+  cascade: z
+    .boolean()
+    .default(true)
+    .describe("true(既定)は子孫タスクの worker も対象にする。false なら対象タスク(Commander)の worker だけ"),
+  includeSubRuns: z
+    .boolean()
+    .default(true)
+    .describe(
+      "true(既定)は Commander 自作の sub-run のうち所有確認が verified のものも対象にする(verified でない sub-run は skippedSubRuns に残して触らない)",
+    ),
+});
+export type ReleaseTaskInputSchema = z.infer<typeof releaseTaskInputSchema>;
 
 /**
  * Human-in-the-loop 用の介入: 判断ゲートを承認/却下して Commander を進める。

@@ -23,6 +23,7 @@ import {
   mapTaskState,
   mapWorkerStatus,
   parseParentMarker,
+  releaseTask,
   replyMessage,
   resolveGate,
   selectSubRunRoots,
@@ -224,6 +225,12 @@ function createFakeClient(options: {
   check?: JsonObject;
   checkThrows?: Error;
   workerRead?: JsonObject;
+  /** dispatchId → worker-show の result。指定したときだけ client に workerShow を生やす(既定は無し = agentWait 判定なし)。 */
+  workerShow?: Record<string, JsonObject>;
+  /** dispatchId → worker-release の result(既定 state: released)。 */
+  workerRelease?: Record<string, JsonObject>;
+  /** dispatchId → worker-release が投げる例外。 */
+  workerReleaseThrows?: Record<string, Error>;
   send?: JsonObject;
   taskUpdate?: JsonObject;
 } = {}) {
@@ -336,6 +343,29 @@ function createFakeClient(options: {
       calls.push(`runList:${JSON.stringify(input)}`);
       return options.runList ?? { ok: true, result: { runs: [] } };
     },
+    workerRelease: async (dispatch: string) => {
+      calls.push(`workerRelease:${dispatch}`);
+      const thrown = options.workerReleaseThrows?.[dispatch];
+      if (thrown !== undefined) {
+        throw thrown;
+      }
+      return {
+        ok: true,
+        result: options.workerRelease?.[dispatch] ?? { dispatchId: dispatch, state: "released", processAction: "closed_agent_terminal" },
+      };
+    },
+    ...(options.workerShow !== undefined
+      ? {
+          workerShow: async (dispatch: string) => {
+            calls.push(`workerShow:${dispatch}`);
+            const shown = options.workerShow?.[dispatch];
+            if (shown === undefined) {
+              throw new Error(`worker_not_found: ${dispatch}`);
+            }
+            return { ok: true, result: shown };
+          },
+        }
+      : {}),
   };
   return { client: client as unknown as OrcaClient, calls };
 }
@@ -513,6 +543,70 @@ describe("delegateTask(submit / Commander API)", () => {
     expect(warnings[0]).toContain("timeout");
     expect(warnings[0]).toContain("task-update");
     expect((result["nextAction"] as string)).toContain("worker-release");
+    expect(calls.filter((call) => call.startsWith("workerStart:")).length).toBe(1);
+  });
+
+  it("commanderModel / commanderEffort を worker-start --model / --effort に渡し、launch を返す", async () => {
+    const launch = {
+      requested: { agent: "claude", model: "claude-opus-5-5", effort: "high" },
+      effective: { agent: "claude", model: "claude-opus-5-5", effort: "high" },
+    };
+    const { client, calls } = createFakeClient({
+      workerStartReceipt: {
+        dispatch: { dispatchId: "disp_commander" },
+        worker: { state: "ready", startOptions: { launch } },
+      },
+    });
+    const result = await delegateTask(client, {
+      spec: "a",
+      commanderAgent: "claude",
+      commanderModel: "claude-opus-5-5",
+      commanderEffort: "high",
+    });
+    expect(result["state"]).toBe("running");
+    expect(result["launch"]).toEqual(launch);
+    const start = calls.find((call) => call.startsWith("workerStart:")) ?? "";
+    expect(start).toContain('"model":"claude-opus-5-5"');
+    expect(start).toContain('"effort":"high"');
+  });
+
+  it("model / effort 未指定なら worker-start に渡さず launch も載せない", async () => {
+    const { client, calls } = createFakeClient();
+    const result = await delegateTask(client, { spec: "a" });
+    expect(result["launch"]).toBeUndefined();
+    const start = calls.find((call) => call.startsWith("workerStart:")) ?? "";
+    expect(start).not.toContain('"model"');
+    expect(start).not.toContain('"effort"');
+  });
+
+  it("commanderEffort だけの指定は effort_requires_model で何も作らずに拒否する", async () => {
+    const { client, calls } = createFakeClient();
+    await expect(delegateTask(client, { spec: "a", commanderEffort: "high" })).rejects.toMatchObject({
+      code: "effort_requires_model",
+    });
+    expect(calls).toEqual([]);
+  });
+
+  it("worker-start receipt が outcome_unknown → 再委譲を促さず poll で確かめさせる(recovery を添える)", async () => {
+    // 1.4.245 の help: outcome_unknown も exit 1 + ok:true の receipt で返り、recovery / residualResources が載る
+    const recovery = [{ argv: ["orchestration", "request-show", "--request", "req_1"] }];
+    const { client, calls } = createFakeClient({
+      workerStartReceipt: {
+        dispatchId: "ctx_unknown",
+        state: "outcome_unknown",
+        stage: "agent_launch",
+        recovery,
+        residualResources: [],
+      },
+    });
+    const result = await delegateTask(client, { spec: "a" });
+    expect(result["state"]).toBe("queued");
+    expect(result["startOutcome"]).toBe("unknown");
+    expect(result["dispatchId"]).toBe("ctx_unknown");
+    expect(result["recovery"]).toEqual(recovery);
+    expect(result["residualResources"]).toEqual([]);
+    expect((result["warnings"] as string[])[0]).toContain("outcome_unknown");
+    expect(result["nextAction"] as string).toContain("delegate し直さない");
     expect(calls.filter((call) => call.startsWith("workerStart:")).length).toBe(1);
   });
 
@@ -806,7 +900,7 @@ describe("getTaskStatus(poll) — dsh 型 worker の task-update 報告待ち", 
           projection: {
             outcome: "in_progress",
             stage: { activity: "working" },
-            liveness: { verdict: "alive" },
+            liveness: { verdict: "live" },
             attention: { requiresAction: false, categories: [] },
           },
         },
@@ -1227,6 +1321,120 @@ describe("getTaskStatus(poll) — Commander の配下", () => {
       activity: null,
     });
     expect(calls.some((call) => call.startsWith("workerRead:") && call.includes('"source":"terminal"'))).toBe(true);
+  });
+
+  describe("worker-show の observation.agentWait(1.4.245)", () => {
+    const taskList = { ok: true, result: { tasks: [{ id: "task_cmd", status: "dispatched" }] } };
+    const dispatchShow = { ok: true, result: { dispatches: [{ dispatchId: "disp_1" }] } };
+
+    it("attention が立っていなくても agentWait があれば agent_prompt にし、Orca の根拠を detail に載せる", async () => {
+      // flagged でも waiting でもない worker = 従来の推定では候補にすらならない
+      const worker = { dispatchId: "disp_1", taskId: "task_cmd", workerState: "running", projection: {} };
+      const agentWait = { source: "hook", since: "2026-10-31T05:00:00Z" };
+      const { client, calls } = createFakeClient({
+        taskList,
+        dispatchShow,
+        workerList: { ok: true, result: { workers: [worker] } },
+        workerShow: { disp_1: { observation: { status: "live", exactWorker: true, agentWait } } },
+        workerRead: { ok: true, result: { text: "Running tests…", source: "terminal" } },
+      });
+      const view = await getTaskStatus(client, { taskId: "task_cmd" });
+      const reasons = view["blockedReasons"] as JsonObject[];
+      expect(reasons[0]?.["kind"]).toBe("agent_prompt");
+      expect(String(reasons[0]?.["summary"])).toContain("Orca 判定: hook");
+      expect((reasons[0]?.["detail"] as JsonObject)["agentWait"]).toEqual(agentWait);
+      expect(calls).toContain("workerShow:disp_1");
+    });
+
+    it("agentWait: null(Orca が見て待ち無し)なら、attention が立っていても agent_prompt にしない", async () => {
+      const worker = {
+        dispatchId: "disp_1",
+        taskId: "task_cmd",
+        workerState: "running",
+        projection: { attention: { requiresAction: true, categories: ["permission"] } },
+      };
+      const { client, calls } = createFakeClient({
+        taskList,
+        dispatchShow,
+        workerList: { ok: true, result: { workers: [worker] } },
+        workerShow: { disp_1: { observation: { status: "live", exactWorker: true, agentWait: null } } },
+        workerRead: { ok: true, result: { text: "Allow this command? (y/n)", source: "terminal" } },
+      });
+      const view = await getTaskStatus(client, { taskId: "task_cmd" });
+      expect(view["blockedReasons"]).toEqual([]);
+      expect(calls.some((call) => call.startsWith("workerRead:"))).toBe(false);
+    });
+
+    it("agentWait フィールドが無い(見ていない)なら従来の推定に任せる", async () => {
+      const worker = {
+        dispatchId: "disp_1",
+        taskId: "task_cmd",
+        workerState: "running",
+        projection: { attention: { requiresAction: true, categories: ["permission"] } },
+      };
+      const { client } = createFakeClient({
+        taskList,
+        dispatchShow,
+        workerList: { ok: true, result: { workers: [worker] } },
+        workerShow: { disp_1: { observation: { status: "missing", exactWorker: false } } },
+        workerRead: { ok: true, result: { text: "Allow this command? (y/n)", source: "terminal" } },
+      });
+      const view = await getTaskStatus(client, { taskId: "task_cmd" });
+      const reasons = view["blockedReasons"] as JsonObject[];
+      expect(reasons[0]?.["kind"]).toBe("agent_prompt");
+      expect((reasons[0]?.["detail"] as JsonObject)["agentWait"]).toBeUndefined();
+      expect((reasons[0]?.["detail"] as JsonObject)["looksLikePrompt"]).toBe(true);
+    });
+
+    it("worker-show の失敗は warning に留めて従来の推定に落とす", async () => {
+      const worker = {
+        dispatchId: "disp_1",
+        taskId: "task_cmd",
+        workerState: "running",
+        projection: { attention: { requiresAction: true, categories: ["permission"] } },
+      };
+      const { client } = createFakeClient({
+        taskList,
+        dispatchShow,
+        workerList: { ok: true, result: { workers: [worker] } },
+        workerShow: {},
+        workerRead: { ok: true, result: { text: "Allow this command? (y/n)", source: "terminal" } },
+      });
+      const view = await getTaskStatus(client, { taskId: "task_cmd" });
+      const reasons = view["blockedReasons"] as JsonObject[];
+      expect(reasons[0]?.["kind"]).toBe("agent_prompt");
+      expect(view["warnings"] as string[]).toContainEqual(expect.stringContaining("worker-show(agentWait)に失敗"));
+    });
+  });
+
+  it("terminal を持たない worker は worker-read を auto で読み直す(1.4.245)", async () => {
+    const worker = {
+      dispatchId: "disp_1",
+      taskId: "task_cmd",
+      workerState: "running",
+      projection: { attention: { requiresAction: true, categories: ["permission"] } },
+    };
+    const { client } = createFakeClient({
+      taskList: { ok: true, result: { tasks: [{ id: "task_cmd", status: "dispatched" }] } },
+      dispatchShow: { ok: true, result: { dispatches: [{ dispatchId: "disp_1" }] } },
+      workerList: { ok: true, result: { workers: [worker] } },
+    });
+    const sources: string[] = [];
+    client.workerRead = (async (input: JsonObject) => {
+      sources.push(String(input["source"]));
+      if (input["source"] === "terminal") {
+        throw new Error("terminal_unavailable: this worker has no terminal");
+      }
+      return { ok: true, result: { text: "Allow this command? (y/n)", source: "transcript" } };
+    }) as unknown as typeof client.workerRead;
+    const view = await getTaskStatus(client, { taskId: "task_cmd" });
+    const reasons = view["blockedReasons"] as JsonObject[];
+    expect(sources).toEqual(["terminal", "auto"]);
+    expect(reasons[0]?.["kind"]).toBe("agent_prompt");
+    expect((reasons[0]?.["detail"] as JsonObject)["looksLikePrompt"]).toBe(true);
+    expect((view["warnings"] as string[] | undefined) ?? []).not.toContainEqual(
+      expect.stringContaining("出力取得に失敗"),
+    );
   });
 });
 
@@ -3283,16 +3491,33 @@ describe("getTaskStatus(poll) — ask の受信と blockedReasons", () => {
     const { client } = createFakeClient({
       taskList: { ok: true, result: { tasks: [{ id: "task_3208dcf22c18", status: "dispatched" }] } },
       checkThrows: new OrcaCommandError(
-        {
-          code: "consumer_fenced",
-          message: "This coordinator terminal is bound to run_other, not run_a781f51d4c91.",
-        },
+        { code: "timeout", message: "orca orchestration check timed out" },
         { ok: false, args: ["orchestration", "check"], exitCode: 1, stdout: "", stderr: "" },
       ),
     });
     const view = await getTaskStatus(client, { taskId: "task_3208dcf22c18", run: "run_a781f51d4c91" });
     expect(view["asks"]).toEqual([]);
-    expect((view["warnings"] as string[]).join("|")).toContain("ask の受信確認");
+    expect((view["warnings"] as string[]).join("|")).toContain("ask の受信確認(check)に失敗");
+  });
+
+  // 2026-10-31 実測: 旧実装は check の consumer_fenced / run_required を runMutation で run-use 復旧し、
+  // 他人の Run を poll しただけで呼び出し元ターミナルがその Run の coordinator を奪った。
+  it.each([
+    ["consumer_fenced", "This coordinator terminal is bound to run_other, not run_a781f51d4c91."],
+    ["run_required", "No Run is bound. Use orchestration run-create or run-use first."],
+  ])("check が %s でも poll は run-use で担当を奪わず warnings に留める", async (code, message) => {
+    const { client, calls } = createFakeClient({
+      taskList: { ok: true, result: { tasks: [{ id: "task_3208dcf22c18", status: "dispatched" }] } },
+      checkThrows: new OrcaCommandError(
+        { code, message },
+        { ok: false, args: ["orchestration", "check"], exitCode: 1, stdout: "", stderr: "" },
+      ),
+    });
+    const view = await getTaskStatus(client, { taskId: "task_3208dcf22c18", run: "run_a781f51d4c91" });
+    expect(view["asks"]).toEqual([]);
+    expect(calls.some((call) => call.startsWith("runUse:"))).toBe(false);
+    expect(calls.filter((call) => call.startsWith("check:"))).toHaveLength(1);
+    expect((view["warnings"] as string[]).join("|")).toContain("Run run_a781f51d4c91 の担当ではない");
   });
 
   // 2026-10-22 E2E 実測: reply の後も ask 行はしばらく peek に残る(完了 task 直後の poll で
@@ -3548,5 +3773,246 @@ describe("commanderSpec — 座分離と ask 承認の固定文言", () => {
     expect(spec).toContain("Do not create gates for human approval");
     expect(spec).toContain("gate-list does not show asks");
     expect(spec).toContain("Never proceed without the answer");
+  });
+});
+
+describe("releaseTask(後片付け / worker-release)", () => {
+  const settledWorker = (dispatchId: string, taskId: string, extra: JsonObject = {}): JsonObject => ({
+    dispatchId,
+    taskId,
+    runId: "run_test",
+    workerState: "succeeded",
+    terminalState: "retained",
+    agentTerminalHandle: `term_${dispatchId}`,
+    resource: { retainedReason: null },
+    projection: { outcome: "succeeded" },
+    ...extra,
+  });
+  const jobTasks = (rootStatus = "completed"): JsonObject => ({
+    ok: true,
+    result: {
+      tasks: [
+        { id: "task_cmd", status: rootStatus, run_id: "run_test" },
+        { id: "task_c1", status: "completed", parent_id: "task_cmd", run_id: "run_test" },
+        { id: "task_c2", status: "failed", parent_id: "task_cmd", run_id: "run_test" },
+        { id: "task_other", status: "completed", run_id: "run_test" },
+      ],
+    },
+  });
+
+  it("走っているジョブは release_job_active で何も変更しない", async () => {
+    const { client, calls } = createFakeClient({ taskList: jobTasks("dispatched") });
+    await expect(releaseTask(client, { taskId: "task_cmd", run: "run_test" })).rejects.toMatchObject({
+      code: "release_job_active",
+    });
+    expect(calls.some((call) => call.startsWith("workerRelease:"))).toBe(false);
+  });
+
+  it("ジョブの settled worker だけを閉じ、解放済み・retain 済み・未 settle・他ジョブには触らない", async () => {
+    const { client, calls } = createFakeClient({
+      taskList: jobTasks(),
+      workerList: {
+        ok: true,
+        result: {
+          workers: [
+            settledWorker("d_cmd", "task_cmd"),
+            settledWorker("d_c1", "task_c1"),
+            settledWorker("d_c2", "task_c2", { workerState: "failed", projection: { outcome: "failed" } }),
+            settledWorker("d_old", "task_c1", { terminalState: "released" }),
+            settledWorker("d_keep", "task_c1", { resource: { retainedReason: "user_requested" } }),
+            settledWorker("d_live", "task_c2", { workerState: "running", terminalState: "active", projection: {} }),
+            settledWorker("d_other", "task_other"),
+          ],
+        },
+      },
+    });
+    const result = await releaseTask(client, { taskId: "task_cmd", run: "run_test" });
+    const released = calls.filter((call) => call.startsWith("workerRelease:")).sort();
+    expect(released).toEqual(["workerRelease:d_c1", "workerRelease:d_c2", "workerRelease:d_cmd"]);
+    expect(result["releasedCount"]).toBe(3);
+    expect((result["alreadyReleased"] as JsonObject[]).map((row) => row["dispatchId"])).toEqual(["d_old"]);
+    const skipped = result["skipped"] as JsonObject[];
+    expect(skipped).toContainEqual(expect.objectContaining({ dispatchId: "d_keep", reason: "user_retained" }));
+    // user_retained は fullyReleased を落とさないが、件数と warning で目立たせる
+    expect(result["retainedByUserCount"]).toBe(1);
+    expect((result["warnings"] as string[]).join("|")).toContain("ユーザーが引き取った");
+    expect(skipped).toContainEqual(expect.objectContaining({ dispatchId: "d_live", reason: "not_settled" }));
+    // 未 settle の worker が残っているので完全な後片付けとは言わない
+    expect(result["fullyReleased"]).toBe(false);
+  });
+
+  it("cascade: false なら Commander の worker だけを閉じる", async () => {
+    const { client, calls } = createFakeClient({
+      taskList: jobTasks(),
+      workerList: { ok: true, result: { workers: [settledWorker("d_cmd", "task_cmd"), settledWorker("d_c1", "task_c1")] } },
+    });
+    const result = await releaseTask(client, { taskId: "task_cmd", run: "run_test", cascade: false });
+    expect(calls.filter((call) => call.startsWith("workerRelease:"))).toEqual(["workerRelease:d_cmd"]);
+    expect(result["fullyReleased"]).toBe(true);
+  });
+
+  it("release_unknown は閉じ損ねとして数え fullyReleased: false", async () => {
+    const { client } = createFakeClient({
+      taskList: jobTasks(),
+      workerList: { ok: true, result: { workers: [settledWorker("d_cmd", "task_cmd")] } },
+      // 2026-10-31 実測の receipt(pane が消えた Commander の worker)
+      workerRelease: {
+        d_cmd: {
+          dispatchId: "d_cmd",
+          state: "release_unknown",
+          processAction: "none",
+          archive: null,
+          lastError: "The recorded terminal no longer resolves; whether its process is gone cannot be proven.",
+          recovery: "Inspect with: orca orchestration worker-show --dispatch d_cmd --json — then retry worker-release",
+        },
+      },
+    });
+    const result = await releaseTask(client, { taskId: "task_cmd", run: "run_test" });
+    expect((result["results"] as JsonObject[])[0]).toMatchObject({
+      outcome: "unconfirmed",
+      lastError: expect.stringContaining("no longer resolves"),
+      recovery: expect.stringContaining("worker-show"),
+    });
+    expect(result["failedCount"]).toBe(1);
+    expect(result["releasedCount"]).toBe(0);
+    expect(result["fullyReleased"]).toBe(false);
+    expect(result["warnings"] as string[]).toContainEqual(expect.stringContaining("release_unknown"));
+  });
+
+  // 2026-10-31 実測: 承認プロンプトに pane で答えた claude Commander は retainedReason: "user_takeover" になり、
+  // release は何も閉じずに fullyReleased: true を返した。pane が残ることは retainedByUserCount で伝える。
+  it("user_takeover だけのジョブは fullyReleased: true のまま retainedByUserCount で pane の残存を伝える", async () => {
+    const { client, calls } = createFakeClient({
+      taskList: jobTasks(),
+      workerList: {
+        ok: true,
+        result: { workers: [settledWorker("d_cmd", "task_cmd", { resource: { retainedReason: "user_takeover" } })] },
+      },
+    });
+    const result = await releaseTask(client, { taskId: "task_cmd", run: "run_test" });
+    expect(calls.some((call) => call.startsWith("workerRelease:"))).toBe(false);
+    expect(result).toMatchObject({ releasedCount: 0, retainedByUserCount: 1, fullyReleased: true });
+    expect((result["warnings"] as string[]).join("|")).toContain("pane で承認に答えただけでも");
+  });
+
+  // 2026-10-31 実測: codex が PATH に無く readiness で落ちた Commander は cmd だけの pane を残し、Orca は release を勧める。
+  it("readiness で落ちて queued のまま残ったタスクの failed worker は閉じる", async () => {
+    const { client, calls } = createFakeClient({
+      taskList: { ok: true, result: { tasks: [{ id: "task_cmd", status: "pending", run_id: "run_test" }] } },
+      workerList: {
+        ok: true,
+        result: {
+          workers: [
+            settledWorker("d_cmd", "task_cmd", {
+              workerState: "failed",
+              projection: { outcome: "failed", liveness: { verdict: "alive" } },
+            }),
+          ],
+        },
+      },
+      dispatchShow: { ok: true, result: { dispatch: { id: "d_cmd", status: "failed", launch_token_hash: "abc" } } },
+    });
+    const result = await releaseTask(client, { taskId: "task_cmd", run: "run_test" });
+    expect(result["state"]).toBe("queued");
+    expect(calls.filter((call) => call.startsWith("workerRelease:"))).toEqual(["workerRelease:d_cmd"]);
+    expect(result["fullyReleased"]).toBe(true);
+  });
+
+  // dsh 型: launch token 無しで dispatch だけ failed、pane は goal を完走して task-update で報告する(poll の workerReportPending)。
+  it("launch token 無しで生きている failed worker は report_pending で閉じない", async () => {
+    const { client, calls } = createFakeClient({
+      taskList: jobTasks("failed"),
+      workerList: {
+        ok: true,
+        result: {
+          workers: [
+            settledWorker("d_cmd", "task_cmd", {
+              workerState: "failed",
+              projection: { outcome: "failed", liveness: { verdict: "live" } },
+            }),
+          ],
+        },
+      },
+      dispatchShow: { ok: true, result: { dispatch: { id: "d_cmd", status: "failed" } } },
+    });
+    const result = await releaseTask(client, { taskId: "task_cmd", run: "run_test" });
+    expect(calls.some((call) => call.startsWith("workerRelease:"))).toBe(false);
+    expect(result["skipped"]).toContainEqual(expect.objectContaining({ dispatchId: "d_cmd", reason: "report_pending" }));
+    expect(result["fullyReleased"]).toBe(false);
+  });
+
+  // help: retained / release_pending も exit 0 だが閉じたとは限らない(cancel の stop_unknown 誤報と同じ型)。
+  it("release_pending と retained は閉じたと数えず、already_released は閉じたと数える", async () => {
+    const { client } = createFakeClient({
+      taskList: jobTasks(),
+      workerList: {
+        ok: true,
+        result: { workers: [settledWorker("d_cmd", "task_cmd"), settledWorker("d_c1", "task_c1"), settledWorker("d_c2", "task_c2")] },
+      },
+      workerRelease: {
+        d_cmd: { dispatchId: "d_cmd", state: "already_released", archive: { status: "ready" } },
+        d_c1: { dispatchId: "d_c1", state: "release_pending" },
+        d_c2: { dispatchId: "d_c2", state: "retained", processAction: "none" },
+      },
+    });
+    const result = await releaseTask(client, { taskId: "task_cmd", run: "run_test" });
+    expect(result).toMatchObject({ releasedCount: 1, pendingCount: 1, notClosedCount: 1, failedCount: 0, fullyReleased: false });
+    const outcomes = Object.fromEntries(
+      (result["results"] as JsonObject[]).map((row) => [row["dispatchId"], [row["outcome"], row["archiveStatus"]]]),
+    );
+    expect(outcomes).toEqual({ d_cmd: ["released", "ready"], d_c1: ["pending", null], d_c2: ["not_closed", null] });
+    const warnings = (result["warnings"] as string[]).join("|");
+    expect(warnings).toContain("release_pending");
+    expect(warnings).toContain("retained");
+  });
+
+  // 2026-10-31 実測: worker-release は Run バインドを要求しない(親 Run にバインドした terminal から sub-run の
+  // worker を release できた)。runMutation を通すと fenced 時の run-use で他の Run の担当を奪うので通さない。
+  it("worker-release が consumer_fenced でも run-use で担当を奪わず、閉じ損ねとして数える", async () => {
+    const { client, calls } = createFakeClient({
+      taskList: jobTasks(),
+      workerList: { ok: true, result: { workers: [settledWorker("d_cmd", "task_cmd")] } },
+      workerReleaseThrows: {
+        d_cmd: new OrcaCommandError(
+          { code: "consumer_fenced", message: "This coordinator terminal is bound to run_other, not run_test." },
+          { ok: false, args: ["orchestration", "worker-release"], exitCode: 1, stdout: "", stderr: "" },
+        ),
+      },
+    });
+    const result = await releaseTask(client, { taskId: "task_cmd", run: "run_test" });
+    expect(calls.some((call) => call.startsWith("runUse:"))).toBe(false);
+    expect(calls.filter((call) => call.startsWith("workerRelease:"))).toEqual(["workerRelease:d_cmd"]);
+    expect(result["releasedCount"]).toBe(0);
+    expect(result["fullyReleased"]).toBe(false);
+  });
+
+  it("対象が上限を超えると release_scope_too_large で何も閉じない", async () => {
+    const workers = Array.from({ length: 37 }, (_, index) => settledWorker(`d_${index}`, "task_c1"));
+    const { client, calls } = createFakeClient({
+      taskList: jobTasks(),
+      workerList: { ok: true, result: { workers } },
+    });
+    await expect(releaseTask(client, { taskId: "task_cmd", run: "run_test" })).rejects.toMatchObject({
+      code: "release_scope_too_large",
+    });
+    expect(calls.some((call) => call.startsWith("workerRelease:"))).toBe(false);
+  });
+
+  it("verified でない sub-run は閉じずに skippedSubRuns に残す", async () => {
+    const { client, calls } = createFakeClient({
+      taskList: jobTasks(),
+      workerList: { ok: true, result: { workers: [settledWorker("d_cmd", "task_cmd")] } },
+      runList: {
+        ok: true,
+        result: {
+          runs: [{ id: "run_sub", coordinator_handle: "term_d_cmd", created_at: new Date().toISOString() }],
+        },
+      },
+    });
+    const result = await releaseTask(client, { taskId: "task_cmd", run: "run_test" });
+    expect(result["subRunsDiscovered"]).toBe(1);
+    expect((result["skippedSubRuns"] as JsonObject[])[0]?.["runId"]).toBe("run_sub");
+    expect(calls.filter((call) => call.startsWith("workerRelease:"))).toEqual(["workerRelease:d_cmd"]);
+    expect(result["fullyReleased"]).toBe(false);
   });
 });

@@ -1,9 +1,10 @@
 import type { McpServer } from "@modelcontextprotocol/server";
 import type { CallToolResult } from "@modelcontextprotocol/server";
 import type { OrcaClient } from "../orca/client.js";
-import { cancelTask, replyMessage, resolveGate, sendMessage } from "../orca/job.js";
+import { cancelTask, releaseTask, replyMessage, resolveGate, sendMessage } from "../orca/job.js";
 import {
   cancelTaskInputSchema,
+  releaseTaskInputSchema,
   replyMessageInputSchema,
   resolveGateInputSchema,
   sendMessageInputSchema,
@@ -14,9 +15,10 @@ export const SEND_MESSAGE_TOOL_NAME = "orca_send_message";
 export const CANCEL_TASK_TOOL_NAME = "orca_cancel_task";
 export const RESOLVE_GATE_TOOL_NAME = "orca_resolve_gate";
 export const REPLY_MESSAGE_TOOL_NAME = "orca_reply_message";
+export const RELEASE_TASK_TOOL_NAME = "orca_release_task";
 
 /**
- * 介入(intervene)ツール: 委譲したジョブに対して明示的に頼まれたときだけ変更を加える 4 個。
+ * 介入(intervene)ツール: 委譲したジョブに対して明示的に頼まれたときだけ変更を加える 5 個。
  * poll / result / 観測ツールが変更系コマンドを呼ぶことはなく、ここだけに集約する。
  */
 export function registerInterveneTools(server: McpServer, client: OrcaClient): void {
@@ -62,6 +64,26 @@ export function registerInterveneTools(server: McpServer, client: OrcaClient): v
           run: input.run,
           reason: input.reason,
           mode: input.mode,
+          cascade: input.cascade,
+          includeSubRuns: input.includeSubRuns,
+        }),
+      ),
+  );
+
+  server.registerTool(
+    RELEASE_TASK_TOOL_NAME,
+    {
+      title: "Orca Release Task",
+      description:
+        "終わったジョブの後片付け: settled(succeeded / failed)な worker の agent terminal を `orca orchestration worker-release` で閉じる。完了しても worker の terminal は retained のまま残り続ける(実測)。対象タスクが終端(completed / failed / cancelled)でも queued(worker-start が readiness で落ちて進まないタスク)でもなければ release_job_active で何も変更しない(走っているジョブは orca_cancel_task で止めてから)。launch token 無しで dispatch だけ失敗し pane がまだ動いている worker は report_pending として skipped に残す(後から task-update で報告が届き得る)。既定 cascade: true で子孫タスクの worker も対象にし、includeSubRuns: true で Commander 自作の sub-run のうち所有確認が verified のものも対象にする(verified でない sub-run は skippedSubRuns に残して触らない)。settled でない worker(not_settled)とユーザーが worker-retain した / 引き取った worker(user_retained。pane で承認プロンプトに答えただけでも引き取り扱いになる)は skipped に残して触らない — fullyReleased は落とさず、件数を retainedByUserCount と warning で出す(pane は残る)。解放済みは alreadyReleased。対象が 36 件を超えると release_scope_too_large で何も変更しない。worker-release は閉じる前に出力を archive するので、orca_get_task_result の worker 出力は引き続き読める(すでに止まっていた worker は archive が取れないことがある)。worker-release は Run バインドを要求しないので run-use は呼ばず、どの Run の担当も動かさない。worktree・setup terminal・ユーザーが引き取った terminal は閉じない(CLI の保証)。閉じたと数えるのは receipt が released / already_released のものだけ(releasedCount)。release_pending は pendingCount、retained は notClosedCount、release_unknown などは failedCount に分け、閉じていない行には Orca の lastError / recovery を添える。pane がすでに消えた worker は release_unknown になる(プロセスが消えたと証明できないため。実測)。fullyReleased は全候補が閉じたと確定し、探索漏れ・skippedSubRuns・not_settled が 0 件のときだけ true。Commander の terminal を閉じると sub-run の所有確認(terminal list の来歴)が取れなくなるので、sub-run を含む後片付けは 1 回の呼び出しで済ませる。",
+      inputSchema: releaseTaskInputSchema,
+      annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
+    },
+    async (input): Promise<CallToolResult> =>
+      resultOf(() =>
+        releaseTask(client, {
+          taskId: input.taskId,
+          run: input.run,
           cascade: input.cascade,
           includeSubRuns: input.includeSubRuns,
         }),

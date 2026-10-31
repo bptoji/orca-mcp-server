@@ -105,19 +105,32 @@ export async function runMutation<T>(
     try {
       return await mutate();
     } catch (error) {
-      const needsBinding =
-        error instanceof OrcaCommandError &&
-        (error.code === "consumer_fenced" ||
-          error.code === "run_required" ||
-          error.message.includes("consumer_fenced") ||
-          error.message.includes("No Run is bound"));
-      if (!needsBinding || runId === undefined) {
+      if (!isBindingError(error) || runId === undefined) {
         throw error;
       }
       await client.runUse(runId);
       return await mutate();
     }
   });
+}
+
+/** 呼び出し元ターミナルが対象 Run の担当でない(consumer_fenced)/ どこにもバインドしていない(run_required)失敗か。 */
+export function isBindingError(error: unknown): boolean {
+  return (
+    error instanceof OrcaCommandError &&
+    (error.code === "consumer_fenced" ||
+      error.code === "run_required" ||
+      error.message.includes("consumer_fenced") ||
+      error.message.includes("No Run is bound"))
+  );
+}
+
+/**
+ * worker の liveness.verdict が「生きている」か。1.4.245 の実値は `live`(2026-10-31 実測: worker-read の
+ * projection.liveness = { verdict: "live", source: "agent_status" })。旧 fixture の `alive` も受ける。
+ */
+export function isLiveVerdict(verdict: unknown): boolean {
+  return verdict === "live" || verdict === "alive";
 }
 
 /** `consumer_fenced` のメッセージから、バインド中の Run ID を拾う(診断用)。 */
@@ -373,6 +386,70 @@ const MAX_ATTENTION_READS = 2;
 const ATTENTION_READ_LINES = 30;
 const ATTENTION_READ_CHARS = 1500;
 
+/**
+ * 承認プロンプト検出用に worker の出力末尾を読む。
+ * auto は transcript(構造化メッセージ)を返し、承認プロンプトの画面が含まれないので terminal を先に試す。
+ * 1.4.245 以降は terminal を持たない worker があり(help: "--source terminal is refused when there is none")、
+ * その場合は auto に落とす(transcript でも文言の推定はできる)。
+ */
+/** poll 1 回で worker-show に問い合わせる worker 数の上限(並列に読む)。 */
+const MAX_AGENT_WAIT_PROBES = 3;
+
+/**
+ * worker-show の `observation.agentWait` を読む(1.4.245)。Orca 本体の実装
+ * (`getTerminalInteractiveWait`)が返す形は 3 通り:
+ * `{ source: "hook", since }` / `{ source: "prompt-text", reason, since? }` / `{ source: "title" }`。
+ * 返り値の Map は dispatchId → 待ちの根拠(object)/ null(Orca が見て待ちは無い)。
+ * フィールドが無い・読めなかった・上限外の worker は Map に入れない(= 判定なし。待っていない証拠ではない)。
+ * agentWait は terminal から判定するので、terminal を持たない worker には付かない。
+ */
+async function probeAgentWaits(
+  client: OrcaClient,
+  workers: JsonObject[],
+  warnings: string[],
+): Promise<Map<string, JsonObject | null>> {
+  const waits = new Map<string, JsonObject | null>();
+  if (typeof client.workerShow !== "function") {
+    return waits;
+  }
+  const dispatchIds = workers
+    .map((worker) => worker["dispatchId"])
+    .filter((value): value is string => typeof value === "string")
+    .slice(0, MAX_AGENT_WAIT_PROBES);
+  await Promise.all(
+    dispatchIds.map(async (dispatchId) => {
+      try {
+        const shown = unwrapResult(await client.workerShow(dispatchId));
+        const observation = isJsonObject(shown["observation"]) ? (shown["observation"] as JsonObject) : undefined;
+        if (observation === undefined || !("agentWait" in observation)) {
+          return;
+        }
+        const wait = observation["agentWait"];
+        if (wait === null) {
+          waits.set(dispatchId, null);
+        } else if (isJsonObject(wait)) {
+          waits.set(dispatchId, wait);
+        }
+      } catch (error) {
+        warnings.push(`worker ${dispatchId} の worker-show(agentWait)に失敗: ${failureLine(error)}`);
+      }
+    }),
+  );
+  return waits;
+}
+
+async function readAttentionOutput(client: OrcaClient, dispatchId: string): Promise<JsonObject> {
+  try {
+    return await client.workerRead({ dispatch: dispatchId, source: "terminal", limit: ATTENTION_READ_LINES });
+  } catch (terminalError) {
+    try {
+      return await client.workerRead({ dispatch: dispatchId, source: "auto", limit: ATTENTION_READ_LINES });
+    } catch {
+      throw terminalError;
+    }
+  }
+}
+
 const APPROVAL_PROMPT_PATTERN =
   /do you want to proceed|requires approval|\(y\/n\)|\[y\/n\]|yes, and don.t ask again|allow (this|once)|❯\s*1\.\s*yes/i;
 
@@ -499,9 +576,11 @@ export function toAskRow(message: JsonObject): JsonObject {
  * 呼び出し Run の受信箱から pending の ask(type: question)を読む。
  *
  * check は **Run バインドスコープ**(実測: 別 Run にバインドされた terminal から
- * `check --run <run>` は consumer_fenced)なので runMutation 経由で読む —
- * fenced / run_required のときだけ run-use で呼び出し Run に再バインドして 1 回再試行する。
- * peek なので既読に触れない。失敗は poll を壊さず warnings に留める。
+ * `check --run <run>` は consumer_fenced)だが、poll は runMutation を通さず直接読む —
+ * run-use で再バインドすると、渡された Run の担当(coordinator)を呼び出し元ターミナルが奪う
+ * (2026-10-31 実測: 他人の Run を poll しただけで coordinator_handle が書き換わった)。
+ * fenced / run_required は「このターミナルはその Run の担当ではない」として warnings に留める。
+ * peek なので既読に触れない。他の失敗も poll を壊さず warnings に留める。
  */
 export async function collectPendingAsks(
   client: OrcaClient,
@@ -509,15 +588,18 @@ export async function collectPendingAsks(
   warnings: string[],
 ): Promise<JsonObject[]> {
   try {
-    const payload = unwrapResult(
-      await runMutation(client, runId, () =>
-        client.check({ run: runId, mode: "peek", types: ["question"] }),
-      ),
-    );
+    const payload = unwrapResult(await client.check({ run: runId, mode: "peek", types: ["question"] }));
     return extractMessages(payload)
       .filter((message) => pickString(message, ["type"]) === "question")
       .map(toAskRow);
   } catch (error) {
+    if (isBindingError(error)) {
+      warnings.push(
+        `ask の受信確認(check)をしていない: このターミナルは Run ${runId} の担当ではない(poll は run-use で担当を奪わない)。` +
+          `ask が届いていても見えないので、Run の担当ターミナルで orca orchestration check --run ${runId} を確認する: ${failureLine(error)}`,
+      );
+      return [];
+    }
     warnings.push(`ask の受信確認(check)に失敗: ${failureLine(error)}`);
     return [];
   }
@@ -589,30 +671,43 @@ export async function collectBlockedReasons(
       .map((ask) => (typeof ask["taskId"] === "string" ? ask["taskId"] : undefined))
       .filter((value): value is string => value !== undefined),
   );
-  const candidates = input.workers
-    .filter(
-      (worker) =>
-        worker["status"] !== "completed" &&
-        worker["status"] !== "failed" &&
-        worker["liveness"] !== "exited" &&
-        (worker["requiresAttention"] === true || worker["activity"] === "waiting") &&
-        !askTaskIds.has(worker["taskId"] as string),
-    )
-    .sort((a, b) => Number(b["requiresAttention"] === true) - Number(a["requiresAttention"] === true));
+  const live = input.workers.filter(
+    (worker) =>
+      worker["status"] !== "completed" &&
+      worker["status"] !== "failed" &&
+      worker["liveness"] !== "exited" &&
+      !askTaskIds.has(worker["taskId"] as string),
+  );
+  const isSuspect = (worker: JsonObject): boolean =>
+    worker["requiresAttention"] === true || worker["activity"] === "waiting";
+  // flagged → waiting → その他の順。agentWait は Orca 自身の判定なので、従来の候補(flagged / waiting)以外の
+  // 生存 worker にも問い合わせる(Orca が requiresAction を立てない承認プロンプトを拾うため)。
+  const ordered = [...live].sort(
+    (a, b) =>
+      Number(b["requiresAttention"] === true) - Number(a["requiresAttention"] === true) ||
+      Number(b["activity"] === "waiting") - Number(a["activity"] === "waiting"),
+  );
   const gateFound = reasons.some((reason) => reason["kind"] === "gate");
-  if (candidates.length > 0 && (input.state === "blocked" || !gateFound)) {
+  if (ordered.length > 0 && (input.state === "blocked" || !gateFound)) {
+    const waits = await probeAgentWaits(client, ordered, warnings);
     let reads = 0;
-    for (const worker of candidates) {
+    for (const worker of ordered) {
       const flagged = worker["requiresAttention"] === true;
       const dispatchId = typeof worker["dispatchId"] === "string" ? (worker["dispatchId"] as string) : undefined;
+      const wait = dispatchId === undefined ? undefined : waits.get(dispatchId);
+      // agentWait: null は「Orca が見て待ちは無かった」。文言推定より Orca の判定を優先して捨てる。
+      // フィールド無し(見ていない / 問い合わせ失敗 / 上限外)は従来の推定に任せる(待っていない証拠ではない)。
+      if (wait === null) {
+        continue;
+      }
+      if (wait === undefined && !isSuspect(worker)) {
+        continue;
+      }
       let output: string | null = null;
       if (dispatchId !== undefined && reads < MAX_ATTENTION_READS) {
         reads += 1;
         try {
-          // auto は transcript(構造化メッセージ)を返し、承認プロンプトの画面が含まれないので terminal を指定する
-          const read = unwrapResult(
-            await client.workerRead({ dispatch: dispatchId, source: "terminal", limit: ATTENTION_READ_LINES }),
-          );
+          const read = unwrapResult(await readAttentionOutput(client, dispatchId));
           const text = extractOutputText(read).text;
           output = text === null ? null : text.length <= ATTENTION_READ_CHARS ? text : text.slice(-ATTENTION_READ_CHARS);
         } catch (error) {
@@ -621,21 +716,29 @@ export async function collectBlockedReasons(
           );
         }
       }
-      if (!flagged && (output === null || !looksLikeApprovalPrompt(output))) {
+      if (wait === undefined && !flagged && (output === null || !looksLikeApprovalPrompt(output))) {
         continue;
+      }
+      const detail: JsonObject = {
+        dispatchId: dispatchId ?? null,
+        outputTail: output === null ? null : (extractApprovalPrompt(output) ?? output),
+        outputHash: output === null ? null : outputHashOf(output),
+        looksLikePrompt: output === null ? null : looksLikeApprovalPrompt(output),
+        observedAt: worker["observedAt"] ?? null,
+        activity: worker["activity"] ?? null,
+      };
+      if (wait !== undefined) {
+        // Orca の判定根拠(source: hook / prompt-text / title、reason / since)をそのまま添える
+        detail["agentWait"] = wait;
       }
       reasons.push({
         kind: "agent_prompt",
         taskId: worker["taskId"] ?? null,
-        summary: `worker ${dispatchId ?? "?"} が入力待ち: categories=${JSON.stringify(worker["attentionCategories"] ?? [])}, activity=${worker["activity"] ?? "unknown"}`,
-        detail: {
-          dispatchId: dispatchId ?? null,
-          outputTail: output === null ? null : (extractApprovalPrompt(output) ?? output),
-          outputHash: output === null ? null : outputHashOf(output),
-          looksLikePrompt: output === null ? null : looksLikeApprovalPrompt(output),
-          observedAt: worker["observedAt"] ?? null,
-          activity: worker["activity"] ?? null,
-        },
+        summary:
+          wait !== undefined
+            ? `worker ${dispatchId ?? "?"} が人間の入力待ち(Orca 判定: ${String(wait["source"] ?? "unknown")}${typeof wait["reason"] === "string" ? ` / ${wait["reason"]}` : ""})`
+            : `worker ${dispatchId ?? "?"} が入力待ち: categories=${JSON.stringify(worker["attentionCategories"] ?? [])}, activity=${worker["activity"] ?? "unknown"}`,
+        detail,
       });
     }
   }
@@ -1480,6 +1583,10 @@ export interface DelegateTaskInput {
   title?: string;
   /** 起動する Commander Agent。作業ワーカーを選ぶのは Commander 側なので、ここは Commander の選択。 */
   commanderAgent?: string;
+  /** Commander の provider model id(worker-start --model)。 */
+  commanderModel?: string;
+  /** Commander の推論レベル(worker-start --effort)。CLI 同様 model 無しは拒否する。 */
+  commanderEffort?: string;
   repo?: string;
   run?: string;
   deps?: string[];
@@ -1674,6 +1781,17 @@ function runIdOf(payload: JsonObject): string | undefined {
 }
 
 /** 失敗を 1 行の warning に落とす(CLI 側の code を優先して載せる)。 */
+/**
+ * worker-start receipt / worker-show の `startOptions.launch`(`{ requested, effective }`、
+ * 2026-10-31 worker-show 実測)を取り出す。receipt 直下に `launch` がある版にも対応する。
+ */
+function launchOf(result: JsonObject): JsonObject | undefined {
+  const worker = isJsonObject(result["worker"]) ? (result["worker"] as JsonObject) : result;
+  const startOptions = isJsonObject(worker["startOptions"]) ? (worker["startOptions"] as JsonObject) : undefined;
+  const launch = startOptions?.["launch"] ?? worker["launch"];
+  return isJsonObject(launch) ? launch : undefined;
+}
+
 function failureLine(error: unknown): string {
   if (error instanceof OrcaCommandError) {
     return `[${error.code}] ${error.message}`;
@@ -1695,6 +1813,15 @@ export async function delegateTask(
 ): Promise<JsonObject> {
   const warnings: string[] = [];
   const commanderAgent = input.commanderAgent ?? "codex";
+  // CLI は "--effort requires --model" で拒否する。Run / task を作ってから worker-start で落ちると
+  // queued のタスクが残るので、何も作る前に弾く。
+  if (input.commanderEffort !== undefined && input.commanderModel === undefined) {
+    throw new JobError(
+      "effort_requires_model",
+      "commanderEffort は commanderModel と一緒に指定してください(worker-start の --effort は --model が必要)",
+      { commanderEffort: input.commanderEffort },
+    );
+  }
 
   // 1) Run: 呼び出し側が指定しなければ新規に作成する(MCP 側はターミナルバインドを持たない)。
   let runId: string | undefined = input.run;
@@ -1729,9 +1856,10 @@ export async function delegateTask(
   }
 
   // 3) worker-start で Commander を起動する(新規 child worktree の supervised worker)。
-  //    新規 worktree は `--name` が必須(2026-10-15 実測: CLI が
-  //    `invalid_argument: New worktrees require --name.` で拒否する)。title を貰えない
-  //    委譲でも worktree が作れるよう、title 無しは spec と taskId から名前を作る。
+  //    `--name` は 1.4.245 で任意になった(help: "New worktrees without --name get the name Orca gives
+  //    an unnamed workspace … Servers older than this change still require --name.")。旧サーバーは
+  //    `invalid_argument: New worktrees require --name.` で拒否する(2026-10-15 実測)ので常に渡す。
+  //    title を貰えない委譲は spec と taskId から名前を作る(worktree 名を予測可能に保つ)。
   const worktreeName = input.title ?? buildWorktreeName(input.title, input.spec, taskId);
   try {
     const started = await runMutation(client, runId, () =>
@@ -1741,6 +1869,8 @@ export async function delegateTask(
         agent: commanderAgent,
         name: worktreeName,
         repo: input.repo,
+        model: input.commanderModel,
+        effort: input.commanderEffort,
         run: runId,
       }),
     );
@@ -1750,6 +1880,44 @@ export async function delegateTask(
     // この dispatch 経由の worker_done は使えない(実測: launch token が記録されない起動コマンド)。
     // タスクは生きているので queued + 正直な warning で返す(例外化して消さない)。
     const receiptState = pickString(startedResult, ["state"]);
+    // 1.4.245 の help: "Failed or outcome_unknown exits 1 and JSON includes stage/failedStage, setup,
+    // effects, residualResources, and recovery commands when needed." — 診断値はそのまま添える。
+    const receiptDiagnostics: JsonObject = {};
+    for (const key of ["residualResources", "recovery"]) {
+      if (startedResult[key] !== undefined && startedResult[key] !== null) {
+        receiptDiagnostics[key] = startedResult[key];
+      }
+    }
+    // model / effort を渡したときは、CLI が実際に使った値(startOptions.launch.effective)を返す。
+    // Orca が対応しないエージェントは自分の設定の model で起動するので requested と食い違い得る。
+    const launch = launchOf(startedResult);
+    if ((input.commanderModel !== undefined || input.commanderEffort !== undefined) && launch !== undefined) {
+      receiptDiagnostics["launch"] = launch;
+    }
+    if (receiptState === "outcome_unknown") {
+      // 起動したかどうかを CLI 自身が確定できていない。queued と同じ「delegate し直す」は
+      // Commander の二重起動になり得るので、poll で実体を確かめさせる。
+      const stage = pickString(startedResult, ["failedStage", "stage"]) ?? "unknown";
+      warnings.push(
+        `worker-start receipt state=outcome_unknown stage=${stage} — Commander が起動したかを CLI が確定できていません` +
+          `(dispatch ${dispatchId ?? "なし"})。再委譲は二重起動になり得るので、先に poll で dispatch / worker の有無を確認してください`,
+      );
+      return {
+        taskId,
+        state: "queued",
+        startOutcome: "unknown",
+        runId,
+        commander: true,
+        commanderAgent,
+        dispatchId,
+        target: { kind: "supervised_worker", worktree: "new-child", agent: commanderAgent },
+        ...receiptDiagnostics,
+        warnings,
+        nextAction:
+          `orca_get_task_status({ taskId: ${taskId}, run: ${runId} }) で dispatch / worker の有無を確認する。` +
+          `確認前に delegate し直さない`,
+      };
+    }
     if (receiptState === "failed") {
       const stage = pickString(startedResult, ["failedStage", "stage"]) ?? "unknown";
       const lastError = pickString(startedResult, ["lastError"]) ?? "unknown";
@@ -1767,6 +1935,7 @@ export async function delegateTask(
         commanderAgent,
         dispatchId,
         target: { kind: "supervised_worker", worktree: "new-child", agent: commanderAgent },
+        ...receiptDiagnostics,
         warnings,
         nextAction:
           `orca_get_task_status({ taskId: ${taskId}, run: ${runId} }) で確認。` +
@@ -1782,6 +1951,7 @@ export async function delegateTask(
       commanderAgent,
       dispatchId,
       target: { kind: "supervised_worker", worktree: "new-child", agent: commanderAgent },
+      ...receiptDiagnostics,
       warnings,
       nextAction: `poll with orca_get_task_status({ taskId: ${taskId}, run: ${runId} })`,
     };
@@ -1909,8 +2079,8 @@ export async function getTaskStatus(client: OrcaClient, input: TaskStatusInput):
 
   const warnings: string[] = [...subCapture.warnings];
 
-  // 呼び出し Run の受信箱の pending ask(check はバインドスコープなので runMutation 経由)。
-  // 失敗は warnings に留めて poll を壊さない。
+  // 呼び出し Run の受信箱の pending ask(check はバインドスコープだが run-use はしない —
+  // 担当でなければ warnings に留める)。失敗は warnings に留めて poll を壊さない。
   const asks = callerRunName !== null ? await collectPendingAsks(client, callerRunName, warnings) : [];
 
   // asker task がすでに終端なら ask はもう答えを待っていない。実測(2026-10-22 E2E):
@@ -1972,7 +2142,7 @@ export async function getTaskStatus(client: OrcaClient, input: TaskStatusInput):
       (pickString(dispatch, ["status", "state"]) ?? "") === "failed" &&
       pickString(dispatch, ["launch_token_hash", "launchTokenHash"]) === undefined,
   );
-  const liveWorker = workers.some((row) => row["liveness"] === "alive" || row["status"] === "running");
+  const liveWorker = workers.some((row) => isLiveVerdict(row["liveness"]) || row["status"] === "running");
   const workerReportPending = state === "failed" && tokenlessFailedDispatch && liveWorker;
 
   return {
@@ -2593,6 +2763,288 @@ async function residualLiveWorkers(
     }
   }
   return residual;
+}
+
+/** 介入: 完了したジョブの worker terminal を worker-release で閉じる(1.4.245)。 */
+export interface ReleaseTaskInput {
+  taskId: string;
+  run?: string;
+  /** 既定 true: 子孫タスクの worker も対象にする。 */
+  cascade?: boolean;
+  /** 既定 true: verified な sub-run の worker も対象にする。 */
+  includeSubRuns?: boolean;
+}
+
+/** 1 回の release で閉じる terminal 数の上限(cancel の 12 タスク × 3 dispatch に揃える)。 */
+const MAX_RELEASES = MAX_CASCADE_TASKS * MAX_FENCE_PER_TASK;
+
+/**
+ * worker-release の receipt の分類。help: "Only release_unknown exits 1; retained, release_pending, and
+ * already_released exit 0." — exit 0 でも閉じたとは限らないので、閉じたと数えるのは released / already_released だけ。
+ * - release_pending: 閉じている途中(まだ閉じ終わっていない)。
+ * - retained: 閉じなかった。help では terminal を持たない dispatch("has no owned terminal resource and is reported
+ *   retained")だが、引き取られた / 来歴が証明できない terminal も閉じない("Never closes … unproven identities")ので
+ *   「閉じる物が無かった」とは言い切れない。保守的に fullyReleased を落とす。
+ * - それ以外(release_unknown / 状態無し / 未知の値): 閉じたと確定していない。
+ */
+const CLOSED_RELEASE_STATES = new Set(["released", "already_released"]);
+
+type ReleaseOutcome = "released" | "pending" | "not_closed" | "unconfirmed";
+
+function classifyReleaseState(state: string | null): ReleaseOutcome {
+  if (state !== null && CLOSED_RELEASE_STATES.has(state)) {
+    return "released";
+  }
+  if (state === "release_pending") {
+    return "pending";
+  }
+  if (state === "retained") {
+    return "not_closed";
+  }
+  return "unconfirmed";
+}
+
+export async function releaseTask(client: OrcaClient, input: ReleaseTaskInput): Promise<JsonObject> {
+  const list = await client.taskList({ run: input.run, brief: false });
+  const task = findTaskById(list, input.taskId);
+  const rawStatus = pickString(task, ["status", "state", "taskStatus"]);
+  const state = mapTaskState(rawStatus);
+  const runId = pickString(task, ["run_id", "runId"]) ?? input.run ?? null;
+  const cascade = input.cascade ?? true;
+
+  // worker-release は settled な worker にしか効かないが、ジョブが走っている間に配下の terminal を
+  // 閉じると Commander が子の pane を読む・retain する判断を奪う。終わったジョブだけを片付ける。
+  // queued も片付けてよい: worker-start が readiness で落ちたタスクは queued のまま進まず、Orca 自身が
+  // 失敗した dispatch の release を勧める(2026-10-31 実測: codex が PATH に無く cmd だけの pane が残った。
+  // receipt の recovery は "This start created a terminal that never ran the Task. Close it with: … worker-release")。
+  // 走っている worker は下の not_settled / report_pending で 1 件ずつ守る。
+  if (!TERMINAL_STATES.includes(state) && state !== "queued") {
+    throw new JobError(
+      "release_job_active",
+      `タスク ${input.taskId} はまだ ${rawStatus ?? state} です。何も変更していません。完了を待つか、orca_cancel_task で止めてから後片付けしてください`,
+      { taskId: input.taskId, runId, state, rawStatus: rawStatus ?? null },
+    );
+  }
+
+  const warnings: string[] = [];
+  let discoveryComplete = true;
+  // Run ごとの対象タスク。sub-run → 呼び出し元 Run の順に閉じる(Commander の terminal は最後)。
+  const targetsByRun = new Map<string, Set<string>>();
+  const addTargets = (run: string, rows: JsonObject[]): void => {
+    const ids = targetsByRun.get(run) ?? new Set<string>();
+    for (const row of rows) {
+      const id = pickString(row, ID_KEYS);
+      if (id !== undefined) {
+        ids.add(id);
+      }
+    }
+    targetsByRun.set(run, ids);
+  };
+
+  let subCapture: SubRunCapture = EMPTY_CAPTURE;
+  if (cascade && input.includeSubRuns !== false) {
+    const handles = await commanderHandlesWithDispatch(client, task, input.taskId);
+    if (typeof runId === "string" && runId.length > 0 && typeof client.workerList === "function") {
+      try {
+        for (const row of (await scanWorkerRows(client, runId)).rows.map(toWorkerRow)) {
+          if (row["taskId"] === input.taskId && typeof row["terminalHandle"] === "string") {
+            handles.push(row["terminalHandle"] as string);
+          }
+        }
+      } catch (error) {
+        warnings.push(`sub-run 照合用の worker-list に失敗: ${failureLine(error)}`);
+      }
+    }
+    // 所有確認は terminal list の来歴を使う。Commander の terminal を閉じる前(= 変更前)に済ませる。
+    subCapture = await captureSubRuns(client, {
+      callerRunId: runId,
+      handles,
+      taskCreatedAt: task["created_at"] ?? task["createdAt"],
+      enabled: true,
+    });
+    warnings.push(...subCapture.warnings);
+    if (subCapture.scanFailed || !subCapture.scanComplete || subCapture.subRunsTruncated) {
+      discoveryComplete = false;
+    }
+  }
+  // 閉じるのは verified な sub-run だけ(cancel と同じ境界)。それ以外は報告して触らない。
+  const skippedSubRuns = subCapture.subRuns
+    .filter((row) => row["cancelEligible"] !== true)
+    .map((row) => ({
+      runId: row["runId"] ?? null,
+      ownership: row["ownership"] ?? null,
+      verificationReasons: row["verificationReasons"] ?? [],
+    }));
+  for (const subRun of subCapture.subRuns.filter((row) => row["cancelEligible"] === true)) {
+    const subRunId = subRun["runId"] as string;
+    addTargets(
+      subRunId,
+      subCapture.subtreeTasks.filter((row) => row["__runId"] === subRunId),
+    );
+  }
+  if (typeof runId === "string" && runId.length > 0) {
+    addTargets(runId, cascade ? collectDescendants(list, input.taskId) : [task]);
+  } else {
+    discoveryComplete = false;
+    warnings.push("呼び出し元 Run が特定できないため、worker-list を読めません");
+  }
+
+  // Phase 1: preflight — 対象 worker を読み切って分類し、上限超過は何も変更する前に断る。
+  const candidates: JsonObject[] = [];
+  const alreadyReleased: JsonObject[] = [];
+  const skipped: JsonObject[] = [];
+  const reportSuspects: JsonObject[] = [];
+  for (const [run, taskIds] of targetsByRun) {
+    let scan: PagedScan;
+    try {
+      scan = await scanWorkerRows(client, run);
+    } catch (error) {
+      discoveryComplete = false;
+      warnings.push(`Run ${run} の worker-list に失敗: ${failureLine(error)}`);
+      continue;
+    }
+    if (!scan.complete) {
+      discoveryComplete = false;
+      warnings.push(`Run ${run} の worker-list を ${scan.pages} ページで打ち切りました(${SCAN_STOP_TEXT[scan.stopReason]})`);
+    }
+    for (const raw of scan.rows) {
+      const row = toWorkerRow(raw);
+      const taskId = row["taskId"];
+      const dispatchId = row["dispatchId"];
+      if (typeof taskId !== "string" || !taskIds.has(taskId) || typeof dispatchId !== "string") {
+        continue;
+      }
+      const base = { dispatchId, taskId, runId: run, terminalState: row["terminalState"] ?? null };
+      const resource = isJsonObject(raw["resource"]) ? (raw["resource"] as JsonObject) : {};
+      const retainedReason = pickString(resource, ["retainedReason", "retained_reason"]);
+      if (row["terminalState"] === "released") {
+        alreadyReleased.push(base);
+      } else if (row["status"] !== "completed" && row["status"] !== "failed") {
+        // help: worker-release は settled(succeeded / failed)な worker の後片付け専用
+        skipped.push({ ...base, reason: "not_settled", status: row["status"] ?? null });
+      } else if (retainedReason !== undefined) {
+        // worker-retain はユーザーの明示的な例外。worker-release はそれを解除してしまうので触らない
+        skipped.push({ ...base, reason: "user_retained", retainedReason });
+      } else if (row["status"] === "failed" && isLiveVerdict(row["liveness"])) {
+        reportSuspects.push(base);
+      } else {
+        candidates.push(base);
+      }
+    }
+  }
+  // dsh 型(launch token 無しで dispatch だけ失敗)の worker は pane が goal を完走して task-update で
+  // 報告する(poll の workerReportPending と同じ判定)。dispatch は failed = settled なので worker-release は
+  // 閉じてしまう — 生きている failed worker は dispatch-show で token を確かめ、無ければ触らない。
+  const dispatchesByTask = new Map<string, JsonObject[] | null>();
+  for (const suspect of reportSuspects) {
+    const taskId = suspect["taskId"] as string;
+    if (!dispatchesByTask.has(taskId)) {
+      try {
+        dispatchesByTask.set(taskId, extractDispatches(await client.dispatchShow(taskId)));
+      } catch (error) {
+        dispatchesByTask.set(taskId, null);
+        warnings.push(`task ${taskId} の dispatch-show に失敗: ${failureLine(error)}`);
+      }
+    }
+    const dispatches = dispatchesByTask.get(taskId);
+    const dispatch = dispatches?.find((row) => pickString(row, DISPATCH_ID_KEYS) === suspect["dispatchId"]);
+    if (dispatch === undefined) {
+      skipped.push({ ...suspect, reason: "report_pending", detail: "生きている failed worker の launch token を確認できない" });
+    } else if (pickString(dispatch, ["launch_token_hash", "launchTokenHash"]) === undefined) {
+      skipped.push({ ...suspect, reason: "report_pending", detail: "launch token 無しで dispatch だけ失敗し pane は生存中(task-update で報告が届き得る)" });
+    } else {
+      candidates.push(suspect);
+    }
+  }
+  if (candidates.length > MAX_RELEASES) {
+    throw new JobError(
+      "release_scope_too_large",
+      `解放対象の worker が ${candidates.length} 件あり、上限 ${MAX_RELEASES} 件を超えます。何も変更していません。cascade: false で Commander だけ解放するか、子タスクごとに解放してください`,
+      { taskId: input.taskId, runId, candidateCount: candidates.length, maxReleases: MAX_RELEASES },
+    );
+  }
+
+  // Phase 2: mutation — worker-release は dispatch 単位で冪等(2 回目は already_released)。
+  // Run バインドを要求しないので runMutation を通さない(2026-10-31 実測: 親 Run にバインドした terminal から
+  // sub-run の worker を release して released、sub-run の coordinator_handle / consumer_generation は不変)。
+  // runMutation を通すと fenced 時の run-use で sub-run の担当を Commander から奪い、戻さない。
+  const results: JsonObject[] = [];
+  const counts: Record<ReleaseOutcome | "failed", number> = {
+    released: 0,
+    pending: 0,
+    not_closed: 0,
+    unconfirmed: 0,
+    failed: 0,
+  };
+  for (const candidate of candidates) {
+    const dispatchId = candidate["dispatchId"] as string;
+    try {
+      const receipt = unwrapResult(await client.workerRelease(dispatchId));
+      const resultState = pickString(receipt, ["state", "releaseState", "status"]) ?? null;
+      const outcome = classifyReleaseState(resultState);
+      counts[outcome] += 1;
+      const archive = isJsonObject(receipt["archive"]) ? receipt["archive"] : undefined;
+      results.push({
+        ...candidate,
+        state: resultState,
+        outcome,
+        processAction: pickString(receipt, ["processAction", "process_action"]) ?? null,
+        archiveStatus: archive !== undefined ? (pickString(archive, ["status"]) ?? null) : null,
+        // release_unknown の理由と次の手順(2026-10-31 実測: pane が消えた worker は
+        // "The recorded terminal no longer resolves; whether its process is gone cannot be proven.")。
+        ...(outcome === "released"
+          ? {}
+          : {
+              lastError: pickString(receipt, ["lastError", "last_error"]) ?? null,
+              recovery: pickString(receipt, ["recovery"]) ?? null,
+            }),
+      });
+      if (outcome === "pending") {
+        warnings.push(`dispatch ${dispatchId} の release はまだ閉じ終わっていません(release_pending)。後で worker-list の terminalState を確認する`);
+      } else if (outcome === "not_closed") {
+        warnings.push(`dispatch ${dispatchId} の terminal は閉じられませんでした(retained: 閉じる terminal が無い、または Orca が閉じてよいと証明できない)`);
+      } else if (outcome === "unconfirmed") {
+        warnings.push(`dispatch ${dispatchId} の release は terminal を閉じたと確定していません(result: ${resultState ?? "状態無し"})`);
+      }
+    } catch (error) {
+      counts.failed += 1;
+      results.push({ ...candidate, outcome: "failed", error: failureLine(error) });
+      warnings.push(`dispatch ${dispatchId} の release に失敗: ${failureLine(error)}`);
+    }
+  }
+
+  const notSettled = skipped.filter((row) => row["reason"] === "not_settled" || row["reason"] === "report_pending").length;
+  // user_retained は fullyReleased を落とさない(ユーザーの意図)が、pane は残るので件数と warning で目立たせる。
+  // 2026-10-31 実測: 承認プロンプトに pane で答えただけで retainedReason: "user_takeover" になり、閉じずに残った。
+  const retainedByUserCount = skipped.filter((row) => row["reason"] === "user_retained").length;
+  if (retainedByUserCount > 0) {
+    warnings.push(
+      `${retainedByUserCount} 件の worker はユーザーが引き取った / retain した terminal なので閉じていません(skipped の user_retained)。` +
+        "pane で承認に答えただけでも引き取り扱いになる。不要なら pane を手で閉じる",
+    );
+  }
+  return {
+    taskId: input.taskId,
+    runId,
+    state,
+    cascade,
+    releasedCount: counts.released,
+    pendingCount: counts.pending,
+    notClosedCount: counts.not_closed,
+    failedCount: counts.unconfirmed + counts.failed,
+    retainedByUserCount,
+    // 全候補が閉じたと確定し、探索漏れ・触らなかった sub-run・settled でない / 報告待ちの worker が無いときだけ true。
+    // user_retained はユーザーの意図なので数えない。
+    fullyReleased:
+      counts.released === candidates.length && discoveryComplete && skippedSubRuns.length === 0 && notSettled === 0,
+    results,
+    alreadyReleased,
+    skipped,
+    subRunsDiscovered: subCapture.subRuns.length,
+    skippedSubRuns,
+    warnings,
+    note: "worker-release は閉じる前に出力を archive するので、orca_get_task_result の worker 出力は引き続き読める(results[].archiveStatus が unavailable なら archive は取れていない)。worktree は削除しない",
+  };
 }
 
 /**
