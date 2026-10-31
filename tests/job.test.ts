@@ -516,6 +516,29 @@ describe("delegateTask(submit / Commander API)", () => {
     expect(calls.filter((call) => call.startsWith("workerStart:")).length).toBe(1);
   });
 
+  it("worker-start receipt が outcome_unknown → 再委譲を促さず poll で確かめさせる(recovery を添える)", async () => {
+    // 1.4.245 の help: outcome_unknown も exit 1 + ok:true の receipt で返り、recovery / residualResources が載る
+    const recovery = [{ argv: ["orchestration", "request-show", "--request", "req_1"] }];
+    const { client, calls } = createFakeClient({
+      workerStartReceipt: {
+        dispatchId: "ctx_unknown",
+        state: "outcome_unknown",
+        stage: "agent_launch",
+        recovery,
+        residualResources: [],
+      },
+    });
+    const result = await delegateTask(client, { spec: "a" });
+    expect(result["state"]).toBe("queued");
+    expect(result["startOutcome"]).toBe("unknown");
+    expect(result["dispatchId"]).toBe("ctx_unknown");
+    expect(result["recovery"]).toEqual(recovery);
+    expect(result["residualResources"]).toEqual([]);
+    expect((result["warnings"] as string[])[0]).toContain("outcome_unknown");
+    expect(result["nextAction"] as string).toContain("delegate し直さない");
+    expect(calls.filter((call) => call.startsWith("workerStart:")).length).toBe(1);
+  });
+
   it("worker-start が consumer_fenced なら run-use で切り替えて 1 回だけ再試行する", async () => {
     const { client, calls } = createFakeClient();
     let attempts = 0;
@@ -1227,6 +1250,36 @@ describe("getTaskStatus(poll) — Commander の配下", () => {
       activity: null,
     });
     expect(calls.some((call) => call.startsWith("workerRead:") && call.includes('"source":"terminal"'))).toBe(true);
+  });
+
+  it("terminal を持たない worker は worker-read を auto で読み直す(1.4.245)", async () => {
+    const worker = {
+      dispatchId: "disp_1",
+      taskId: "task_cmd",
+      workerState: "running",
+      projection: { attention: { requiresAction: true, categories: ["permission"] } },
+    };
+    const { client } = createFakeClient({
+      taskList: { ok: true, result: { tasks: [{ id: "task_cmd", status: "dispatched" }] } },
+      dispatchShow: { ok: true, result: { dispatches: [{ dispatchId: "disp_1" }] } },
+      workerList: { ok: true, result: { workers: [worker] } },
+    });
+    const sources: string[] = [];
+    client.workerRead = (async (input: JsonObject) => {
+      sources.push(String(input["source"]));
+      if (input["source"] === "terminal") {
+        throw new Error("terminal_unavailable: this worker has no terminal");
+      }
+      return { ok: true, result: { text: "Allow this command? (y/n)", source: "transcript" } };
+    }) as unknown as typeof client.workerRead;
+    const view = await getTaskStatus(client, { taskId: "task_cmd" });
+    const reasons = view["blockedReasons"] as JsonObject[];
+    expect(sources).toEqual(["terminal", "auto"]);
+    expect(reasons[0]?.["kind"]).toBe("agent_prompt");
+    expect((reasons[0]?.["detail"] as JsonObject)["looksLikePrompt"]).toBe(true);
+    expect((view["warnings"] as string[] | undefined) ?? []).not.toContainEqual(
+      expect.stringContaining("出力取得に失敗"),
+    );
   });
 });
 

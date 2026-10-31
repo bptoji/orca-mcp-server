@@ -211,13 +211,19 @@ docs/
 - **`repo` は repo セレクタ**(E2E 実機確認): `id:<repoId>` / `path:<repo home>` は解決できるが、
   worktree の displayName(`name:weever`)や worktree path は `repo_not_found`。repoId は
   `orca worktree current --json` の `result.worktree.repoId`。
-- **新しい worktree には `--name` が必須**(2026-10-15 実測)。`worker-start --worktree new-child` に
-  `--name` が無いと CLI は `invalid_argument: New worktrees require --name.` で拒否する(help の usage 行は
-  `--name` を optional に示すが、新規 worktree では必須。既存 worktree には逆に creation flags が拒否される)。
+- **新しい worktree には `--name` を常に渡す**。1.4.222 では必須だった(2026-10-15 実測:
+  `invalid_argument: New worktrees require --name.`)。1.4.245 の help で任意になった
+  ("New worktrees without --name get the name Orca gives an unnamed workspace … Servers older than this
+  change still require --name.")が、旧サーバー互換と worktree 名の予測可能性のために渡し続ける
+  (既存 worktree には逆に creation flags が拒否される)。
   `orca_delegate_task` は `title` をそのまま worktree 名に使い(E2E 実測: 日本語 title の worktree が作れる)、
   `title` を貰えない委譲では `buildWorktreeName` が spec と taskId から短い ASCII 名を作る
-  (32 字 + taskId 末尾 4 字の接尾なので、同じ goal を再委譲しても衝突しない)。`--name` を渡さない経路を
-  残すと **task-create まで成功したうえで worker-start が落ち、state: queued で止まる**(worktree が作れない)。
+  (32 字 + taskId 末尾 4 字の接尾なので、同じ goal を再委譲しても衝突しない)。
+- **worker-start の receipt は `failed` と `outcome_unknown` を分ける**(1.4.245 help: "The call exits 0 only
+  for ready. Failed or outcome_unknown exits 1 and JSON includes stage/failedStage, setup, effects,
+  residualResources, and recovery commands")。`failed` は `queued` + 起動設定の見直し、`outcome_unknown` は
+  `queued` + `startOutcome: "unknown"` で **再委譲を促さない**(Commander の二重起動になり得る)。
+  どちらも receipt の `recovery` / `residualResources` をそのまま応答に添える。
 - **`worker-start` だけ transport timeout を 180 秒**(`WORKER_START_TIMEOUT_MS`)。worktree 作成 +
   setup hook + エージェント起動 + 初ターン観測まで同期で走るため、既定 30 秒では SIGKILL される(実測)。
 - `queued`(worker-start 失敗)は放置しても進まない。`nextActionHint` が「delegate し直す / cancel する」を
@@ -575,9 +581,16 @@ sub-run の worker を走りたままにした)。設計は `docs/design/sub-run
   --from / --retry-request` のみ)。なので delegate 後に spec へ値を焼き込む書き直しはできない。
   `COMMANDER_PROMPT` へ注入できるのは `task-create` の前に決まる値(`{{runId}}`)だけ。
 - **`worker-start` には `--run` がある**(実測)。`gate-create` / `gate-resolve` には無い。
-  `--name` は usage 行では optional だが、**新しい worktree を作るには必須**(実測 1.4.222:
-  `invalid_argument: New worktrees require --name.`)。逆に既存 / current worktree には
+  `--name` は 1.4.222 では新しい worktree に必須、1.4.245 で任意(上記。互換のため常に渡す)。
+  逆に既存 / current worktree には
   creation flags(`--name` / `--repo` / `--base-branch` / `--display-name` / `--comment` / `--setup`)が拒否される。
+- **1.4.245 の差分(2026-10-31 help 実測)**: terminal を持たない worker がある("Not every worker has a
+  terminal … `--source terminal` is refused when there is none")ので、poll の承認プロンプト検出は
+  `worker-read --source terminal` が失敗したら `auto` で読み直す。`run-use` は "A worker cannot bind its own or
+  ancestor Run"(座分離契約を CLI 側も強制)。新コマンド `worker-release`(settled worker の terminal 片付け)/
+  `worker-retain` / `request-show`(`--retry-request` の到達確認)/ `reset`、`worker-start --model / --effort`、
+  `worker-show` の `observation.agentWait`、`worktree ps --agent-wait` は**未採用**(公開 API に載せる前に実測する)。
+  `coordinator-start` / `coordinator-stop` は retired(本実装は使っていない)。
   `run-list` は `--limit / --cursor`、`run-show` は `--id` を取る。`run-list` の `nextCursor` は
   base64 の keyset(`{createdAt,id}`)で、help 文の「line cursor」とは実体が違う。
 - **公開サイトの掲載は CLI バージョンに追いつかないことがある。** `worker-abandon` は実機 1.4.220 の

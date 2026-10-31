@@ -373,6 +373,24 @@ const MAX_ATTENTION_READS = 2;
 const ATTENTION_READ_LINES = 30;
 const ATTENTION_READ_CHARS = 1500;
 
+/**
+ * 承認プロンプト検出用に worker の出力末尾を読む。
+ * auto は transcript(構造化メッセージ)を返し、承認プロンプトの画面が含まれないので terminal を先に試す。
+ * 1.4.245 以降は terminal を持たない worker があり(help: "--source terminal is refused when there is none")、
+ * その場合は auto に落とす(transcript でも文言の推定はできる)。
+ */
+async function readAttentionOutput(client: OrcaClient, dispatchId: string): Promise<JsonObject> {
+  try {
+    return await client.workerRead({ dispatch: dispatchId, source: "terminal", limit: ATTENTION_READ_LINES });
+  } catch (terminalError) {
+    try {
+      return await client.workerRead({ dispatch: dispatchId, source: "auto", limit: ATTENTION_READ_LINES });
+    } catch {
+      throw terminalError;
+    }
+  }
+}
+
 const APPROVAL_PROMPT_PATTERN =
   /do you want to proceed|requires approval|\(y\/n\)|\[y\/n\]|yes, and don.t ask again|allow (this|once)|❯\s*1\.\s*yes/i;
 
@@ -609,10 +627,7 @@ export async function collectBlockedReasons(
       if (dispatchId !== undefined && reads < MAX_ATTENTION_READS) {
         reads += 1;
         try {
-          // auto は transcript(構造化メッセージ)を返し、承認プロンプトの画面が含まれないので terminal を指定する
-          const read = unwrapResult(
-            await client.workerRead({ dispatch: dispatchId, source: "terminal", limit: ATTENTION_READ_LINES }),
-          );
+          const read = unwrapResult(await readAttentionOutput(client, dispatchId));
           const text = extractOutputText(read).text;
           output = text === null ? null : text.length <= ATTENTION_READ_CHARS ? text : text.slice(-ATTENTION_READ_CHARS);
         } catch (error) {
@@ -1729,9 +1744,10 @@ export async function delegateTask(
   }
 
   // 3) worker-start で Commander を起動する(新規 child worktree の supervised worker)。
-  //    新規 worktree は `--name` が必須(2026-10-15 実測: CLI が
-  //    `invalid_argument: New worktrees require --name.` で拒否する)。title を貰えない
-  //    委譲でも worktree が作れるよう、title 無しは spec と taskId から名前を作る。
+  //    `--name` は 1.4.245 で任意になった(help: "New worktrees without --name get the name Orca gives
+  //    an unnamed workspace … Servers older than this change still require --name.")。旧サーバーは
+  //    `invalid_argument: New worktrees require --name.` で拒否する(2026-10-15 実測)ので常に渡す。
+  //    title を貰えない委譲は spec と taskId から名前を作る(worktree 名を予測可能に保つ)。
   const worktreeName = input.title ?? buildWorktreeName(input.title, input.spec, taskId);
   try {
     const started = await runMutation(client, runId, () =>
@@ -1750,6 +1766,38 @@ export async function delegateTask(
     // この dispatch 経由の worker_done は使えない(実測: launch token が記録されない起動コマンド)。
     // タスクは生きているので queued + 正直な warning で返す(例外化して消さない)。
     const receiptState = pickString(startedResult, ["state"]);
+    // 1.4.245 の help: "Failed or outcome_unknown exits 1 and JSON includes stage/failedStage, setup,
+    // effects, residualResources, and recovery commands when needed." — 診断値はそのまま添える。
+    const receiptDiagnostics: JsonObject = {};
+    for (const key of ["residualResources", "recovery"]) {
+      if (startedResult[key] !== undefined && startedResult[key] !== null) {
+        receiptDiagnostics[key] = startedResult[key];
+      }
+    }
+    if (receiptState === "outcome_unknown") {
+      // 起動したかどうかを CLI 自身が確定できていない。queued と同じ「delegate し直す」は
+      // Commander の二重起動になり得るので、poll で実体を確かめさせる。
+      const stage = pickString(startedResult, ["failedStage", "stage"]) ?? "unknown";
+      warnings.push(
+        `worker-start receipt state=outcome_unknown stage=${stage} — Commander が起動したかを CLI が確定できていません` +
+          `(dispatch ${dispatchId ?? "なし"})。再委譲は二重起動になり得るので、先に poll で dispatch / worker の有無を確認してください`,
+      );
+      return {
+        taskId,
+        state: "queued",
+        startOutcome: "unknown",
+        runId,
+        commander: true,
+        commanderAgent,
+        dispatchId,
+        target: { kind: "supervised_worker", worktree: "new-child", agent: commanderAgent },
+        ...receiptDiagnostics,
+        warnings,
+        nextAction:
+          `orca_get_task_status({ taskId: ${taskId}, run: ${runId} }) で dispatch / worker の有無を確認する。` +
+          `確認前に delegate し直さない`,
+      };
+    }
     if (receiptState === "failed") {
       const stage = pickString(startedResult, ["failedStage", "stage"]) ?? "unknown";
       const lastError = pickString(startedResult, ["lastError"]) ?? "unknown";
@@ -1767,6 +1815,7 @@ export async function delegateTask(
         commanderAgent,
         dispatchId,
         target: { kind: "supervised_worker", worktree: "new-child", agent: commanderAgent },
+        ...receiptDiagnostics,
         warnings,
         nextAction:
           `orca_get_task_status({ taskId: ${taskId}, run: ${runId} }) で確認。` +
