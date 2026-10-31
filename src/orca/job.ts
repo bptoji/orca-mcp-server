@@ -791,7 +791,8 @@ export function nextActionHint(
       return "call orca_get_task_result";
     case "failed":
     case "cancelled":
-      return "call orca_get_task_result for the failure detail";
+      // 終わった worker の terminal は retained のまま残る(readiness で落ちた起動の空 pane も)。
+      return "call orca_get_task_result for the failure detail。残った worker の pane は orca_release_task で閉じる(workerReportPending が true の間は報告待ちなので閉じない)";
     default:
       return "poll again with orca_get_task_status";
   }
@@ -1799,13 +1800,30 @@ function failureLine(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/** 対象タスクの状態を task-list から読む。読めない / 見つからない / 未知の値は undefined。 */
+async function readTaskState(
+  client: OrcaClient,
+  runId: string,
+  taskId: string,
+): Promise<{ state: JobState; rawStatus: string | null } | undefined> {
+  try {
+    const task = findTaskById(await client.taskList({ run: runId, brief: false }), taskId);
+    const rawStatus = pickString(task, ["status", "state", "taskStatus"]);
+    const state = mapTaskState(rawStatus);
+    return state === "unknown" ? undefined : { state, rawStatus: rawStatus ?? null };
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * submit: ゴールを Commander に渡す(この API の唯一の意味)。
  *
  * 手順は run-create(run 未指定時) → task-create(Commander 用の指示を付与) →
  * worker-start(supervised worker として Commander を起動)。
- * worker-start に失敗してもタスクは存在するので state: "queued" + warnings で返す
- * (例外にしてタスクを消さない)。完了は待たない。
+ * worker-start に失敗してもタスクは存在するので例外にせず warnings 付きで返す。起動前に落ちれば
+ * タスクは ready のまま(state: "queued")、readiness で落ちれば Orca がタスクを failed にする
+ * (startOutcome: "failed")。完了は待たない。
  */
 export async function delegateTask(
   client: OrcaClient,
@@ -1878,7 +1896,7 @@ export async function delegateTask(
     const dispatchId = pickIdDeep(startedResult, DISPATCH_ID_KEYS) ?? null;
     // worker-start は receipt を返す。agent_readiness を通過しないと state: "failed" になり、
     // この dispatch 経由の worker_done は使えない(実測: launch token が記録されない起動コマンド)。
-    // タスクは生きているので queued + 正直な warning で返す(例外化して消さない)。
+    // 例外化してタスク ID を失わせず、実際のタスク状態 + 正直な warning で返す(下の failed 分岐)。
     const receiptState = pickString(startedResult, ["state"]);
     // 1.4.245 の help: "Failed or outcome_unknown exits 1 and JSON includes stage/failedStage, setup,
     // effects, residualResources, and recovery commands when needed." — 診断値はそのまま添える。
@@ -1927,9 +1945,19 @@ export async function delegateTask(
           `この dispatch 経由の worker_done は使えないので、worker 側の報告は task-update に落ちます。` +
           `agentCmdOverrides を向いている場合は起動コマンドの launch token が記録されません(README 参照)`,
       );
+      // Orca は readiness で落ちたタスクを failed にする(2026-11-01 実測: codex が PATH に無い起動で
+      // receipt 直後の task-list が failed)。queued と返すと poll と食い違い「まだ始まっていない」に見えるので、
+      // 実際のタスク状態を読み直して返す。読めなければ実測どおり failed に寄せる。
+      const settled = await readTaskState(client, runId, taskId);
+      if (settled === undefined) {
+        warnings.push("readiness 失敗後のタスク状態を task-list で読み直せなかったので failed として返します");
+      }
+      const state = settled?.state ?? "failed";
       return {
         taskId,
-        state: "queued",
+        state,
+        rawStatus: settled?.rawStatus ?? null,
+        startOutcome: "failed",
         runId,
         commander: true,
         commanderAgent,
@@ -1938,9 +1966,10 @@ export async function delegateTask(
         ...receiptDiagnostics,
         warnings,
         nextAction:
-          `orca_get_task_status({ taskId: ${taskId}, run: ${runId} }) で確認。` +
-          `readiness 失敗を放置しない: worker-release して起動コマンド設定を直すか、` +
-          `報告経路を task-update にした worker として扱う`,
+          `orca_get_task_status({ taskId: ${taskId}, run: ${runId} }) で workerReportPending を確認する。` +
+          `true なら pane で作業が続いていて task-update の報告が後から届く(launch token を持たない dsh 型)ので閉じずに待つ。` +
+          `false なら pane はタスクを実行していないので orca_release_task({ taskId: ${taskId}, run: ${runId} }) で閉じ、` +
+          `起動設定(エージェントの PATH / agentCmdOverrides)を直して delegate し直す(worktree は release では消えない)`,
       };
     }
     return {
@@ -2814,9 +2843,10 @@ export async function releaseTask(client: OrcaClient, input: ReleaseTaskInput): 
 
   // worker-release は settled な worker にしか効かないが、ジョブが走っている間に配下の terminal を
   // 閉じると Commander が子の pane を読む・retain する判断を奪う。終わったジョブだけを片付ける。
-  // queued も片付けてよい: worker-start が readiness で落ちたタスクは queued のまま進まず、Orca 自身が
-  // 失敗した dispatch の release を勧める(2026-10-31 実測: codex が PATH に無く cmd だけの pane が残った。
-  // receipt の recovery は "This start created a terminal that never ran the Task. Close it with: … worker-release")。
+  // readiness で落ちた起動はタスクが failed になるので終端として通る(2026-11-01 実測: codex が PATH に無く
+  // cmd だけの pane が残り、receipt の recovery が "… Close it with: … worker-release"。release で閉じた)。
+  // queued も許すのは保険: 起動前に落ちたタスク(agent_unconfigured 等)は ready のままで worker も pane も無く
+  // 何も閉じない(同日実測)。pane が残ったまま queued になり得るのは worker-start の outcome_unknown だけ(未再現)。
   // 走っている worker は下の not_settled / report_pending で 1 件ずつ守る。
   if (!TERMINAL_STATES.includes(state) && state !== "queued") {
     throw new JobError(

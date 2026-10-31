@@ -345,9 +345,14 @@ worktree の displayName(`name:weever`)や worktree path は `repo_not_found` �
 [dsh の節](#dsh-を-commander--worker-に使う)の設定が必要です。
 
 **worker-start が失敗してもタスクは消えません** 
-- `state: "queued"` + `warnings` で返ります。
+- 起動前に失敗した場合(`agent_unconfigured` / `repo_not_found` など)は `state: "queued"` + `warnings` で返ります。
 `queued` は放置しても進みません(dispatch が無い = Commander 未起動)。`nextAction` が
 「delegate し直す / cancel する」を明示するので、どちらかを選んでください。
+- エージェントが readiness を通れなかった場合(PATH に無い、launch token が無いなど)、Orca はタスクを `failed` にします。
+応答は実際の状態(`state: "failed"` / `rawStatus`)+ `startOutcome: "failed"` です(2026-11-01 実測)。
+タスクを一度も実行していない pane が残るので、poll で `workerReportPending` を確認し、`false` なら
+`orca_release_task` で閉じてから起動設定を直して delegate し直してください(`true` は dsh 型で、pane が作業を続けて
+後から報告が届くので待つ)。放置しても害はありませんが pane と worktree が残ります(worktree は release でも消えません)。
 - `worker-start` は worktree 作成 + setup hook + エージェント起動 + 初ターン観測まで同期で走るため、
 このコマンドだけ transport 側の timeout を **180 秒**に広げています。
 
@@ -651,7 +656,7 @@ poll を打ち切る前に数回待ってください。**launcher 運用では�
 | 症状 | 原因 | 対処 |
 | --- | --- | --- |
 | `state: "queued"` から進まない | worker-start 失敗(dispatch が無く Commander 未起動) | `nextAction` の指示どおり delegate し直すか cancel する |
-| `state: "failed"` / `stage: "agent_readiness"` | pane に生きたプロセスが見えていない(dsh) | `agentCmdOverrides.dsh` を launcher に向ける。`workerReportPending: true` なら報告を待つ |
+| `state: "failed"` / `stage: "agent_readiness"` | エージェントが起動しない(PATH に無い等)/ pane に生きたプロセスが見えていない(dsh) | `workerReportPending: true` なら報告を待つ。false なら `orca_release_task` で空の pane を閉じ、起動設定(PATH / `agentCmdOverrides.dsh` を launcher に)を直して delegate し直す |
 | `lastError=Agent startup blocked: agent-trust-workspace` | copilot が **folder trust** の確認を求めて起動が止まっている | `agentCmdOverrides.copilot = node` + launcher(launcher が `COPILOT_ALLOW_ALL=true` を設定して起動する)。`--add-dir` / `--allow-all-paths` では消えない |
 | `nested_worker_depth_exceeded`(子 worker が起動しない) | Orca の **Nested worker depth** が既定 1。MCP が起動する Commander は既に depth 1 なので、その子は depth 2 で拒否される | Orca の Settings → Orchestration → "Nested worker depth" を 2 にする(既定 1 / 1 以上の整数)。`depth 2, max 1` がそのまま応答に出る |
 | `running` のまま progress が止まる | エージェントの**ツール承認プロンプト**で worker が停止 | `attentionNotes` をたどって pane を確認。codex は `--approve-for-me`、claude は `agentDefaultArgs.claude` の `--permission-mode acceptEdits --allowedTools Bash …` |

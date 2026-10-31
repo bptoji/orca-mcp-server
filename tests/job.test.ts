@@ -523,9 +523,9 @@ describe("delegateTask(submit / Commander API)", () => {
     expect(calls[1]).toMatch(/^taskCreate:/);
   });
 
-  it("worker-start receipt が agent_readiness で failed → queued + stage/lastError を正直に warning", async () => {
+  it("worker-start receipt が agent_readiness で failed → task-list の実際の状態(failed)+ stage/lastError を正直に warning", async () => {
     // 実測: agentCmdOverrides で起動した worker は launch token が記録されず readiness を通れない。
-    // receipt は ok:true / state:failed で返るので、transport 失敗ではなく queued + warning に落とす。
+    // receipt は ok:true / state:failed で返り、Orca はタスクを failed にする(2026-11-01 実測)。
     const { client, calls } = createFakeClient({
       workerStartReceipt: {
         dispatchId: "ctx_readiness_failed",
@@ -534,16 +534,43 @@ describe("delegateTask(submit / Commander API)", () => {
         failedStage: "agent_readiness",
         lastError: "timeout",
       },
+      taskList: { ok: true, result: { tasks: [{ id: "task_abc123", status: "failed" }] } },
     });
     const result = await delegateTask(client, { spec: "a", commanderAgent: "dsh" });
-    expect(result["state"]).toBe("queued");
+    expect(result["state"]).toBe("failed");
+    expect(result["rawStatus"]).toBe("failed");
+    expect(result["startOutcome"]).toBe("failed");
     expect(result["dispatchId"]).toBe("ctx_readiness_failed");
     const warnings = result["warnings"] as string[];
+    expect(warnings).toHaveLength(1);
     expect(warnings[0]).toContain("agent_readiness");
     expect(warnings[0]).toContain("timeout");
     expect(warnings[0]).toContain("task-update");
-    expect((result["nextAction"] as string)).toContain("worker-release");
+    const nextAction = result["nextAction"] as string;
+    expect(nextAction).toContain("workerReportPending");
+    expect(nextAction).toContain("orca_release_task");
     expect(calls.filter((call) => call.startsWith("workerStart:")).length).toBe(1);
+  });
+
+  it("readiness 失敗後に task-list が読めなければ failed に寄せて warning を足す", async () => {
+    const { client } = createFakeClient({
+      workerStartReceipt: { dispatchId: "ctx_readiness_failed", state: "failed", stage: "agent_readiness" },
+    });
+    const result = await delegateTask(client, { spec: "a" });
+    expect(result["state"]).toBe("failed");
+    expect(result["rawStatus"]).toBeNull();
+    expect((result["warnings"] as string[]).some((w) => w.includes("読み直せなかった"))).toBe(true);
+  });
+
+  it("readiness 失敗でもタスクが ready のままなら queued を返す", async () => {
+    const { client } = createFakeClient({
+      workerStartReceipt: { dispatchId: "ctx_readiness_failed", state: "failed", stage: "agent_readiness" },
+      taskList: { ok: true, result: { tasks: [{ id: "task_abc123", status: "ready" }] } },
+    });
+    const result = await delegateTask(client, { spec: "a" });
+    expect(result["state"]).toBe("queued");
+    expect(result["rawStatus"]).toBe("ready");
+    expect(result["startOutcome"]).toBe("failed");
   });
 
   it("commanderModel / commanderEffort を worker-start --model / --effort に渡し、launch を返す", async () => {
