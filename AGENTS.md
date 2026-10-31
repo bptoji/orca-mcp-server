@@ -227,12 +227,18 @@ docs/
   (32 字 + taskId 末尾 4 字の接尾なので、同じ goal を再委譲しても衝突しない)。
 - **worker-start の receipt は `failed` と `outcome_unknown` を分ける**(1.4.245 help: "The call exits 0 only
   for ready. Failed or outcome_unknown exits 1 and JSON includes stage/failedStage, setup, effects,
-  residualResources, and recovery commands")。`failed` は `queued` + 起動設定の見直し、`outcome_unknown` は
+  residualResources, and recovery commands")。`failed` は `startOutcome: "failed"` + 起動設定の見直し、`outcome_unknown` は
   `queued` + `startOutcome: "unknown"` で **再委譲を促さない**(Commander の二重起動になり得る)。
   どちらも receipt の `recovery` / `residualResources` をそのまま応答に添える。
+- **readiness で落ちたタスクは Orca 側で `failed` になる**(2026-11-01 実測: codex が PATH に無い起動で receipt 直後の
+  task-list が `failed`)。なので `failed` receipt のあとは task-list を読み直し、実際の状態(読めなければ `failed`)と
+  `rawStatus` を返す(以前は `queued` と返して poll と食い違い、「まだ始まっていない」に見えた)。
+  pane はタスクを一度も実行していない空のシェルとして `reclaimable` で残るので、`nextAction` は
+  「poll で `workerReportPending` を確認 → true なら報告待ち(dsh 型)で閉じない / false なら `orca_release_task` で閉じて
+  起動設定を直し delegate し直す(worktree は release で消えない)」と案内する。放置しても進まず害も無いが pane は溜まる。
 - **`worker-start` だけ transport timeout を 180 秒**(`WORKER_START_TIMEOUT_MS`)。worktree 作成 +
   setup hook + エージェント起動 + 初ターン観測まで同期で走るため、既定 30 秒では SIGKILL される(実測)。
-- `queued`(worker-start 失敗)は放置しても進まない。`nextActionHint` が「delegate し直す / cancel する」を
+- `queued`(worker-start が起動前に失敗。`agent_unconfigured` / `repo_not_found` など。タスクは `ready` のまま)は放置しても進まない。`nextActionHint` が「delegate し直す / cancel する」を
   明示する(worker / dispatch が 0 件のとき)。
 
 ### 非同期の決まり
@@ -241,7 +247,8 @@ docs/
   `{ taskId, state: "running" }` を返して終わる。30 分ブロックする同期委譲は作らない。
 - 完了の監視は呼び出し側の poll。poll は常に短時間で返す(タイムアウトは子プロセス側のみ)。
 - submit は**部分成功を返せる**: task-create まで成功したらタスクは生き、
-  worker-start 失敗は `state: "queued"` + `warnings` で伝える(例外にしてタスクを消さない)。
+  worker-start 失敗は `warnings` 付きで伝える(例外にしてタスクを消さない)。起動前の失敗は `state: "queued"`、
+  readiness の失敗は実際のタスク状態(実測では `failed`)+ `startOutcome: "failed"`。
 - 状態は正規化する(`queued/running/blocked/completed/failed/cancelled`)。CLI 生の値は
   `rawStatus` に残す。phase は worker/gate から推定し、根拠が無ければ `starting` に寄せる
   (推定には Commander 配下の child worker も含める)。
@@ -276,9 +283,11 @@ docs/
 - **release(`orca_release_task`)は終わったジョブの後片付けだけ**(1.4.245 `worker-release`)。完了しても worker の
   terminal は `retained` のまま残る(2026-10-31 実測: `worker-list` の counts が retained 23 / released 9)。
   - 対象タスクが終端でも `queued` でもなければ `release_job_active`(変更ゼロ)。走っているジョブの pane を閉じない。
-    `queued` を許すのは、worker-start が readiness で落ちたタスクが `queued` のまま進まず、Orca 自身が失敗した dispatch の
-    release を勧めるため(2026-10-31 実測: codex が PATH に無く cmd だけの pane が残り、receipt の recovery が
-    "This start created a terminal that never ran the Task. Close it with: … worker-release")。
+    readiness で落ちた起動の空 pane は、タスクが `failed` になるので終端として閉じられる(2026-11-01 実測: codex が PATH に無く
+    cmd だけの pane が残り、receipt の recovery が "This start created a terminal that never ran the Task. Close it with: …
+    worker-release"。release で `released` / `closed_agent_terminal` / `archiveStatus: captured`、2 回目は `alreadyReleased`)。
+    `queued` も許すのは保険: 起動前に落ちたタスクは `ready` のまま worker も pane も無く、release は何も閉じずに
+    `fullyReleased: true` を返す(同日実測)。pane を持ったまま `queued` になり得るのは worker-start の `outcome_unknown` だけ(未再現)。
   - 対象は cancel と同じ境界(子孫 + **verified な sub-run だけ**)。verified でない sub-run は `skippedSubRuns` に残して触らない
     (cancel のように全体を拒否しない — 閉じる対象は settled な worker だけで、残しても漏れるのは terminal だけ)。
   - 閉じるのは settled(`completed` / `failed`)かつ未解放の worker だけ。`released` は `alreadyReleased`、
