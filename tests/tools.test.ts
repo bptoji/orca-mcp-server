@@ -18,6 +18,7 @@ import {
 } from "../src/tools/job.js";
 import {
   CANCEL_TASK_TOOL_NAME,
+  RELEASE_TASK_TOOL_NAME,
   REPLY_MESSAGE_TOOL_NAME,
   RESOLVE_GATE_TOOL_NAME,
   SEND_MESSAGE_TOOL_NAME,
@@ -64,7 +65,7 @@ function createStubClient() {
 }
 
 describe("createServer", () => {
-  it("Job API 3 + 介入 4 + 観測 read-only 7 が登録されている", () => {
+  it("Job API 3 + 介入 5 + 観測 read-only 7 が登録されている", () => {
     const { stub } = createStubClient();
     const server = createServer(stub);
     expect(server).toBeInstanceOf(McpServer);
@@ -78,6 +79,7 @@ describe("createServer", () => {
         TASK_RESULT_TOOL_NAME,
         SEND_MESSAGE_TOOL_NAME,
         CANCEL_TASK_TOOL_NAME,
+        RELEASE_TASK_TOOL_NAME,
         RESOLVE_GATE_TOOL_NAME,
         REPLY_MESSAGE_TOOL_NAME,
         STATUS_TOOL_NAME,
@@ -115,7 +117,7 @@ describe("createServer", () => {
     }
   });
 
-  it("変更系ツールの annotations: submit と cancel は destructive、send / resolve_gate / reply_message は非破壊", () => {
+  it("変更系ツールの annotations: submit / cancel / release は destructive、send / resolve_gate / reply_message は非破壊", () => {
     const { stub } = createStubClient();
     const tools = (createServer(stub) as unknown as RegisteredToolsAccess)._registeredTools;
     const annotationsOf = (name: string) =>
@@ -125,6 +127,10 @@ describe("createServer", () => {
       destructiveHint: true,
     });
     expect(annotationsOf(CANCEL_TASK_TOOL_NAME)).toMatchObject({
+      readOnlyHint: false,
+      destructiveHint: true,
+    });
+    expect(annotationsOf(RELEASE_TASK_TOOL_NAME)).toMatchObject({
       readOnlyHint: false,
       destructiveHint: true,
     });

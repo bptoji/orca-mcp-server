@@ -41,8 +41,8 @@
 - 座分離契約(`docs/design/run-seat-ownership.md` §7)では承認を ask(`orchestration ask --to run:<run>`)に
   統一し、ゲートを作らせない。ask はメッセージ承認で、asker は `--resume` で回答まで待つため
   `blocked` の典型原因になる。
-- poll は `orchestration check --run <run> --peek --types question`(runMutation 経由。check は
-  Run バインドスコープのため、復旧の run-use は呼び出し元自身の Run への再バインドだけ)で読み、
+- poll は `orchestration check --run <run> --peek --types question`(check は Run バインドスコープだが
+  run-use はしない — 担当でなければ `consumer_fenced` / `run_required` を `warnings` に残す)で読み、
   `type === "question"` の行を `asks[]` に正規化する(`messageId` = `thread_id` / `question` /
   `options` / `taskId` / `dispatchId` / `fromHandle` / `createdAt`)。
 - **ask が pending の asker worker は `agent_prompt` に出さない**(二重掲載の排除。asker は ask の

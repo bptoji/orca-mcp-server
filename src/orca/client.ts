@@ -111,6 +111,10 @@ export interface WorkerStartInput {
   name?: string;
   repo?: string;
   setup?: "run" | "skip" | "inherit";
+  /** 1.4.245: provider の model id(Claude / Codex / Cursor / Antigravity / Muse が対応)。 */
+  model?: string;
+  /** 1.4.245: 推論レベル。CLI は `--effort requires --model` で model 無しを拒否する。 */
+  effort?: string;
   run?: string;
   from?: string;
 }
@@ -315,6 +319,14 @@ export class OrcaClient {
     return this.call(["orchestration", "worker-stop", "--dispatch", dispatch]);
   }
 
+  /**
+   * `orca orchestration worker-release` — settled な worker の agent terminal を閉じる(1.4.245)。
+   * 出力は閉じる前に archive されるので worker-read は引き続き読める。冪等(2 回目は already_released)。
+   */
+  workerRelease(dispatch: string): Promise<JsonObject> {
+    return this.call(["orchestration", "worker-release", "--dispatch", dispatch]);
+  }
+
   /** `orca orchestration worker-read` — worker の出力(読み取り)。 */
   workerRead(input: WorkerReadInput): Promise<JsonObject> {
     const args = ["orchestration", "worker-read", "--dispatch", input.dispatch];
@@ -399,6 +411,8 @@ export class OrcaClient {
     if (input.name !== undefined) args.push("--name", input.name);
     if (input.repo !== undefined) args.push("--repo", input.repo);
     if (input.setup !== undefined) args.push("--setup", input.setup);
+    if (input.model !== undefined) args.push("--model", input.model);
+    if (input.effort !== undefined) args.push("--effort", input.effort);
     if (input.run !== undefined) args.push("--run", input.run);
     if (input.from !== undefined) args.push("--from", input.from);
     // worker-start は worktree 作成 + setup hook 実行 + エージェント起動 + 初ターン観測まで

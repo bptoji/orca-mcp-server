@@ -15,6 +15,7 @@
 | 聞く | `orca_get_task_status` | 今の状態と、Commander が分解した子タスク・ワーカーの進捗(**sub-run の中まで拾う**) |
 | 受け取る | `orca_get_task_result` | 完了後の成果(ワーカー個々の成果も集約できる) |
 | 途中で手を出す(任意) | `orca_send_message` / `orca_reply_message` / `orca_resolve_gate` / `orca_cancel_task` | 指示の追加 / ask への回答(承認)/ ゲートの承認(旧契約ジョブ互換)/ 停止(sub-run の worker まで止める) |
+| 後片付け(任意) | `orca_release_task` | 終わったジョブの worker terminal を閉じる(出力は archive され result で読める) |
 | Run を見る(任意) | `orca_list_runs` / `orca_get_run` | Orca の Run 一覧と詳細(sub-run 発見の唯一の経路) |
 
 **1 回の MCP 呼び出しでワーカーの完了を待つことはありません。**(30 分ブロックし続ける設計にしていません)
@@ -191,18 +192,19 @@ providers 列挙にそのエージェント名は出ない)。`orca_delegate_tas
    - ゲート(旧契約のジョブ、`gates[]` に出る)→ `orca_resolve_gate({ gateId, resolution, run })`
 6. 取り消すときだけ `orca_cancel_task({ taskId, reason })`(既定で子孫 worker も子から順に止める。**sub-run の worker も Commander より先に止める**)
 7. `state: "completed"` になったら `orca_get_task_result({ taskId })`。ワーカー個々の成果まで欲しければ `includeChildren: true`
+   - 読み終わったら `orca_release_task({ taskId, run })` で worker の terminal を閉じる(完了しても terminal は `retained` のまま残る)
 8. 状況確認が欲しいときだけ `orca_list_worktrees` / `orca_get_worktree` / `orca_list_agents` / `orca_list_runs` / `orca_status`
 
-**poll / result / 観測ツールは変更を一切行いません。** 変更系は `orca_delegate_task` と介入 4 個
-(`orca_send_message` / `orca_reply_message` / `orca_resolve_gate` / `orca_cancel_task`)だけです。
-唯一の例外は poll の ask 受信(`check` は Run バインドスコープなので runMutation 経由。復旧の
-`run-use` は呼び出し元自身の Run への再バインドだけ)と `orca_reply_message` の reply 前点検です。
+**poll / result / 観測ツールは変更を一切行いません。** 変更系は `orca_delegate_task` と介入 5 個
+(`orca_send_message` / `orca_reply_message` / `orca_resolve_gate` / `orca_cancel_task` / `orca_release_task`)だけです。
+poll の ask 受信(`check`)も `run-use` を呼びません — このターミナルが Run の担当でなければ ask を読まずに
+`warnings` に理由を残します(他人の Run ID で poll しただけで担当を奪わないため)。
 
 ---
 
 ## ツールリファレンス
 
-公開 API は 14 個です。低レベルすぎる API(`orca_create_worktree` / `orca_start_agent` /
+公開 API は 15 個です。低レベルすぎる API(`orca_create_worktree` / `orca_start_agent` /
 `orca_send_terminal` など)は外部に出さず、内部実装に隠しています。
 
 ### Job API
@@ -213,7 +215,9 @@ providers 列挙にそのエージェント名は出ない)。`orca_delegate_tas
 | `orca_get_task_status` | **poll** | task-list / dispatch-show / worker-list / gate-list / run-list(sub-run 照合)/ **check**(呼び出し Run の受信箱から pending の ask を読む) | 待たない |
 | `orca_get_task_result` | **result** | task-list / dispatch-show / worker-read / run-list(sub-run 照合) | 待たない |
 
-Commander は新しいワークツリーに起動します。その名前は `title` があればそのまま、`title` を省略した場合は `spec` とタスク ID から自動生成します(Orca は新しいワークツリーの名前を要求するため、名無しでは作れません)。`title` は省略できます。
+Commander は新しいワークツリーに起動します。その名前は `title` があればそのまま、`title` を省略した場合は `spec` とタスク ID から自動生成します(Orca 1.4.222 は新しいワークツリーの名前を要求します。1.4.245 で任意になりましたが、旧版互換と名前の予測可能性のために常に渡します)。`title` は省略できます。
+
+`commanderModel` / `commanderEffort` を渡すと `worker-start --model` / `--effort` で Commander の model と推論レベルを指定できます(Orca 1.4.245 以降。Orca が対応するのは claude / codex / cursor / antigravity / muse で、他のエージェントは自分の設定の model で起動します)。`commanderEffort` だけの指定は `effort_requires_model` で何も作らずに拒否します。指定したときは応答の `launch`(`requested` / `effective`)に実際に使われた値が載ります。
 
 ```
 orca_delegate_task({
@@ -283,13 +287,15 @@ orca_get_task_result({ taskId: "task_abc123", includeChildren: true })
   `gate`(質問文 + `detail.gateId` / `detail.runId` / `detail.options`)/
   `ask`(pending の ask。`detail` に `messageId` / `question` / `options`。**新契約では承認は ask なのでこちらが主役**)/
   `task_report`(Commander・子タスクの blocked 報告 `result`)/
-  `agent_prompt`(入力待ちの worker。`detail` に `outputTail` / `outputHash` / `looksLikePrompt` / `observedAt` / `activity`。
+  `agent_prompt`(入力待ちの worker。`detail` に `outputTail` / `outputHash` / `looksLikePrompt` / `observedAt` / `activity`、Orca が判定したときは `agentWait`(`source: hook / prompt-text / title`、`reason` / `since`)。
   MCP からは解除不可。`looksLikePrompt` は文言からの推定。`outputHash` は呼び出し側が前回値と比べて動作中かを判定する。
   **pending の asker は `agent_prompt` に出さない**(asker は ask の回答待ちで、二重掲載を避けるため)/
   `unknown`(根拠なし)。`nextAction` は最優先の kind に合わせて案内します。
-  `agent_prompt` の出力取得(`worker-read`)だけが追加の読み取りで、失敗しても `warnings` に残して poll は返ります。
-  Orca が attention を立てない承認プロンプトもあるため、`activity: waiting` の worker も出力末尾を読み、
-  プロンプトらしいときだけ `agent_prompt`(と `attentionRequired: true`)にします。
+  `agent_prompt` の判定(`worker-show` 最大 3 件 + `worker-read` 最大 2 件)だけが追加の読み取りで、失敗しても `warnings` に残して poll は返ります。
+  判定はまず `worker-show` の `observation.agentWait`(Orca 1.4.245 が「人間にしか答えられない待ち」を根拠付きで返す)を使い、
+  `agentWait: null`(Orca が見て待ち無し)の worker は出しません。フィールドが無い worker(Orca が見ていない。terminal を持たない worker もここ)は
+  従来の推定に落とします: Orca が attention を立てない承認プロンプトもあるため、`activity: waiting` の worker も出力末尾を読み、
+  プロンプトらしいときだけ `agent_prompt`(と `attentionRequired: true`)にします。出力は `--source terminal` で読み、terminal を持たない worker は `auto` で読み直します。
 - `children` は Commander が分解した**直接の子タスク**(`parent_id` 一致)とその worker。
   `childCount` は実件数、`returnedChildCount` が返した件数(上限 20)、`childrenTruncated` で打ち切りを伝えます。
   **孫以降は出ません**(その子の poll / result で見る)。
@@ -347,7 +353,7 @@ worktree の displayName(`name:weever`)や worktree path は `repo_not_found` �
 
 ### 介入(intervene)
 
-委譲したジョブへ**あなたが明示的に介入を決めたときだけ**使う 4 個です。
+委譲したジョブへ**あなたが明示的に介入を決めたときだけ**使う 5 個です。
 
 | ツール | 役割 | 内部で呼ぶもの | 破壊的? |
 | --- | --- | --- | --- |
@@ -355,6 +361,7 @@ worktree の displayName(`name:weever`)や worktree path は `repo_not_found` �
 | `orca_reply_message` | **ask への回答**(新契約の Human-in-the-loop 承認) | `orchestration check`(--all で点検)→ `orchestration reply`(必要なら `run-use` でバインド切替) | いいえ |
 | `orca_resolve_gate` | 判断ゲートを承認/却下して Commander を進める(**旧契約ジョブ互換**) | gate-list → `orchestration gate-resolve`(必要なら `run-use` でバインド切替) | いいえ |
 | `orca_cancel_task` | ジョブを止めてキャンセル扱いにする(**既定で子孫へ cascade**) | worker-stop / worker-abandon → `task-update --status failed` | はい |
+| `orca_release_task` | 終わったジョブの worker terminal を閉じる(後片付け、**既定で子孫へ cascade**) | worker-list で settled な worker を選ぶ → `orchestration worker-release` | はい(terminal を閉じる) |
 
 ```
 orca_send_message({ subject: "方針変更", body: "実装は src/ のみに限定", run: "run_…",
@@ -385,7 +392,26 @@ orca_cancel_task({ taskId: "task_abc123", reason: "方針変更" })   // cascade
       "tasks": [ { "taskId": "task_deep", "state": "cancelled", "runId": "run_…", "fenced": [ … ] }, … ],
       "workers": [ { "taskId": "task_deep", "dispatchId": "ctx_…", "action": "stop", "resultState": "stopped" }, … ],
       "warnings": [] }
+
+orca_release_task({ taskId: "task_abc123", run: "run_…" })   // ジョブが終端でも queued でもなければ release_job_active
+  → { "taskId": "task_abc123", "state": "completed", "releasedCount": 3, "fullyReleased": true,
+      "results": [ { "dispatchId": "ctx_…", "taskId": "task_backend", "state": "released", … }, … ],
+      "alreadyReleased": [], "skipped": [], "subRunsDiscovered": 0, "skippedSubRuns": [], "warnings": [] }
 ```
+
+`orca_release_task` が触るのは **settled(succeeded / failed)な worker だけ**です。走っている worker(`skipped` の
+`not_settled`)、launch token 無しで dispatch だけ失敗し pane がまだ動いている worker(`report_pending` — 後から
+`task-update` で報告が届き得る)、ユーザーが `worker-retain` した / 引き取った worker(`user_retained` — pane で承認に答えただけでも引き取り扱いになる。
+件数は `retainedByUserCount` で、`fullyReleased` は落とさない)、所有確認が verified でない sub-run
+(`skippedSubRuns`)には触りません。`worker-release` は閉じる前に出力を archive するので、閉じた後も
+`orca_get_task_result` で worker 出力を読めます(すでに止まっていた worker は archive が取れないことがあります —
+実測で `archive.status: "unavailable"`)。worktree は削除しません。`worker-release` は Run バインドを要求しないので、
+このツールは `run-use` を呼ばず、どの Run の担当も動かしません。
+閉じたと数えるのは receipt が `released` / `already_released` のものだけです(`releasedCount`)。`release_pending` は
+`pendingCount`、`retained` は `notClosedCount`、`release_unknown` などは `failedCount` に分け、閉じていない行には
+Orca の `lastError` / `recovery` を添えます。pane がすでに消えた worker は Orca が「プロセスが消えたと証明できない」として
+`release_unknown` を返すので(実測)、古いジョブの後片付けは `fullyReleased: false` になります。Commander の terminal を閉じると
+sub-run の所有確認(terminal list の来歴)が取れなくなるため、sub-run を含む後片付けは 1 回の呼び出しで済ませてください。
 
 - `type` は CLI が受け付ける種別のみ(`status / dispatch / worker_done / merge_ready / escalation /
   handoff / decision_gate / question / heartbeat`)。**`worker_done` には `outcome` と `dispatchId` が必須**
@@ -499,9 +525,9 @@ orca_cancel_task({ taskId: "task_abc123", reason: "方針変更" })   // cascade
   `cancel_discovery_incomplete` / `gate_task_mismatch` / `ask_not_found` / `ask_task_mismatch`
 - orca CLI は**呼び出し元ターミナルを 1 つの Run にバインド**します。違う Run への変更は `consumer_fenced` で
   拒否されるため、介入ツールだけが必要に応じて `run-use` でバインドを切り替えて 1 回だけ再試行します
-  (poll / 観測ツールは切り替えません。唯一の例外は poll の ask 受信と `orca_reply_message` の点検 —
-  `check` も Run バインドスコープなので runMutation 経由で、復旧の `run-use` は**呼び出し元自身の
-  Run への再バインド**だけを行います)。変更系は MCP サーバー内で直列化します
+  (poll / 観測ツールは切り替えません。poll の ask 受信の `check` も Run バインドスコープですが、
+  `consumer_fenced` / `run_required` なら ask を読まずに `warnings` に残します — 同じターミナルから
+  別のジョブを委譲すると担当が移るので、前のジョブの ask は poll に出なくなります)。変更系は MCP サーバー内で直列化します
 - **座(コーディネーターのバインド)の所有権は Run 単位で分離**しています(設計:
   `docs/design/run-seat-ownership.md`、§12 に実装記録)。新契約の Commander は**自分が作った子 Run で
   仕事をし**、親 Run への `run-use` / mutation は依頼文で禁じます(親 Run の座は呼び出し元が終身保持)。
@@ -694,7 +720,7 @@ orca-mcp/
 │  └─ tools/
 │     ├─ result.ts      # 共通の CallToolResult ヘルパー(text / isError)
 │     ├─ job.ts         # orca_delegate_task / orca_get_task_status / orca_get_task_result
-│     ├─ intervene.ts   # orca_send_message / orca_reply_message / orca_resolve_gate / orca_cancel_task(変更系はここだけ)
+│     ├─ intervene.ts   # orca_send_message / orca_reply_message / orca_resolve_gate / orca_cancel_task / orca_release_task(変更系はここだけ)
 │     ├─ status.ts      # orca_status
 │     ├─ readiness.ts   # orca_readiness(runtime / orchestration / skill の前提チェック)
 │     ├─ worktrees.ts   # orca_list_worktrees / orca_get_worktree
