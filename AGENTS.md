@@ -65,11 +65,11 @@ docs/
 | ツール | 役割 | 内部コマンド |
 | --- | --- | --- |
 | `orca_delegate_task` | submit(**Commander 専用**) | run-create(未指定時) → task-create(固定 Commander 指示 + goal + repo + constraints) → worker-start `--worktree new-child --name <title または生成名> --agent <commanderAgent>` |
-| `orca_get_task_status` | poll | task-list / dispatch-show / worker-list / gate-list / **run-list**(sub-run 照合)/ **check**(呼び出し Run の受信箱から pending の ask を読む。子タスクは task-list の `parent_id` + sub-run の root 照合で拾う) |
+| `orca_get_task_status` | poll | task-list / dispatch-show / worker-list / gate-list / **run-list**(sub-run 照合)/ **check**(呼び出し Run の受信箱から pending の ask を読む。子タスクは task-list の `parent_id` + sub-run の root 照合で拾う)/ **inbox**(asker の dispatch 受信箱で ask 回答の配達を確認) |
 | `orca_get_task_result` | result | task-list / dispatch-show / worker-read / **run-list**(`includeChildren: true` で子タスクの result と出力も集約) |
 | `orca_send_message` | intervene(非破壊) | `orchestration send`(必要なら run-use でバインド切替) |
 | `orca_resolve_gate` | intervene(非破壊 / Human-in-the-loop) | gate-list → `orchestration gate-resolve`(必要なら run-use でバインド切替) |
-| `orca_reply_message` | intervene(非破壊 / Human-in-the-loop) | `orchestration check`(--all で点検) → `orchestration reply`(必要なら run-use でバインド切替) |
+| `orca_reply_message` | intervene(非破壊 / Human-in-the-loop) | `orchestration check`(--all で点検) → `orchestration reply`(必要なら run-use でバインド切替)→ dispatch-show / run-list(asker が Run を coordinate しているかの事後確認、読み取りのみ) |
 | `orca_cancel_task` | intervene(破壊的 / 既定 cascade) | 子孫を**子から順**に worker-stop/abandon → `task-update --status failed` |
 | `orca_release_task` | intervene(破壊的 = terminal を閉じる / 既定 cascade) | worker-list(+ verified sub-run)で settled な worker を選ぶ → `orchestration worker-release` |
 | `orca_status` | 観測 | `orca status --json` |
@@ -92,9 +92,13 @@ docs/
 - `COMMANDER_PROMPT` には「orchestration を変更する前に `orca skills get orchestration --full` を
   読み、記憶した CLI 構文を使わない」という Orca 公式の推奨を固定で書き込む。
   さらに **座分離契約**(2026-10-21 実測・設計: `docs/design/run-seat-ownership.md`)を固定で書き込む:
-  親 Run は 1 つで seat は呼び出し元のまま(`run-use --id {{runId}}` 禁止)、作業は Commander が作る
+  親 Run は 1 つで seat は呼び出し元のまま(`run-use --id {{runId}}` 禁止)、委譲する作業は Commander が作る
   子 Run に限定(objective に `orca-mcp-parent:` マーカー)、承認は ask(`--to run:{{runId}}`)で
   ゲートを作らせない。`commanderSpec` のテストで文言を固定する。
+  **小さい goal は Commander が自分の worktree で作業してよく、そのときは子 Run を作らない**(子 Run は最初の
+  task-create の直前に 1 回だけ作る)。2026-11-08 E2E 実測: 旧文言は判断の前に子 Run の作成を指示していたので、
+  3 回とも Commander が子 Run を作ってから自分で作業し、空の子 Run が残った(cancel の探索との競合も生んだ)。
+  子 Run を持たない Commander は Run を coordinate しないので、ask 回答が配達されない Orca 不具合の条件にも当たらない。
 - 作業ワーカーの選択は Commander 側。MCP 側の語彙は `commanderAgent`(= どの Commander を起動するか)。
 - **`commanderModel` / `commanderEffort` は `worker-start --model / --effort` にそのまま渡す**(1.4.245)。
   CLI は `--effort requires --model` なので、effort だけの指定は Run / task を作る前に `effort_requires_model` で弾く
@@ -280,6 +284,10 @@ docs/
 - **Commander(root)の fence 失敗は cancel 成功にしない**: 対象タスクの fence に 1 件でも失敗したら
   `cancel_incomplete`(`state: "partial"` / `cancelled: false` / `fullyStopped: false`)で**対象 task は更新しない**。
   「論理 cancel」と「実プロセス停止」のズレを放置しないため。成功応答には `fullyStopped`(fence 全成功か)を載せる。
+- **cancel は確定(task-update)の直前に task を読み直し、自分で終わっていたら上書きしない**(2026-11-08 E2E 実測:
+  Commander が `worker_done` で完了した 4 秒後の cancel が、空振りの worker-stop(`resultState: succeeded` /
+  `processAction: none`)のあと completed の task を `failed` / `cancelled: …` に書き換えた)。終端なら `tasks[]` に
+  `settledBeforeCancel: true` で残し、Commander 自身がそうなら応答は `cancelled: false` + 実際の `state`。
 - **release(`orca_release_task`)は終わったジョブの後片付けだけ**(1.4.245 `worker-release`)。完了しても worker の
   terminal は `retained` のまま残る(2026-10-31 実測: `worker-list` の counts が retained 23 / released 9)。
   - 対象タスクが終端でも `queued` でもなければ `release_job_active`(変更ゼロ)。走っているジョブの pane を閉じない。
@@ -293,6 +301,11 @@ docs/
   - 閉じるのは settled(`completed` / `failed`)かつ未解放の worker だけ。`released` は `alreadyReleased`、
     settled でない worker は `skipped`(`not_settled`)、`resource.retainedReason` がある worker は `skipped`
     (`user_retained` — worker-release は worker-retain の例外を**解除して**閉じるので、ユーザーの意図を上書きしない)。
+    **ただし `retainedReason: "user_requested"`(keep-open)は閉じる**(`RELEASABLE_RETAINED_REASONS`、2026-11-08 E2E 実測):
+    1.4.250 は新しい worktree で起動した worker を既定で keep-open にする(worker-start help)ので、new-child で起動する
+    Commander は完了後に必ず `user_requested` で残り、旧判定では release が 1 件も閉じなかった(4 ジョブすべて)。
+    worker-release help は "call it … to clear a worker-keep-open"、Orca 本体も `user_requested` は release を進め、
+    retained で拒否するのは UI の Keep open(`user_kept`)と引き取り(`user_takeover`)など。
     `user_retained` は `fullyReleased` を落とさないが、pane は残るので `retainedByUserCount` と warning で目立たせる。
     **pane で承認プロンプトに答えただけで `retainedReason: "user_takeover"` になる**(2026-10-31 実測: claude Commander の
     PowerShell 承認に 2 を選んだ worker は完走後も閉じられず、release は `releasedCount: 0` / `fullyReleased: true`)。
@@ -313,15 +326,17 @@ docs/
     `processAction: "none"` / `archive: null` / lastError "The recorded terminal no longer resolves; whether its process
     is gone cannot be proven."、worker-list の terminalState も `release_unknown` に変わった)。
     再試行しても証明できないので、古いジョブの後片付けは `fullyReleased: false` で返るのが正常。
-    同じ実測で sub-run `run_f22501f98979` は root が 3 件で `unverified` になり `skippedSubRuns` に回った(触らない)。
+    同じ実測で sub-run `run_f22501f98979` は root が 3 件で `unverified` になり `skippedSubRuns` に回った(触らない。
+    当時の判定は root 1 件限定。今は全 root を照合するが、Commander の pane が消えていれば来歴を照合できず `probable` で残る)。
   - **`worker-release` は Run バインドを要求しないので runMutation を通さない**(2026-10-31 実測: 親 Run にバインドした
     terminal から sub-run の stopped worker `ctx_5e6454b01434` を release → `state: released` / exit 0、sub-run の
     `coordinator_handle` / `consumer_generation` は不変)。runMutation を通すと fenced 時の run-use で sub-run の担当を
     Commander から奪い、戻さない。
   - archive は常に取れるとは限らない(同実測: 止まった worker は `processAction: "none"` / `archive.status: "unavailable"`)。
     help の "An inspectable output archive is preserved before the terminal closes" は閉じる terminal があるときの話。
-  - 所有確認は terminal list の来歴なので、**Commander の terminal を閉じた後の 2 回目は sub-run が probable に落ちる**。
-    sub-run を含む後片付けは 1 回で済ませる(ツール説明に明記)。
+  - 所有確認は terminal list の来歴で、**Commander の terminal を閉じた後は dispatch 記録の来歴で照合する**(2026-11-08 E2E 対応)。
+    以前は閉じた後の 2 回目で sub-run が probable に落ち(さらに `coordinator_handle: null` で sub-run 自体が見えなくなり)、
+    sub-run の worker を閉じ損ねても `fullyReleased: true` を返していた。
 - **result の子集約は明示されたときだけ**: `orca_get_task_result` の既定は Commander だけ。
   `includeChildren: true` で子 10 件・worker-read 8 件まで(応答サイズと CLI 呼び出し数の抑制)。
   子行に `dispatch_id` があれば dispatch-show を足しにいかない。
@@ -341,11 +356,13 @@ docs/
   CLI 側の語彙(`run_required` など)はそのまま転送する。
 - `state: "cancelled"` は **MCP 側の論理状態**(CLI に native status が無い)。実体は
   `status: failed` + `result: "cancelled: <reason>"`。README にその旨を 1 行書く。
+  poll / result / children は `taskRowState` でこの組を `cancelled` に戻す(`rawStatus` は `failed` のまま。
+  2026-11-08 E2E 実測: 以前は cancel 直後の poll が `failed` を返していた)。
 - **ゲートは自分の task に作れない**(2026-10-16 実機): Commander の task は supervised dispatch が生きているので
   `gate-create --task <自分>` は `task_not_startable` で拒否される。承認経路は ask に統一したので
   Commander Prompt はゲートを作らせない(詳細は下の `blockedReasons[]` の項)。`orca_resolve_gate` は
   旧契約のジョブ(sub-run 内の承認用子 task のゲート)との互換用に残す。
-- poll の `blockedReasons[]`(設計: `docs/design/blocked-reasons.md`): `kind` は `gate / ask / task_report /
+- poll の `blockedReasons[]`(設計: `docs/design/blocked-reasons.md`): `kind` は `gate / ask / ask_undelivered / task_report /
   agent_prompt / unknown`。`blocked` でも gate が無いことがある(Commander の blocked 報告 = `task-update` の `result`、
   エージェントの承認プロンプト)ので、**`blocked` = `decision_gate` と決めつけない**。pending のゲート**か ask**
   があるときだけ phase は `decision_gate`、無ければ `blocked`。gates は `gate-list --run` で全件取り、対象タスク +
@@ -369,7 +386,7 @@ docs/
   `options` / `taskId` / `dispatchId` / `fromHandle` / `createdAt`)を載せ、`kind: ask` の `blockedReasons`
   (`detail` に `messageId` / `question` / `options`)を添える。**asker は回答までブロック中**なので、
   ask が pending の asker の worker は `agent_prompt` に出さない(二重掲載の排除)。
-  回答は `orca_reply_message({ messageId, body, run })`(asker はタイムアウト後も `ask --resume` で待つので遅れて届く)。
+  回答は `orca_reply_message({ messageId, body, run })`(asker は `ask --wait`、タイムアウト後は `ask --resume` で自分で読む)。
   asker task の payload.taskId が呼び出し元 Run の task 部分木に属さない sub-run 由来の ask は taskId 点検の外側
   (呼び出し元 Run の task-list に現れない)なので、その場合は `taskId` を外して解決する。
   check の失敗は `warnings` に留めて poll を壊さない。ask の「まだ pending か」の確定は受信箱の unread(peek)
@@ -379,10 +396,27 @@ docs/
   (`completed` / `failed` / `cancelled`)の ask は `asks[]` と `kind: ask` から外し、
   warnings に記録する**。呼び出し Run の task-list に現れない sub-run 由来の ask は
   判定不能なので残す(回答待ちの可能性を捨てない)。
+- **ask の回答は Commander に配達されない — Orca 1.4.250〜1.4.253 の不具合**(2026-11-07 / 11-08 実測 2 件、
+  1.4.253 のソース `src/main/runtime/orchestration/mailbox/routing/mailbox-owner.ts` の `resolve()` で確認)。
+  terminal が Run を coordinate していると `run:` 受信箱しか見ず、`dispatch:` 宛てのメールを `null` に解決して捨てる。
+  座分離契約の Commander は子 Run の coordinator なので必ず該当する。1.4.250 の ask は Dispatch からだと即座に返り
+  (`next: "End your turn; Orca wakes you with the answer."`)、Commander がターンを終えると回答は asker の受信箱に
+  `read: 0` / `delivered_at: null` のまま残る(ask 行も呼び出し Run で unread のまま = poll は decision_gate のまま)。
+  再 reply は `duplicate: true` で届かない。10 月までの ask はブロック型だったので表に出なかった。
+  対策は 3 段: (1) `COMMANDER_PROMPT` は ask を `--wait --timeout-ms 540000` で必ずブロックさせ、タイムアウト・中断は
+  `--resume` を繰り返させ、receipt の "End your turn" に従わせない(Claude Code の Bash は最大 10 分なので 9 分。
+  打ち切られても question は pending のまま残る。`commanderSpec` のテストで固定)。(2) poll は pending に見える ask ごとに
+  asker の `inbox --terminal dispatch:<id> --full`(読み取り専用・バインド不要、最大 5 件)で回答行
+  (`thread_id` = ask の messageId、`from_handle: run:…`)を探し、`read: 1` なら `asks[]` から外す、未読なら
+  `undeliveredAsks[]` / `kind: ask_undelivered`(phase は decision_gate にしない)。(3) `orca_reply_message` は reply 後に
+  asker の handle(dispatch-show)を coordinator に持つ Run を run-list で探し、あれば `delivery.wakeLikelyBlocked: true` +
+  warnings + `nextAction`。回復は人手で Commander の pane に `ask --resume <messageId>` を頼む(`terminal send` で
+  自動入力する機能は作らない — 低レベル API を公開しない方針)。1.4.251 で直ったのは副次要因の
+  「Claude Code のプロンプト候補が draft 扱いでメールを保留する」(#38370)だけ。
 - poll は worker の `projection.attention.requiresAction` を `attentionRequired` / `attentionNotes`
   (行には `attentionCategories`)として出す。ゲートが pending でないのに止まる典型はエージェント側の
   ツール承認プロンプト(E2E 実測)。Commander Prompt には「答えられない承認待ちで止めない / 親 Run は
-  1 つで seat は呼び出し元のまま、作業は子 Run に限定し `run-use --id {{runId}}` を禁止 /
+  1 つで seat は呼び出し元のまま、委譲する作業は子 Run に限定し(自分で作業するなら子 Run を作らない)`run-use --id {{runId}}` を禁止 /
   深さ・circuit-break・失敗 dispatch・binding 回避で新しい Run を作らない / 承認は ask でゲートを作らせない /
   ask 失敗は承認を進めず停止して人間に依頼する」を固定で書き込む(`commanderSpec` のテストで文言を固定する)。
 - 出力は既定で切り詰める(`specPreview` 200 字、worker 出力 4000 字、agents の prompt 200 字)。
@@ -401,7 +435,7 @@ docs/
 - 大きな欄は既定で省略する(`orca_list_agents` は `prompt` を 200 文字で切り詰め、
   `lastAssistantMessage` は `full: true` のときだけ)。
 - 1 ハンドラーで複数の orca コマンドを呼んでよいのは **poll / result の読み集め**
-  (`task-list` + `dispatch-show` + `worker-list` + `gate-list` + `run-list` + **check**〔ask 受信〕 +
+  (`task-list` + `dispatch-show` + `worker-list` + `gate-list` + `run-list` + **check**〔ask 受信〕 + **inbox**〔ask 回答の配達確認〕 +
   `worker-show`〔agentWait〕/ `worker-read`〔承認プロンプトの出力末尾〕)、
   submit の既定フロー、観測の `orca_readiness`(`status` + `skills installed`)、
   そして **介入ツール(`orca_send_message` / `orca_resolve_gate` / `orca_cancel_task` /
@@ -458,12 +492,30 @@ sub-run の worker を走りたままにした)。設計は `docs/design/sub-run
   handle なので、Commander の handle(タスクの `assignee_handle` + worker の `agentTerminalHandle`)と一致する。
   **完了 task は `assignee_handle` が消える**(2026-10-22 E2E 実測)ので、handle が無いときは
   dispatch-show の `assignee_handle` で補完する(`commanderHandlesWithDispatch` — §12・§13 参照)。
-  `coordinator_handle` が `null` の Run は照合不能なので除外し、呼び出し元 Run 自身も除外する。
+  呼び出し元 Run 自身は除外する。
+  **`coordinator_handle` が `null` の Run は objective マーカーが呼び出し元の run と task の両方を指すときだけ拾う**
+  (2026-11-08 E2E 実測: cancel で Commander の terminal が閉じると Orca は sub-run の `coordinator_handle` を `null` に書き換え
+  (`consumer_generation` も進む)、以前はその後の poll が `childCount: 0`、result の子が 0 件、release が sub-run の worker を
+  見落としたまま `fullyReleased: true` を返した)。handle は root の `created_by_terminal_handle`(Commander の handle と一致するもの)で代え、
+  来歴は下の dispatch 記録で照合する。マーカーだけ・handle だけでは verified にしない。
+  修正後の E2E(2026-11-09)で、cancel 後の poll が子 Run `run_b1db5a3fcdf0` を `verified`(`coordinator_handle: null`)で出し、
+  release が子 Run の worker `ctx_b6db1dd15b31` まで閉じた(`releasedCount: 2` / `fullyReleased: true`、2 回目は `alreadyReleased` 2 件)。
   対象タスクの `created_at` より **24 分以上前**の Run は除外(terminal 再利用で古い Run が同じ handle を
   持つリスク。task-list はローカル時刻、run-list は UTC なので厳密比較はしない)。照合は最大 `MAX_SUB_RUNS = 3`。
 - **sub-run 内の root は `parent_id` では特定できない**。実測では sub-run の子 6 件の `parent_id` は
   sub-run 内で Commander が作った新しい root を指し、呼び出し元 Run の Commander task を指す行は無い。
   root は「`parent_id` がその Run 内に無い + `created_by_terminal_handle` が Commander の handle」で選ぶ。
+  **root は複数あり得る**(2026-11-08 実測: 座分離契約の Commander は子 Run に `parent_id: null` の task を横並びで
+  6 件作る)。所有判定は全 root を個別に来歴照合し、1 件でも矛盾すれば `conflicting`、全件が 2 系統一致したときだけ
+  `verified`、欠けがあれば `probable`(以前は「root が 1 件に特定できない」で `unverified` にしており、
+  新契約のジョブの cancel が毎回 `cancel_ownership_unverified` で拒否されていた)。修正後、完了済みジョブの
+  sub-run `run_da558107eb37` が `verified`(root 6 件中 6 件で pane key / incarnation 一致)になることを実測で確認。
+  **task がまだ無い sub-run(`empty: true`)は cancel / release を塞がない**(2026-11-08 E2E 実測: Commander が子 Run を
+  run-create した直後の cancel が「root が見つからない」→ `cancel_ownership_unverified` で拒否され、Commander が走り続けた)。
+  止める対象が無いので触らず、cancel は停止後にその Run の worker-list を **task を問わず**読み直して、競合で起動した
+  worker があれば `residualWorkers` / `fullyStopped: false` で報告する。release は `skippedSubRuns` に数えない。
+  poll / result の `subRunOwnershipComplete` も空の sub-run を未完了に数えない(同日 2 回目の E2E 実測: Commander が子 Run を作ったが使わずに自分で作業し、空の子 Run だけが残った)。
+  task はあるが Commander の root が無い sub-run は従来どおり `unverified`(拒否)。
 - **探索を走らせる条件は worker / dispatch が 1 件以上あるとき**(queued で探索を走らせない)。
   `childCount == 0` だけを条件にすると、親 Run にも sub-run にも子がある場合に sub-run が落ちる(実測)。
 - **run-list / worker-list は cursor でページングする**(実測: `run-list --limit 60` は 60 件 + `nextCursor`、
@@ -476,8 +528,12 @@ sub-run の worker を走りたままにした)。設計は `docs/design/sub-run
 - **所有関係は 4 段階で判定し、破壊的操作には `verified` だけ使う**(`classifySubRunOwnership`):
   `verified` = coordinator_handle 一致 + root の `created_by_pane_key`(tabId:leafId)と
   `created_by_process_incarnation`(ptyId:incarnationId)が `terminal list` と一致し矛盾なし、
-  `probable` = handle 一致のみ、`unverified` = handle 一致なし / root 特定不能、
-  `conflicting` = 来歴の矛盾、または objective マーカーが別の Run を指す。行には `ownership` /
+  `probable` = handle 一致のみ、`unverified` = handle 一致なし / root 0 件、
+  `conflicting` = 来歴の矛盾、または objective マーカーが別の Run / 別の task を指す。
+  **来歴の照合先は terminal list を優先し、Commander の terminal が無ければ Commander の dispatch 記録に落とす**
+  (`buildDispatchIdentities`。dispatch-show の `assignee_pane_key` / `process_incarnation` は terminal が閉じた後も残り、
+  root の `created_by_pane_key` / `created_by_process_incarnation` と同じ書式 — 2026-11-08 実測で文字列一致。どちらも Orca が書く値)。
+  dispatch-show は Commander の terminal が terminal list に無いときだけ 1 回読む(読み取りのみ)。行には `ownership` /
   `cancelEligible` / `verificationReasons` / `discoverySource` を載せる。
 - **objective のマーカーは発見の候補にだけ使う**(書式 `orca-mcp-parent: run=<caller runId> task=<task id>`、
   定数 `SUB_RUN_MARKER_PREFIX`)。誰でも書けるのでマーカー単独で `verified` にしない。来歴と組み合わせて使い、
@@ -661,6 +717,19 @@ sub-run の worker を走りたままにした)。設計は `docs/design/sub-run
   `coordinator-start` / `coordinator-stop` は retired(本実装は使っていない)。
   `run-list` は `--limit / --cursor`、`run-show` は `--id` を取る。`run-list` の `nextCursor` は
   base64 の keyset(`{createdAt,id}`)で、help 文の「line cursor」とは実体が違う。
+- **orchestration コマンドは常に `--full` で呼ぶ**(`OrcaClient.call` の `withFullRecord`)。Orca 1.4.246
+  (PR #36498、2026-10-31)から orchestration の `--json` は既定でエージェント向けの簡易表示になり、`--full` で
+  従来のプリンタ(1.4.245 までと同じ出力)に戻る。簡易表示は項目を落とすだけでなく、失敗時の `ok` / 終了コード
+  (worker-start は簡易表示だと「turn 未観測」でも exit 0、`--full` は ready 以外 exit 1)や envelope も変える。
+  2026-11-08 実測(1.4.250)で簡易表示に無かった、orca-mcp が読む項目: `task-list` の `parent_id` / `result` /
+  `created_by_*` / `created_at` / `spec`(poll の `childCount: 0`、result 本文が空、sub-run 所有判定不能)、
+  `worker-list` の `agentTerminalHandle` / `workerState` / `projection` / `resource` / `page`(attention・
+  liveness・`user_retained`・ページング)、`worker-show` の `observation`(`agentWait`)、`run-list` / `run-show` の
+  `coordinator_handle`(sub-run 探索が 0 件)、`inbox` の `thread_id` / `read`。`dispatch-show` は差なし。
+  修正後、完了済みジョブの poll が `childCount: 6` / sub-run 検出、result が子 6 件の結果を返すことを実測で確認。
+  `scripts/dsh-*-worker.mjs` の逆引き(run-list / task-list / dispatch-show)も `--full` を付ける。
+  したがって **Orca 1.4.246 以上が前提**(1.4.245 以前は `--full` を未知のフラグとして拒否する)。
+  orchestration 以外(`status` / `worktree` / `terminal list` / `skills installed`)には `--full` が無いので付けない。
 - **公開サイトの掲載は CLI バージョンに追いつかないことがある。** `worker-abandon` は実機 1.4.220 の
   `orca orchestration --help` に存在する("Fence a worker without claiming its process stopped"、
   資源を残しプロセス/filesystem に触らない)が、公式ドキュメントの掲載有無は別軸。

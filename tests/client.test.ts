@@ -3,6 +3,7 @@ import {
   extractTaskId,
   extractTasks,
   OrcaClient,
+  withFullRecord,
   type JsonObject,
 } from "../src/orca/client.js";
 import {
@@ -42,8 +43,23 @@ describe("OrcaClient の引数組み立て", () => {
       "--run",
       "r1",
       "--inject",
+      "--full",
       "--json",
     ]);
+  });
+
+  // 1.4.246 から orchestration の既定出力は簡易表示(項目が欠ける)。正規化は従来の出力が前提なので一律 --full。
+  it("orchestration サブコマンドだけに --full を 1 回付ける", async () => {
+    expect(withFullRecord(["orchestration", "task-list"])).toEqual(["orchestration", "task-list", "--full"]);
+    expect(withFullRecord(["orchestration", "inbox", "--full"])).toEqual(["orchestration", "inbox", "--full"]);
+    expect(withFullRecord(["status"])).toEqual(["status"]);
+    expect(withFullRecord(["worktree", "list"])).toEqual(["worktree", "list"]);
+    const { runner, calls } = createMockRunner();
+    const client = new OrcaClient(runner);
+    await client.inbox({ terminal: "dispatch:ctx_1", full: true });
+    expect(calls[0]?.filter((arg) => arg === "--full")).toHaveLength(1);
+    await client.status();
+    expect(calls[1]).toEqual(["status", "--json"]);
   });
 
   it("task-create の deps は JSON 文字列になる", async () => {
@@ -59,6 +75,7 @@ describe("OrcaClient の引数組み立て", () => {
       "原稿",
       "--deps",
       JSON.stringify(["t1", "t2"]),
+      "--full",
       "--json",
     ]);
   });
@@ -76,6 +93,7 @@ describe("OrcaClient の引数組み立て", () => {
       "--wait",
       "--timeout-ms",
       "5000",
+      "--full",
       "--json",
     ]);
   });
@@ -84,7 +102,7 @@ describe("OrcaClient の引数組み立て", () => {
     const { runner, calls } = createMockRunner();
     const client = new OrcaClient(runner);
     await client.send({ subject: "hello", body: "world" });
-    expect(calls[0]).toEqual(["orchestration", "send", "--subject", "hello", "--body", "world", "--json"]);
+    expect(calls[0]).toEqual(["orchestration", "send", "--subject", "hello", "--body", "world", "--full", "--json"]);
   });
 
   it("send は worker_done の outcome を --outcome で渡す(消すと CLI が拒否する)", async () => {
@@ -119,6 +137,7 @@ describe("OrcaClient の引数組み立て", () => {
       "t1",
       "--dispatch-id",
       "d1",
+      "--full",
       "--json",
     ]);
   });
@@ -169,6 +188,7 @@ describe("OrcaClient の引数組み立て", () => {
       "r1",
       "--from",
       "term_1",
+      "--full",
       "--json",
     ]);
   });
@@ -199,6 +219,7 @@ describe("OrcaClient の引数組み立て", () => {
       "name:foo",
       "--run",
       "r1",
+      "--full",
       "--json",
     ]);
   });
@@ -228,6 +249,7 @@ describe("OrcaClient の引数組み立て", () => {
       "current",
       "--agent",
       "claude",
+      "--full",
       "--json",
     ]);
   });
@@ -243,6 +265,7 @@ describe("OrcaClient の引数組み立て", () => {
       "gate_1",
       "--resolution",
       "approve",
+      "--full",
       "--json",
     ]);
     await client.gateResolve({ id: "gate_1", resolution: "reject", from: "term_1" });
@@ -255,6 +278,7 @@ describe("OrcaClient の引数組み立て", () => {
       "reject",
       "--from",
       "term_1",
+      "--full",
       "--json",
     ]);
   });
@@ -270,11 +294,12 @@ describe("OrcaClient の引数組み立て", () => {
     const { runner, calls } = createMockRunner();
     const client = new OrcaClient(runner);
     await client.runList();
-    expect(calls[0]).toEqual(["orchestration", "run-list", "--json"]);
+    // --full が無いと coordinator_handle が出ない(2026-11-08 実測・1.4.250)
+    expect(calls[0]).toEqual(["orchestration", "run-list", "--full", "--json"]);
     await client.runList({ limit: 50, cursor: "abc" });
-    expect(calls[1]).toEqual(["orchestration", "run-list", "--limit", "50", "--cursor", "abc", "--json"]);
+    expect(calls[1]).toEqual(["orchestration", "run-list", "--limit", "50", "--cursor", "abc", "--full", "--json"]);
     await client.runShow("run_8d1d20524d42");
-    expect(calls[2]).toEqual(["orchestration", "run-show", "--id", "run_8d1d20524d42", "--json"]);
+    expect(calls[2]).toEqual(["orchestration", "run-show", "--id", "run_8d1d20524d42", "--full", "--json"]);
   });
 
   it("worker-start は --run を渡せる(sub-run 外でも同じ Run に置ける)", async () => {
@@ -292,6 +317,7 @@ describe("OrcaClient の引数組み立て", () => {
       "codex",
       "--run",
       "run_caller",
+      "--full",
       "--json",
     ]);
   });

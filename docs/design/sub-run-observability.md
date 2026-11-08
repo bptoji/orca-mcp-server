@@ -194,7 +194,7 @@ review9 の「条件付き実装承認」(`orca-mcp_review9.txt` §2–§7)ど�
 | Phase | 実装 | 要点 |
 |---|---|---|
 | P1 | `COMMANDER_PROMPT` の Run ownership / gate 手順を改修 | 既存 Run を再利用 / 深さ・circuit-break・失敗 dispatch・binding 回避で Run を作らない / `run-use --takeover-legacy` は別操作(新しい Run を作る許可ではない)/ 自律 coordinator が child Run を作れるのは guide が許すときだけ + objective マーカー + 最終報告 / gate 作成失敗は binding 確認 → 1 回だけ安全に再試行 → だめなら承認を進めず停止して人間に依頼 |
-| P2 | 所有関係の判定 `classifySubRunOwnership` | `verified` は coordinator_handle + pane key + incarnation の 2 系統一致・矛盾なし。objective マーカー(`SUB_RUN_MARKER_PREFIX`)は**発見の候補**で、単独では `verified` にしない(誰でも書ける)。別 Run を指すマーカーは `conflicting` |
+| P2 | 所有関係の判定 `classifySubRunOwnership` | `verified` は coordinator_handle + pane key + incarnation の 2 系統一致・矛盾なし(root が複数なら全 root で一致。2026-11-08 に横並び root へ対応)。objective マーカー(`SUB_RUN_MARKER_PREFIX`)は**発見の候補**で、単独では `verified` にしない(誰でも書ける)。別 Run / 別 task を指すマーカーは `conflicting`。Commander の terminal が閉じて `coordinator_handle: null` になった sub-run は、マーカーが run / task の両方を指すときだけ拾い、来歴は Commander の dispatch 記録(`assignee_pane_key` / `process_incarnation`)と照合する(2026-11-08 E2E 実測で cancel 後に sub-run が見えなくなった件の対応) |
 | P3 | `scanRunRows` / `scanWorkerRows` の cursor ページング | `MAX_SCAN_PAGES = 5` / `MAX_WORKER_PAGES = 3`。打ち切りは `subRunScanComplete` / `subRunsTruncated` / `subRunScanPageCount` / `subRunScanRunCount` / `subRunOwnershipComplete` と warning で出す |
 | P4 | cancel の対象を `verified` に限定 | 検証失敗の sub-run が 1 件でもあれば preflight で `cancel_ownership_unverified`(**破壊的操作ゼロ**)。逃げ道は `includeSubRuns: false` / `cascade: false`。同一 dispatch は 1 回だけ(`fencedDispatchIds`) |
 | P5 | 停止後の読み直し `residualLiveWorkers` | 生存 worker を `residualWorkers[]` に載せ、1 件でもあれば `fullyStopped: false`。探索を打ち切った場合も `fullyStopped: false` |

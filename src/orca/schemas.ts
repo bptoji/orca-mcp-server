@@ -278,9 +278,10 @@ export type ResolveGateInputSchema = z.infer<typeof resolveGateInputSchema>;
 
 /**
  * ask(質問メッセージ)への回答: Human-in-the-loop の ask 承認経路。
- * asker は `orchestration ask --to run:<親Run>` でブロックして回答を待っているので、
+ * asker は `orchestration ask --to run:<親Run> --wait` でブロックして回答を待っているので、
  * reply するとブロックが解け、`answer` として届く(実測: `timedOut: false` で返る)。
- * タイムアウト済みの ask は asker 側が `ask --resume` で受け続ける。
+ * タイムアウト済みの ask は asker 側が `ask --resume` で受け取る。ターンを終えて wake を待つ asker には
+ * Orca 1.4.250〜1.4.253 が回答を配達しないことがある(Run の coordinator を兼ねる terminal。2026-11-08 実測)。
  */
 export const replyMessageInputSchema = z.strictObject({
   messageId: z

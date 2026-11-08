@@ -28,6 +28,7 @@
 | --- | --- | --- |
 | `gate` | pending のゲート | 質問文 / `{ gateId, options }` |
 | `ask` | 呼び出し Run の受信箱に pending の ask(`type: question`) | 質問文 / `{ messageId, question, options, taskId?, fromHandle, createdAt }` |
+| `ask_undelivered` | ask は回答済みだが asker の dispatch 受信箱で回答が未読(Orca が配達していない) | 説明 / `{ messageId, question, fromHandle, createdAt, recoveryCommand }` |
 | `task_report` | task または子 task が `blocked` で `result` が非空 | `result`(2000 字まで) |
 | `agent_prompt` | worker が `requiresAttention`(終端 / exited の worker は除く。**pending の asker は除外**) | 入力待ちの説明 / `detail.outputTail`(30 行 / 1500 字)、`outputHash`、`looksLikePrompt`、`observedAt`、`activity` |
 | `unknown` | 上のどれにも当たらない | 根拠なし |
@@ -59,6 +60,31 @@
   sub-run 由来の ask は判定不能なので残す)。peek で `consumer_fenced` の意味
   (fenced-on-peek が caller teardown を示すのか)は未確定。
 
+### 回答の配達確認(`ask_undelivered`、2026-11-08 追加・実装済み)
+
+- **実測(2026-11-07 / 11-08、Orca 1.4.250)**: approve を reply しても Commander が読まない事象が 2 件。
+  回答は asker の dispatch 受信箱に `read: 0` / `delivered_at: null` で残り、ask 行は呼び出し Run の受信箱で
+  unread のまま(poll は `decision_gate` を出し続け、もう一度 reply しても `duplicate: true` で届かない)。
+- **原因は Orca の配達先判定**(`src/main/runtime/orchestration/mailbox/routing/mailbox-owner.ts` の `resolve()`、
+  1.4.253 のソースでも同じ): terminal が Run を coordinate していると `run:` 受信箱しか見ず、`dispatch:` 宛ての
+  メールを `null` に解決して配達しない。座分離契約の Commander は子 Run の coordinator なので必ず該当する。
+  10 月までの ask はブロック型(asker が回答を自分で読む = `read: 1`)だったので表に出なかった。
+  1.4.250 の ask は Dispatch からだと即座に返り("End your turn; Orca wakes you")、wake を待つと上の不具合で止まる。
+- 予防は Commander Prompt: ask は必ず `--wait --timeout-ms 540000`、タイムアウト・中断は `--resume` を繰り返す、
+  receipt の "End your turn" に従わない(`commanderSpec` のテストで固定)。
+- 検出は poll: pending に見える ask ごとに `orca orchestration inbox --terminal dispatch:<asker dispatch> --full --json`
+  (読み取り専用、バインド不要。最大 5 件・同じ受信箱は 1 回)で `thread_id` = ask の messageId、`from_handle` が
+  `run:` の回答行を探す。回答無し → 従来どおり `ask`。回答あり・`read: 1`(簡易表示は `handled: true`)→
+  受け取り済みなので `asks[]` から外して warnings。回答あり・未読 → `asks[]` から外し `undeliveredAsks[]` と
+  `kind: ask_undelivered` に回す(phase は `decision_gate` にせず、`implementation` / `starting` / `settling` なら
+  `blocked`。`attentionRequired: true`)。inbox が読めなければ従来どおり `ask` に残して warnings。
+- asker の worker は `ask_undelivered` のときも `agent_prompt` に出さない(二重掲載の排除)。
+- 回復は人手: asker の pane で `orca orchestration ask --resume <messageId> --json` を実行させる
+  (回答済みなのですぐ返る)。MCP から pane へ打ち込む機能(`terminal send`)は作らない(低レベル API を公開しない方針)。
+- `orca_reply_message` も事後確認をする: asker の handle(dispatch-show の `assignee_handle`)を coordinator に持つ
+  Run を run-list で探し、あれば `delivery.wakeLikelyBlocked: true` + warnings + `nextAction`(上の --resume 案内)。
+  読み取りだけで、失敗しても reply の結果は変えない(`wakeLikelyBlocked: null` + warnings)。
+
 ### phase
 
 - pending のゲート**か ask** があるときだけ `decision_gate`。
@@ -69,7 +95,8 @@
 | kind | 案内 |
 | --- | --- |
 | `gate` | `question` / `options` を確認し `orca_resolve_gate` |
-| `ask` | `question` / `options` を確認し `orca_reply_message({ messageId, body, run })` で回答する(タイムアウト後も asker は `--resume` で待つので遅れて届いてよい) |
+| `ask` | `question` / `options` を確認し `orca_reply_message({ messageId, body, run })` で回答する(asker は `--wait` / `--resume` で自分で読む) |
+| `ask_undelivered` | `orca_reply_message` をもう一度呼ばない。asker の pane で `ask --resume <messageId>` を実行させる |
 | `task_report` | 報告を読み、`orca_send_message` で指示するか `orca_cancel_task` |
 | `agent_prompt` | エージェントが入力待ち(承認プロンプトまたは Commander の待機)。MCP からは解除できない。`detail.outputTail` と `looksLikePrompt` で見極める。待機中なら `orca_send_message` / cancel |
 | `unknown` | `orca_get_task_result` と terminal を確認 |

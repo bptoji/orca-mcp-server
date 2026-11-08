@@ -208,6 +208,24 @@ export function extractTasks(result: JsonObject): JsonObject[] {
  * orca CLI を型付きメソッドで叩くクライアント。
  * runner を注入できるので、テストでは子プロセスを実際に起動せずに検証できる。
  */
+/**
+ * orchestration サブコマンドには常に `--full` を付ける(テスト対象)。
+ *
+ * Orca 1.4.246(PR #36498、2026-10-31)から orchestration の出力は既定でエージェント向けの簡易表示になり、
+ * `--full` で従来のプリンタ(1.4.245 までと同じ出力)に戻る。簡易表示は項目を落とすだけでなく、失敗時の
+ * `ok` / 終了コードや envelope の形も変える。2026-11-08 実測(1.4.250)で簡易表示に無かった項目:
+ * task-list の parent_id / result / created_by_* / created_at、worker-list の agentTerminalHandle /
+ * workerState / projection / resource / page、worker-show の observation、run-list の coordinator_handle、
+ * inbox の thread_id / read。orca-mcp の正規化はすべて従来の出力を前提にしているので、一律に `--full` で読む。
+ * `--full` は 1.4.246 以上が必要(それ以前の CLI は未知のフラグとして拒否する)。
+ */
+export function withFullRecord(subcommand: string[]): string[] {
+  if (subcommand[0] !== "orchestration" || subcommand.includes("--full")) {
+    return subcommand;
+  }
+  return [...subcommand, "--full"];
+}
+
 export class OrcaClient {
   private readonly runner: CommandRunner;
   private readonly defaults: RunOptions;
@@ -218,7 +236,7 @@ export class OrcaClient {
   }
 
   private async call(subcommand: string[], options: RunOptions = {}): Promise<JsonObject> {
-    const args = buildArgs(subcommand);
+    const args = buildArgs(withFullRecord(subcommand));
     const result: OrcaCommandResult = await this.runner(args, {
       ...this.defaults,
       ...options,
@@ -485,6 +503,7 @@ export class OrcaClient {
   /**
    * `orca orchestration run-list` — Run の一覧(read-only)。
    * 実測応答は `result.runs[]` + `result.nextCursor`(keyset cursor)。
+   * 簡易表示の行は `{ id, objective }` だけで `coordinator_handle` が無い(`--full` は call() が付ける)。
    */
   runList(input: RunListInput = {}): Promise<JsonObject> {
     const args = ["orchestration", "run-list"];
