@@ -141,9 +141,15 @@ mutations against {{runId}} (task-create, worker-start, gate-create, send).
 Your terminal holds no seat there, so those mutations are refused with
 consumer_fenced — and taking the seat would block the caller.
 
-Do all of your work inside your own child Run:
+Decide first whether you will delegate. Doing the work yourself needs no Run:
+edit and test in your own worktree, ask the caller for approval (below), and
+report with worker_done. In that case do not create a child Run, and say in
+your final report that you did the work yourself without one.
 
-1. Create it once, with the caller's job marker at the start of the objective:
+Only when you delegate, put all delegated work inside your own child Run:
+
+1. Create it once, right before your first task-create, with the caller's job
+   marker at the start of the objective:
 
    orca orchestration run-create --objective "orca-mcp-parent: run={{runId}} task=<your task id> <short objective>" --json
 
@@ -444,3 +450,14 @@ MCP 経路 E2E)をこの 1 回で確認した。
   task は `failed` に確定)。
 - scripts/e2e.mjs に **sweep cancel** を追加(期限到来でも 1 本目が完了していなければ
   cascade cancel。1 回目の E2E で残留 running job が残った教訓)。
+
+## 14. 自分で作業する Commander は子 Run を作らない(2026-11-08)
+
+- 実測: 旧文言(`Do all of your work inside your own child Run: 1. Create it once …`)は委譲するかの判断より前に
+  子 Run の作成を指示していた。E2E 3 回とも、小さい goal の Commander は子 Run を作ってから自分で作業し、
+  task 0 件の子 Run が残った。cancel 用ジョブでは、cancel の sub-run 探索の直後(fence の約 2 秒前)に子 Run が作られた。
+- 方針: 小さく自己完結した goal は Commander が自分の worktree で作業してよい。そのときは子 Run を作らず、
+  最終報告にその旨を書く。委譲するときだけ、最初の task-create の直前に子 Run を 1 回作る。使わない子 Run は作らない。
+- 副次効果: 子 Run を持たない Commander は Run を coordinate しないので、ask 回答が配達されない
+  Orca 1.4.250〜1.4.253 の不具合(`mailbox-owner.ts`)の条件に当たらない。ask の `--wait` は引き続き必須にする。
+- poll / cancel / release は空の子 Run(`empty: true`)を拒否の理由にしない(旧来の Commander が作った分の互換)。

@@ -104,14 +104,14 @@ const resolveMyTask = async () => {
       const mine = terminals.find((row) => normalizePath(row.worktreePath) === myPath);
       if (mine?.handle) {
         // task-list は Run バインドが必要。このターミナルは未バインドなので run-list から辿る
-        const runs = runOrca(["orchestration", "run-list", "--limit", "20", "--json"]).runs ?? [];
+        const runs = runOrca(["orchestration", "run-list", "--limit", "20", "--full", "--json"]).runs ?? [];
         for (const runRow of runs) {
           const runId = typeof runRow?.id === "string" ? runRow.id : null;
           if (!runId) continue;
-          const tasks = runOrca(["orchestration", "task-list", "--run", runId, "--json"]).tasks ?? [];
+          const tasks = runOrca(["orchestration", "task-list", "--run", runId, "--full", "--json"]).tasks ?? [];
           for (const row of tasks) {
             if (typeof row.id !== "string") continue;
-            const dispatch = runOrca(["orchestration", "dispatch-show", "--task", row.id, "--json"]).dispatch;
+            const dispatch = runOrca(["orchestration", "dispatch-show", "--task", row.id, "--full", "--json"]).dispatch;
             if (dispatch?.assignee_handle === mine.handle) {
               const spec = row.spec ?? row.task_title ?? row.display_name ?? null;
               if (typeof spec === "string" && spec.length > 0) {

@@ -211,18 +211,18 @@ const resolveMyTask = async (deadlineMs = 90_000) => {
         // task-list は Run バインドが必要。このターミナルは未バインドなので run-list から辿る。
         // 新しい Run 4 本だけ(worker の dispatch は直近の Run にある)。広く回すと 1 周が
         // 20-30 秒になり、worker-start が完了した瞬間を素通りして取り逃す(実測デグレ)。
-        const runs = (runOrca(["orchestration", "run-list", "--limit", "10", "--json"]).runs ?? [])
+        const runs = (runOrca(["orchestration", "run-list", "--limit", "10", "--full", "--json"]).runs ?? [])
           .filter((row) => typeof row?.id === "string")
           .sort((a, b) => String(b?.created_at ?? "").localeCompare(String(a?.created_at ?? "")))
           .slice(0, 4);
         for (const runRow of runs) {
           if (outOfTime()) break;
           const runId = runRow.id;
-          const tasks = runOrca(["orchestration", "task-list", "--run", runId, "--json"]).tasks ?? [];
+          const tasks = runOrca(["orchestration", "task-list", "--run", runId, "--full", "--json"]).tasks ?? [];
           for (const row of tasks) {
             if (outOfTime()) break;
             if (typeof row.id !== "string") continue;
-            const dispatch = runOrca(["orchestration", "dispatch-show", "--task", row.id, "--json"]).dispatch;
+            const dispatch = runOrca(["orchestration", "dispatch-show", "--task", row.id, "--full", "--json"]).dispatch;
             if (dispatch?.assignee_handle !== mine.handle) continue;
             const spec = row.spec ?? row.task_title ?? row.display_name ?? null;
             if (typeof spec !== "string" || spec.length === 0) continue;

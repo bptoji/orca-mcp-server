@@ -216,6 +216,21 @@ export function mapTaskState(rawStatus: string | undefined): JobState {
   }
 }
 
+/**
+ * task 行 → Job API の state。orca-mcp の cancel は CLI に native の cancelled が無いので
+ * `status: failed` + `result: "cancelled: <reason>"` で記録する。poll / result / children ではそれを `cancelled` に戻す
+ * (2026-11-08 E2E 実測: cancel 直後の poll が `failed` を返し、README の「cancelled は MCP 側の論理状態」と食い違った)。
+ * 生の値は呼び出し側が rawStatus に残す。
+ */
+export function taskRowState(task: JsonObject | undefined): JobState {
+  const state = mapTaskState(pickString(task ?? {}, ["status", "state", "taskStatus"]));
+  const result = task?.["result"];
+  if (state === "failed" && typeof result === "string" && result.startsWith("cancelled:")) {
+    return "cancelled";
+  }
+  return state;
+}
+
 /** worker の生の状態(projection.outcome / workerState / dispatchStatus)→ 正規化 status。 */
 export function mapWorkerStatus(raw: string | undefined): string {
   switch (raw?.toLowerCase()) {
@@ -365,13 +380,15 @@ export function estimatePhase(
   return "starting";
 }
 
-export type BlockedKind = "gate" | "ask" | "task_report" | "agent_prompt" | "unknown";
+export type BlockedKind = "gate" | "ask" | "ask_undelivered" | "task_report" | "agent_prompt" | "unknown";
 
 const BLOCKED_HINTS: Record<BlockedKind, string> = {
   gate:
     "判断ゲートが pending。blockedReasons の question / options を確認し、承認/却下は orca_resolve_gate({ gateId, resolution, run }) — run には blockedReasons[].detail.runId(gates[].runId)を使う。sub-run 内のゲートは呼び出し元 Run と違う Run に属する",
   ask:
-    "ask(質問メッセージ)が pending で asker が回答待ち。blockedReasons の detail.messageId / question / options を確認し、orca_reply_message({ messageId, body: <選択肢の値>, run }) で答える(run には orca_delegate_task の runId)。asker はタイムアウト後も --resume で待っているので、遅れて回答しても届く",
+    "ask(質問メッセージ)が pending で asker が回答待ち。blockedReasons の detail.messageId / question / options を確認し、orca_reply_message({ messageId, body: <選択肢の値>, run }) で答える(run には orca_delegate_task の runId)。回答は asker が ask --wait / --resume で自分で読む(Orca の wake は子 Run の coordinator を兼ねる asker に届かない — Orca 1.4.250〜1.4.253 実測)。返信後に poll が ask_undelivered を出したら、もう一度 reply せずその案内に従う",
+  ask_undelivered:
+    "ask は回答済みだが asker が回答を読んでいない(Orca は子 Run の coordinator を兼ねる asker の pane に回答を配達しない — Orca 1.4.250〜1.4.253 の不具合)。orca_reply_message をもう一度呼ばない(同じ本文は duplicate、違う本文は answer_conflict になるだけで届かない)。asker(Commander)の pane で人間が「orca orchestration ask --resume <blockedReasons[].detail.messageId> --json を実行して回答を受け取り、続けてください」と入力して送る(回答済みなので --resume はすぐ返る)",
   task_report:
     "Commander / 子タスクが blocked を報告している。blockedReasons の内容を読み、orca_send_message で指示するか orca_cancel_task で止める",
   agent_prompt:
@@ -380,7 +397,7 @@ const BLOCKED_HINTS: Record<BlockedKind, string> = {
     "blocked の理由が特定できない。orca_get_task_result と terminal の出力を確認する",
 };
 
-const BLOCKED_KIND_ORDER: BlockedKind[] = ["gate", "ask", "task_report", "agent_prompt", "unknown"];
+const BLOCKED_KIND_ORDER: BlockedKind[] = ["gate", "ask", "ask_undelivered", "task_report", "agent_prompt", "unknown"];
 const MAX_REASON_TEXT = 2000;
 const MAX_ATTENTION_READS = 2;
 const ATTENTION_READ_LINES = 30;
@@ -605,6 +622,99 @@ export async function collectPendingAsks(
   }
 }
 
+/** poll 1 回で asker の受信箱(inbox --terminal dispatch:<id>)を読む ask 数の上限(並列)。 */
+const MAX_ASK_DELIVERY_PROBES = 5;
+
+export type AskDelivery = "unanswered" | "undelivered" | "received" | "unknown";
+
+/** ask 行から asker の dispatch 受信箱(`dispatch:<id>`)を決める。payload.dispatchId 優先、無ければ from_handle。 */
+function askerMailboxOf(ask: JsonObject): string | null {
+  const dispatchId = typeof ask["dispatchId"] === "string" ? (ask["dispatchId"] as string) : null;
+  if (dispatchId !== null && dispatchId.length > 0) {
+    return dispatchId.startsWith("dispatch:") ? dispatchId : `dispatch:${dispatchId}`;
+  }
+  const from = typeof ask["fromHandle"] === "string" ? (ask["fromHandle"] as string) : null;
+  return from !== null && from.startsWith("dispatch:") ? from : null;
+}
+
+/**
+ * asker 受信箱の行から、その ask(thread_id = messageId)への回答の配達状態を判定する(テスト対象)。
+ *
+ * 実測(2026-11-08、`inbox --terminal dispatch:<id> --full --json`): 回答は
+ * `{ type: "status", from_handle: "run:<親Run>", thread_id: <ask の messageId>, read: 0|1, delivered_at }`。
+ * 配達されなかった回答は `read: 0` / `delivered_at: null` のまま残り(Orca 1.4.250〜1.4.253 の不具合:
+ * Run の coordinator を兼ねる terminal には dispatch 宛てのメールを配達しない)、
+ * asker が `ask --resume` で読むと `read: 1` になる。簡易表示(--full 無し)は `handled` を返す。
+ */
+export function classifyAskDelivery(messageId: string, mailboxRows: JsonObject[]): AskDelivery {
+  const answers = mailboxRows.filter(
+    (row) =>
+      pickString(row, ["thread_id", "threadId"]) === messageId &&
+      pickString(row, ["id"]) !== messageId &&
+      (pickString(row, ["from_handle", "fromHandle", "from"]) ?? "").startsWith("run:"),
+  );
+  if (answers.length === 0) {
+    return "unanswered";
+  }
+  const isRead = (row: JsonObject): boolean =>
+    row["read"] === 1 || row["read"] === true || row["handled"] === true;
+  return answers.some(isRead) ? "received" : "undelivered";
+}
+
+/**
+ * pending に見える ask ごとに asker の受信箱を読み、回答済みかどうかを確かめる(読み取りのみ)。
+ *
+ * 背景(2026-11-07 / 11-08 実測・Orca 1.4.250、1.4.253 のソースでも同じ): reply 後も ask 行は
+ * 呼び出し Run の受信箱で unread のまま残り、poll は decision_gate を出し続ける。一方で回答は
+ * asker の dispatch 受信箱に未読で残り、子 Run の coordinator を兼ねる Commander には wake が届かない。
+ * ここで「回答済み・未読(undelivered)」「回答済み・既読(received)」を見分ける。
+ * inbox はバインドスコープではない(実測: 担当外の terminal から読めた)ので run-use は要らない。
+ * 失敗は unknown(= 従来どおり pending 扱い)にして warnings に留める。
+ */
+export async function classifyAskDeliveries(
+  client: OrcaClient,
+  asks: JsonObject[],
+  warnings: string[],
+): Promise<Map<string, AskDelivery>> {
+  const result = new Map<string, AskDelivery>();
+  if (asks.length === 0 || typeof (client as { inbox?: unknown }).inbox !== "function") {
+    return result;
+  }
+  const targets = asks
+    .map((ask) => ({
+      messageId: typeof ask["messageId"] === "string" ? (ask["messageId"] as string) : null,
+      mailbox: askerMailboxOf(ask),
+    }))
+    .filter((target): target is { messageId: string; mailbox: string } =>
+      target.messageId !== null && target.mailbox !== null,
+    );
+  if (targets.length > MAX_ASK_DELIVERY_PROBES) {
+    warnings.push(
+      `pending の ask が ${targets.length} 件あり、回答の配達確認は先頭 ${MAX_ASK_DELIVERY_PROBES} 件だけ行いました`,
+    );
+  }
+  const probed = targets.slice(0, MAX_ASK_DELIVERY_PROBES);
+  // 同じ asker の受信箱は 1 回だけ読む
+  const mailboxes = [...new Set(probed.map((target) => target.mailbox))];
+  const rowsByMailbox = new Map<string, JsonObject[] | null>();
+  await Promise.all(
+    mailboxes.map(async (mailbox) => {
+      try {
+        const payload = unwrapResult(await client.inbox({ terminal: mailbox, full: true }));
+        rowsByMailbox.set(mailbox, extractMessages(payload));
+      } catch (error) {
+        rowsByMailbox.set(mailbox, null);
+        warnings.push(`ask の回答配達の確認(inbox --terminal ${mailbox})に失敗: ${failureLine(error)}`);
+      }
+    }),
+  );
+  for (const target of probed) {
+    const rows = rowsByMailbox.get(target.mailbox);
+    result.set(target.messageId, rows === null || rows === undefined ? "unknown" : classifyAskDelivery(target.messageId, rows));
+  }
+  return result;
+}
+
 /**
  * blocked の理由を kind 別に集める(読み取りのみ)。
  * gate / task_report は task-list と gate-list の内容だけで決まる。agent_prompt は worker-read を足す。
@@ -617,12 +727,31 @@ export async function collectBlockedReasons(
     gates: JsonObject[];
     /** 呼び出し Run の受信箱に届いた pending の ask(type: question)。 */
     asks: JsonObject[];
+    /** 回答済みだが asker が読んでいない ask(classifyAskDeliveries の undelivered)。 */
+    undeliveredAsks?: JsonObject[];
     workers: JsonObject[];
     rootTaskId: string;
   },
   warnings: string[],
 ): Promise<JsonObject[]> {
   const reasons: JsonObject[] = [];
+  const undeliveredAsks = input.undeliveredAsks ?? [];
+
+  for (const ask of undeliveredAsks) {
+    const messageId = typeof ask["messageId"] === "string" ? (ask["messageId"] as string) : "<messageId>";
+    reasons.push({
+      kind: "ask_undelivered",
+      taskId: ask["taskId"] ?? null,
+      summary: `ask ${messageId} は回答済みだが asker が回答を読んでいない(Orca の wake が届いていない)。asker の pane で ask --resume ${messageId} を実行させる`,
+      detail: {
+        messageId: ask["messageId"] ?? null,
+        question: ask["question"] ?? null,
+        fromHandle: ask["fromHandle"] ?? null,
+        createdAt: ask["createdAt"] ?? null,
+        recoveryCommand: `orca orchestration ask --resume ${messageId} --json`,
+      },
+    });
+  }
 
   for (const ask of input.asks) {
     reasons.push({
@@ -667,7 +796,7 @@ export async function collectBlockedReasons(
   // 出力末尾がプロンプトらしいときだけ採用する(flagged = Orca が attention を立てたもの)
   // ask が pending の asker の worker は二重掲載しない(ask が一次情報。asker は回答までブロック中)。
   const askTaskIds = new Set(
-    input.asks
+    [...input.asks, ...undeliveredAsks]
       .map((ask) => (typeof ask["taskId"] === "string" ? ask["taskId"] : undefined))
       .filter((value): value is string => value !== undefined),
   );
@@ -835,7 +964,7 @@ export function toChildRow(child: JsonObject, workers: JsonObject[], sourceRunId
   return {
     taskId: pickString(child, ID_KEYS) ?? null,
     title: pickString(child, TITLE_KEYS) ?? null,
-    state: mapTaskState(rawStatus),
+    state: taskRowState(child),
     rawStatus: rawStatus ?? null,
     workers,
     resultPreview: preview(child["result"], 200),
@@ -920,7 +1049,13 @@ function toEpoch(value: unknown): number | undefined {
  */
 export function matchSubRuns(
   runs: JsonObject[],
-  input: { callerRunId: string | null; handles: readonly string[]; taskCreatedAt?: unknown },
+  input: {
+    callerRunId: string | null;
+    handles: readonly string[];
+    taskCreatedAt?: unknown;
+    /** 呼び出し元の Commander task。指定すると coordinator_handle が null の Run をマーカーで拾う。 */
+    callerTaskId?: string | null;
+  },
   limit: number = MAX_SUB_RUNS,
 ): JsonObject[] {
   const handles = new Set(input.handles.filter((handle) => typeof handle === "string" && handle.length > 0));
@@ -935,32 +1070,49 @@ export function matchSubRuns(
     const row = toRunRow(run);
     const runId = row["runId"];
     const handle = row["coordinatorHandle"];
-    if (typeof runId !== "string" || typeof handle !== "string") {
-      continue; // handle 無しは照合不能
+    if (typeof runId !== "string") {
+      continue;
     }
     if (input.callerRunId !== null && runId === input.callerRunId) {
       continue; // 呼び出し元 Run 自身
     }
-    if (!handles.has(handle)) {
-      continue;
+    let matchedBy: "handle" | "marker";
+    if (typeof handle === "string") {
+      if (!handles.has(handle)) {
+        continue;
+      }
+      matchedBy = "handle";
+    } else if (markerPointsToJob(row["objective"], input.callerRunId, input.callerTaskId)) {
+      // Commander の terminal が閉じると Orca は sub-run の coordinator_handle を null に書き換える
+      // (2026-11-08 E2E 実測: cancel 後の run_0d6a7b5964fd は coordinator_handle: null / consumer_generation 3)。
+      // handle では二度と照合できないので、objective マーカー(run と task の両方一致)を発見の候補にする。
+      // マーカーは誰でも書けるので、所有は classifySubRunOwnership が root の来歴で確かめる。
+      matchedBy = "marker";
+    } else {
+      continue; // handle 無し + マーカーも一致しない = 照合不能
     }
     const created = toEpoch(row["createdAt"]);
     if (created !== undefined && floor !== undefined && created < floor) {
       continue;
     }
-    matched.push(row);
+    matched.push({ ...row, matchedBy });
   }
-  return matched.slice(0, MAX_SUB_RUNS);
+  return matched.slice(0, limit);
+}
+
+/** objective マーカーが呼び出し元の run と task の**両方**を指すか(task 省略のマーカーは数えない)。 */
+function markerPointsToJob(objective: unknown, callerRunId: string | null, callerTaskId: string | null | undefined): boolean {
+  if (callerRunId === null || typeof callerTaskId !== "string" || callerTaskId.length === 0) {
+    return false;
+  }
+  const marker = parseParentMarker(objective);
+  return marker !== null && marker.runId === callerRunId && marker.taskId === callerTaskId;
 }
 
 /**
  * sub-run の root 配列から「Commander が作った root」を 1 件に絞る(複数 root は信頼度を落とす)。
  * 実測では 1 件(task_a9c5f6f06805)。複数ある = 同一 handle が複数の job を作っている可能性。
  */
-function primaryRoot(roots: JsonObject[]): JsonObject | null {
-  return roots.length === 1 ? (roots[0] as JsonObject) : null;
-}
-
 /* ---------------------------------------------------------------------------
  * sub-run の所有関係(review9 §4 / §6 の方針)
  *
@@ -1014,6 +1166,47 @@ export function buildTerminalIdentities(payload: JsonObject): Map<string, Termin
 }
 
 /**
+ * Commander の dispatch 記録から handle → 来歴の対応表を作る(テスト対象)。
+ *
+ * Commander の terminal が閉じると terminal list から消え、来歴を照合できなくなる(2026-11-08 E2E 実測:
+ * cancel 後の poll / release で sub-run が見えなくなった)。dispatch 記録は閉じた後も残り、
+ * Orca が dispatch 時に書いた `assignee_pane_key` / `process_incarnation` を持つ。値の書式は task 行の
+ * `created_by_pane_key` / `created_by_process_incarnation` と同じ(同日実測で sub-run root と文字列一致)。
+ * どちらも Orca が書く値で、エージェントが書き換えられる欄ではない。
+ */
+export function buildDispatchIdentities(payload: JsonObject): Map<string, ProvenanceAnchor> {
+  const anchors = new Map<string, ProvenanceAnchor>();
+  for (const dispatch of extractDispatches(payload)) {
+    const handle = pickString(dispatch, ["assignee_handle", "assigneeHandle"]);
+    if (handle === undefined || anchors.has(handle)) {
+      continue;
+    }
+    anchors.set(handle, {
+      paneKey: pickString(dispatch, ["assignee_pane_key", "assigneePaneKey"]) ?? null,
+      incarnation: pickString(dispatch, ["process_incarnation", "processIncarnation"]) ?? null,
+      source: "dispatch",
+    });
+  }
+  return anchors;
+}
+
+/** 来歴照合の基準 1 件(terminal list か Commander の dispatch 記録から作る)。 */
+export interface ProvenanceAnchor {
+  paneKey: string | null;
+  incarnation: string | null;
+  source: "terminal" | "dispatch";
+}
+
+function anchorFromTerminal(identity: TerminalIdentity): ProvenanceAnchor {
+  return {
+    paneKey: identity.tabId !== null && identity.leafId !== null ? `${identity.tabId}:${identity.leafId}` : null,
+    incarnation:
+      identity.ptyId !== null && identity.incarnationId !== null ? `${identity.ptyId}:${identity.incarnationId}` : null,
+    source: "terminal",
+  };
+}
+
+/**
  * objective へ書き込まれた親 Job マーカーを取り出す(テスト対象)。
  *
  * 書式: `orca-mcp-parent: run=<runId> task=<taskId>`(task 省略可)。
@@ -1045,7 +1238,8 @@ export interface OwnershipVerdict {
  *
  * verified  : coordinator_handle 一致 + pane key / incarnation の 2 系統が一致、矛盾なし
  * probable  : handle 一致のみ(来歴の確認が取れない)= 破壊的操作には使わない
- * unverified: handle 一致が取れない / root が特定できない
+ * unverified: handle 一致が取れない / root が 0 件
+ * root が複数(座分離契約の横並び root)なら全 root を個別に照合し、全件が 2 系統一致したときだけ verified。
  * conflicting: 来歴が矛盾する、またはマーカーが別の Run を指す
  */
 export function classifySubRunOwnership(input: {
@@ -1054,19 +1248,56 @@ export function classifySubRunOwnership(input: {
   handles: readonly string[];
   callerRunId: string | null;
   terminals: Map<string, TerminalIdentity>;
+  /** Commander の dispatch 記録の来歴(terminal list に Commander が居ないときの照合先)。 */
+  dispatchIdentities?: Map<string, ProvenanceAnchor>;
+  /** 呼び出し元の Commander task(マーカーの task 照合と、handle が null の Run の発見条件)。 */
+  callerTaskId?: string | null;
 }): OwnershipVerdict {
-  const handle = pickString(input.run, COORDINATOR_HANDLE_KEYS);
-  if (typeof handle !== "string" || !input.handles.includes(handle)) {
-    return {
-      ownership: "unverified",
-      cancelEligible: false,
-      verificationReasons: ["coordinator_handle が Commander の handle と一致しない"],
-      source: "none",
-    };
-  }
-  const reasons: string[] = ["coordinator_handle 一致"];
-
+  const coordinator = pickString(input.run, COORDINATOR_HANDLE_KEYS);
   const marker = parseParentMarker(input.run["objective"]);
+  const reasons: string[] = [];
+  let handle: string;
+  if (typeof coordinator === "string") {
+    if (!input.handles.includes(coordinator)) {
+      return {
+        ownership: "unverified",
+        cancelEligible: false,
+        verificationReasons: ["coordinator_handle が Commander の handle と一致しない"],
+        source: "none",
+      };
+    }
+    handle = coordinator;
+    reasons.push("coordinator_handle 一致");
+  } else {
+    // Commander の terminal が閉じて coordinator_handle が null になった Run(2026-11-08 E2E 実測)。
+    // マーカーが run / task の両方を指すときだけ候補にし、handle は root の作成者(= Commander の handle)で代える。
+    if (!markerPointsToJob(input.run["objective"], input.callerRunId, input.callerTaskId)) {
+      return {
+        ownership: "unverified",
+        cancelEligible: false,
+        verificationReasons: ["coordinator_handle が null で、objective マーカーも呼び出し元の run / task を指さない"],
+        source: "none",
+      };
+    }
+    const creator = input.roots
+      .map((root) => pickString(root, CREATED_BY_HANDLE_KEYS))
+      .find((value): value is string => value !== undefined && input.handles.includes(value));
+    if (creator === undefined) {
+      return {
+        ownership: "unverified",
+        cancelEligible: false,
+        verificationReasons: [
+          "coordinator_handle が null(Commander の terminal が閉じた後)",
+          "objective マーカーの親 run / task が一致",
+          "root が特定できない(0 件)",
+        ],
+        source: "explicit",
+      };
+    }
+    handle = creator;
+    reasons.push("coordinator_handle が null(Commander の terminal が閉じた後)、root の作成者が Commander の handle と一致");
+  }
+
   if (marker !== null) {
     if (input.callerRunId !== null && marker.runId !== null && marker.runId !== input.callerRunId) {
       return {
@@ -1076,72 +1307,134 @@ export function classifySubRunOwnership(input: {
         source: "explicit",
       };
     }
+    if (
+      typeof input.callerTaskId === "string" &&
+      marker.taskId !== null &&
+      marker.taskId !== input.callerTaskId
+    ) {
+      return {
+        ownership: "conflicting",
+        cancelEligible: false,
+        verificationReasons: [...reasons, `objective のマーカーが別の task(${marker.taskId})を指す`],
+        source: "explicit",
+      };
+    }
     reasons.push(marker.taskId !== null ? "objective マーカーの親 run / task が一致" : "objective マーカーの親 Run が一致");
   }
 
-  const root = primaryRoot(input.roots);
-  if (root === null) {
+  if (input.roots.length === 0) {
     return {
       ownership: "unverified",
       cancelEligible: false,
-      verificationReasons: [...reasons, `root が 1 件に特定できない(${input.roots.length} 件)`],
+      verificationReasons: [...reasons, "root が特定できない(0 件)"],
       source: marker !== null ? "explicit" : "handle",
     };
   }
 
-  const createdBy = pickString(root, CREATED_BY_HANDLE_KEYS);
-  if (createdBy !== undefined && createdBy !== handle) {
+  // root が複数でも、**全 root を個別に**来歴照合する(2026-11-08 実測: 座分離契約の Commander は子 Run に
+  // parent_id: null の task を横並びで 6 件作り、全行が同じ handle / pane key / incarnation を持つ)。
+  // 1 件でも矛盾すれば conflicting、全 root が 2 系統一致したときだけ verified。
+  // 照合先は terminal list を優先し、Commander の terminal が閉じていれば dispatch 記録に落とす。
+  const terminal = input.terminals.get(handle);
+  const anchor: ProvenanceAnchor | undefined =
+    terminal !== undefined ? anchorFromTerminal(terminal) : input.dispatchIdentities?.get(handle);
+  if (anchor?.source === "dispatch") {
+    reasons.push("Commander の terminal が terminal list に無いので dispatch 記録の来歴で照合");
+  }
+  let createdByMismatch = 0;
+  let conflicts = 0;
+  let unconfirmed = 0;
+  let paneMatched = 0;
+  let incarnationMatched = 0;
+  for (const root of input.roots) {
+    const check = checkRootProvenance(root, handle, anchor);
+    if (check.createdByMismatch) {
+      createdByMismatch += 1;
+      continue;
+    }
+    conflicts += check.conflicts;
+    if (check.paneMatched) {
+      paneMatched += 1;
+    }
+    if (check.incarnationMatched) {
+      incarnationMatched += 1;
+    }
+    if (!check.paneMatched || !check.incarnationMatched) {
+      unconfirmed += 1;
+    }
+  }
+  const total = input.roots.length;
+  const scope = total === 1 ? "" : `(root ${total} 件中 `;
+  const suffix = (count: number) => (total === 1 ? "" : `${count} 件)`);
+  if (createdByMismatch > 0) {
     return {
       ownership: "conflicting",
       cancelEligible: false,
-      verificationReasons: [...reasons, "root の created_by_terminal_handle が Commander の handle と違う"],
+      verificationReasons: [
+        ...reasons,
+        `root の created_by_terminal_handle が Commander の handle と違う${scope}${suffix(createdByMismatch)}`,
+      ],
       source: "provenance",
     };
   }
-
-  const identity = input.terminals.get(handle);
-  let matches = 0;
-  let conflicts = 0;
-  const paneKey = pickString(root, PANE_KEY_KEYS);
-  if (paneKey !== undefined) {
-    if (identity?.tabId !== null && identity?.leafId !== null && identity !== undefined) {
-      if (paneKey === `${identity.tabId}:${identity.leafId}`) {
-        matches += 1;
-        reasons.push("pane key(tabId:leafId)一致");
-      } else {
-        conflicts += 1;
-      }
-    }
-  }
-  const incarnation = pickString(root, PROCESS_INCARNATION_KEYS);
-  if (incarnation !== undefined) {
-    if (identity?.ptyId !== null && identity?.incarnationId !== null && identity !== undefined) {
-      if (incarnation === `${identity.ptyId}:${identity.incarnationId}`) {
-        matches += 1;
-        reasons.push("process incarnation(ptyId:incarnationId)一致");
-      } else {
-        conflicts += 1;
-      }
-    }
-  }
-
   if (conflicts > 0) {
     return {
       ownership: "conflicting",
       cancelEligible: false,
-      verificationReasons: [...reasons, `来歴の不一致が ${conflicts} 件`],
+      verificationReasons: [...reasons, `来歴の不一致が ${conflicts} 件${total === 1 ? "" : `(root ${total} 件を照合)`}`],
       source: "provenance",
     };
   }
-  if (matches >= 2) {
+  if (paneMatched === total) {
+    reasons.push(`pane key(tabId:leafId)一致${scope}${suffix(paneMatched)}`);
+  }
+  if (incarnationMatched === total) {
+    reasons.push(`process incarnation(ptyId:incarnationId)一致${scope}${suffix(incarnationMatched)}`);
+  }
+  if (unconfirmed === 0) {
     return { ownership: "verified", cancelEligible: true, verificationReasons: reasons, source: "provenance" };
   }
   return {
     ownership: "probable",
     cancelEligible: false,
-    verificationReasons: [...reasons, "pane key / incarnation の来歴確認が取れない"],
+    verificationReasons: [
+      ...reasons,
+      `pane key / incarnation の来歴確認が取れない${scope}${suffix(unconfirmed)}`,
+    ],
     source: marker !== null ? "explicit" : "handle",
   };
+}
+
+/** root 1 件の来歴を Commander の来歴(terminal / dispatch 記録)と照合する。値が無い系統は「確認できない」(矛盾ではない)。 */
+function checkRootProvenance(
+  root: JsonObject,
+  handle: string,
+  anchor: ProvenanceAnchor | undefined,
+): { createdByMismatch: boolean; conflicts: number; paneMatched: boolean; incarnationMatched: boolean } {
+  const createdBy = pickString(root, CREATED_BY_HANDLE_KEYS);
+  if (createdBy !== undefined && createdBy !== handle) {
+    return { createdByMismatch: true, conflicts: 0, paneMatched: false, incarnationMatched: false };
+  }
+  let conflicts = 0;
+  let paneMatched = false;
+  let incarnationMatched = false;
+  const paneKey = pickString(root, PANE_KEY_KEYS);
+  if (paneKey !== undefined && anchor !== undefined && anchor.paneKey !== null) {
+    if (paneKey === anchor.paneKey) {
+      paneMatched = true;
+    } else {
+      conflicts += 1;
+    }
+  }
+  const incarnation = pickString(root, PROCESS_INCARNATION_KEYS);
+  if (incarnation !== undefined && anchor !== undefined && anchor.incarnation !== null) {
+    if (incarnation === anchor.incarnation) {
+      incarnationMatched = true;
+    } else {
+      conflicts += 1;
+    }
+  }
+  return { createdByMismatch: false, conflicts, paneMatched, incarnationMatched };
 }
 
 /**
@@ -1191,7 +1484,7 @@ interface SubRunCapture {
   scanLimit: number;
   /** 照合が MAX_SUB_RUNS で打ち切られたか。 */
   subRunsTruncated: boolean;
-  /** 見つけた sub-run の所有関係がすべて verified か(0 件なら true)。 */
+  /** 見つけた sub-run の所有関係がすべて verified か(0 件なら true。task が無い sub-run は数えない)。 */
   ownershipComplete: boolean;
   /** sub-run 側の worker-list を読み切ったか(打ち切ったら false)。 */
   workerScanComplete: boolean;
@@ -1320,6 +1613,8 @@ async function captureSubRuns(
     handles: readonly string[];
     taskCreatedAt?: unknown;
     enabled: boolean;
+    /** 呼び出し元の Commander task。coordinator_handle が null の sub-run をマーカーで拾い、dispatch 記録を読むのに使う。 */
+    callerTaskId?: string | null;
   },
 ): Promise<SubRunCapture> {
   if (!input.enabled || typeof client.runList !== "function" || input.handles.length === 0) {
@@ -1354,7 +1649,12 @@ async function captureSubRuns(
 
   const matchedAll = matchSubRuns(
     rows,
-    { callerRunId: input.callerRunId, handles: input.handles, taskCreatedAt: input.taskCreatedAt },
+    {
+      callerRunId: input.callerRunId,
+      handles: input.handles,
+      taskCreatedAt: input.taskCreatedAt,
+      callerTaskId: input.callerTaskId ?? null,
+    },
     MAX_SUB_RUNS + 1,
   );
   const subRunsTruncated = matchedAll.length > MAX_SUB_RUNS;
@@ -1373,6 +1673,16 @@ async function captureSubRuns(
       terminals = buildTerminalIdentities(unwrapResult(await client.terminalList({ limit: 200 })));
     } catch (error) {
       warnings.push(`来歴照合の terminal list に失敗: ${failureLine(error)}`);
+    }
+  }
+  // Commander の terminal が terminal list に無い(閉じた後)ときだけ、dispatch 記録の来歴を読む(読み取りのみ・1 回)。
+  let dispatchIdentities = new Map<string, ProvenanceAnchor>();
+  const commanderPaneMissing = input.handles.every((handle) => !terminals.has(handle));
+  if (commanderPaneMissing && typeof input.callerTaskId === "string" && typeof client.dispatchShow === "function") {
+    try {
+      dispatchIdentities = buildDispatchIdentities(unwrapResult(await client.dispatchShow(input.callerTaskId)));
+    } catch (error) {
+      warnings.push(`来歴照合の dispatch-show に失敗: ${failureLine(error)}`);
     }
   }
 
@@ -1395,6 +1705,23 @@ async function captureSubRuns(
       const list = unwrapResult(await client.taskList({ run: runId, brief: false }));
       const tasks = extractTasks(list);
       const roots = selectSubRunRoots(tasks, input.handles);
+      if (tasks.length === 0) {
+        // 作られた直後で task がまだ無い sub-run(2026-11-08 E2E 実測: Commander が子 Run を run-create した
+        // 直後に cancel → 以前は unverified で cancel 全体を拒否し、Commander が走り続けた)。
+        // 止める対象が無いので所有は判定できないが、cancel / release を塞ぐ理由にもしない(`empty: true`)。
+        // cancel は停止後にこの Run の worker-list を task を問わず読み直し、競合で生まれた worker を残存として報告する。
+        capture.subRuns.push({
+          ...run,
+          taskCount: 0,
+          rootTaskIds: [],
+          empty: true,
+          ownership: "unverified",
+          cancelEligible: false,
+          verificationReasons: ["sub-run に task がまだ無い(止める対象なし)"],
+          discoverySource: run["matchedBy"] === "marker" ? "explicit" : "handle",
+        });
+        continue;
+      }
       if (roots.length === 0) {
         capture.subRuns.push({
           ...run,
@@ -1413,6 +1740,8 @@ async function captureSubRuns(
         handles: input.handles,
         callerRunId: input.callerRunId,
         terminals,
+        dispatchIdentities,
+        callerTaskId: input.callerTaskId ?? null,
       });
       capture.subRuns.push({
         ...run,
@@ -1464,7 +1793,8 @@ async function captureSubRuns(
       warnings.push(`sub-run ${runId} の読み集めに失敗: ${failureLine(error)}`);
     }
   }
-  capture.ownershipComplete = capture.subRuns.every((row) => row["ownership"] === "verified");
+  // task が無い sub-run(`empty: true`)は所有を判定する対象が無いので未完了に数えない(2026-11-08 E2E 実測: 使われなかった子 Run)。
+  capture.ownershipComplete = capture.subRuns.every((row) => row["ownership"] === "verified" || row["empty"] === true);
   return capture;
 }
 
@@ -1629,7 +1959,9 @@ per-command "--help" for the syntax you need, and note the fallback in your
 report. A worker that stalls on an unanswerable prompt blocks the whole job.
 
 Responsibilities:
-1. Inspect the repository and break the goal into well-scoped subtasks.
+1. Inspect the repository and decide whether to delegate. If the goal is small
+   and self-contained, so that delegating would cost more than it saves, do it
+   yourself in your own worktree. Otherwise break it into well-scoped subtasks.
 2. Delegate independent work to supervised workers, preferably in parallel.
 3. Review worker outputs and diffs, request corrections, and run applicable tests.
 4. Do not merge, push, deploy, delete branches, or modify production resources
@@ -1648,9 +1980,15 @@ Your task id is in your dispatch preamble; confirm it with:
 
    orca orchestration task-list --run {{runId}} --json
 
-Do all of your work inside your own child Run:
+Decide first whether you will delegate. Doing the work yourself needs no Run:
+edit and test in your own worktree, ask the caller for approval (below), and
+report with worker_done. In that case do not create a child Run, and say in
+your final report that you did the work yourself without one.
 
-1. Create it once, with the caller's job marker at the start of the objective:
+Only when you delegate, put all delegated work inside your own child Run:
+
+1. Create it once, right before your first task-create, with the caller's job
+   marker at the start of the objective:
 
    orca orchestration run-create --objective "orca-mcp-parent: run={{runId}} task=<your task id> <short objective>" --json
 
@@ -1667,6 +2005,8 @@ Do all of your work inside your own child Run:
 3. Record the child Run id in your final report, and finish every task inside
    it, so the caller's poll and cancel cover it.
 
+Never create a child Run that you will not use.
+
 Never create a Run to bypass a nested worker depth limit, a circuit-broken
 dispatch, a failed dispatch, or a missing Run binding: the version-matched
 guide says a new Run does not reset depth and must not route around those
@@ -1681,21 +2021,35 @@ Stop, report the exact error, and wait. Do not fight for the seat.
 
 Human approval — ask the caller:
 You own the human-facing decisions. Request approval with an ask. An ask is
-message-based, needs no seat, and blocks until the caller replies:
+message-based and needs no seat. Always ask in blocking mode with --wait, so
+the answer comes back as the command's own output:
 
-  orca orchestration ask --to run:{{runId}} --question '<question>' --options approve,reject --timeout-ms <n> --json
+  orca orchestration ask --to run:{{runId}} --question '<question>' --options approve,reject --wait --timeout-ms 540000 --json
 
+- Never ask without --wait, and do not end your turn while an ask is pending,
+  even if the receipt says "End your turn; Orca wakes you". Orca cannot wake
+  you with the answer once you have a child Run: your terminal coordinates it,
+  and Orca does not deliver Dispatch mail (ask answers) to a terminal that
+  coordinates a Run. An answer you do not read yourself with --wait / --resume
+  never arrives.
+- Run the ask with a shell-tool timeout longer than --timeout-ms (for example
+  600000 ms for 540000). If your shell tool cuts the command off first, the
+  question stays pending; collect it with --resume below.
 - An ask is only available while your supervised Dispatch is active.
 - Workers must not create gates, must not create Runs, and must not ask the
   caller directly: a worker that needs approval escalates to you (message
   level, into your child Run), and you decide and ask the caller.
 - Do not create gates for human approval, and do not create a gate on your
   own task. gate-list does not show asks.
-- If the ask times out, keep waiting with the same message id:
+- If the ask times out or is interrupted, keep waiting with the same message
+  id (--resume blocks until the answer, and returns at once if it has already
+  been answered):
 
-   orca orchestration ask --resume <messageId> --json
+   orca orchestration ask --resume <messageId> --timeout-ms 540000 --json
 
-  Do not re-ask the same question.
+  Repeat --resume until you get the answer. Do not re-ask the same question.
+- If anyone tells you an ask has been answered, collect the answer with
+  --resume <messageId>.
 - Never proceed without the answer, and never substitute your own judgement
   for a missing answer.
 
@@ -2038,7 +2392,7 @@ export async function getTaskStatus(client: OrcaClient, input: TaskStatusInput):
   const list = await client.taskList({ run: input.run, brief: false });
   const task = findTaskById(list, input.taskId);
   const rawStatus = pickString(task, ["status", "state", "taskStatus"]);
-  const state = mapTaskState(rawStatus);
+  const state = taskRowState(task);
   const runId = pickString(task, ["run_id", "runId"]) ?? input.run ?? null;
 
   // dispatch id は dispatch-show と task 行(dispatch_id)の両方から拾う
@@ -2066,11 +2420,21 @@ export async function getTaskStatus(client: OrcaClient, input: TaskStatusInput):
   // Commander が `run-create` で sub-run を作ると、その配下は呼び出し元 Run の
   // task-list に 1 件も現れない(実測: childCount: 0)。handle 照合で拾って合算する。
   const handles = commanderHandles(task, workers);
+  if (handles.length === 0) {
+    // 完了・cancel 後の task 行は assignee_handle が消える。dispatch 記録(読み済み)の assignee_handle で補う。
+    for (const dispatch of dispatchRows) {
+      const assignee = pickString(dispatch, ["assignee_handle", "assigneeHandle"]);
+      if (assignee !== undefined && !handles.includes(assignee)) {
+        handles.push(assignee);
+      }
+    }
+  }
   const subCapture = await captureSubRuns(client, {
     callerRunId: runId,
     handles,
     taskCreatedAt: task["created_at"] ?? task["createdAt"],
     enabled: input.includeSubRuns !== false && (dispatchIds.size > 0 || workers.length > 0),
+    callerTaskId: input.taskId,
   });
 
   const allChildTasks = [...findChildTasks(list, input.taskId), ...subCapture.childTasks];
@@ -2123,7 +2487,7 @@ export async function getTaskStatus(client: OrcaClient, input: TaskStatusInput):
       taskStateById.set(id, mapTaskState(pickString(row, ["status", "state", "taskStatus"])));
     }
   }
-  const pendingAsks = asks.filter((ask) => {
+  const unansweredOrTerminal = asks.filter((ask) => {
     const askTaskId = typeof ask["taskId"] === "string" ? ask["taskId"] : null;
     if (askTaskId === null) {
       return true;
@@ -2139,6 +2503,27 @@ export async function getTaskStatus(client: OrcaClient, input: TaskStatusInput):
     return false;
   });
 
+  // 受信箱の unread だけでは「回答済みか」が分からない(reply 後も ask 行は unread のまま残る)。
+  // asker の dispatch 受信箱を読み、回答済み・既読なら外し、回答済み・未読なら ask_undelivered に回す
+  // (2026-11-07 / 11-08 実測: 回答が asker に配達されず、poll は decision_gate を出し続けた)。
+  const deliveries = await classifyAskDeliveries(client, unansweredOrTerminal, warnings);
+  const undeliveredAsks: JsonObject[] = [];
+  const pendingAsks = unansweredOrTerminal.filter((ask) => {
+    const askMessageId = typeof ask["messageId"] === "string" ? (ask["messageId"] as string) : null;
+    const delivery = askMessageId === null ? undefined : deliveries.get(askMessageId);
+    if (delivery === "received") {
+      warnings.push(
+        `ask ${askMessageId} は回答済みで asker が回答を受け取っているので asks から外しました(同じ ask への 2 回目の返信をしないでください)`,
+      );
+      return false;
+    }
+    if (delivery === "undelivered") {
+      undeliveredAsks.push({ ...ask, delivery });
+      return false;
+    }
+    return true;
+  });
+
   const commander =
     workers.length > 0
       ? {
@@ -2148,7 +2533,13 @@ export async function getTaskStatus(client: OrcaClient, input: TaskStatusInput):
         }
       : null;
 
-  const phase = estimatePhase(state, [...workers, ...childWorkers], gates, pendingAsks);
+  const estimatedPhase = estimatePhase(state, [...workers, ...childWorkers], gates, pendingAsks);
+  // 回答が asker に届いていない ask があると Commander は回答待ちのまま進まない(人手で --resume が要る)。
+  // implementation / starting / settling と見せずに blocked に寄せる。
+  const phase: JobPhase =
+    undeliveredAsks.length > 0 && ["implementation", "starting", "settling"].includes(estimatedPhase)
+      ? "blocked"
+      : estimatedPhase;
   const blockedReasons = await collectBlockedReasons(
     client,
     {
@@ -2156,6 +2547,7 @@ export async function getTaskStatus(client: OrcaClient, input: TaskStatusInput):
       tasks: [task, ...childTasks],
       gates,
       asks: pendingAsks,
+      undeliveredAsks,
       workers: [...workers, ...childWorkers],
       rootTaskId: input.taskId,
     },
@@ -2200,6 +2592,7 @@ export async function getTaskStatus(client: OrcaClient, input: TaskStatusInput):
     subRunWorkerScanComplete: subCapture.workerScanComplete,
     gates,
     asks: pendingAsks,
+    undeliveredAsks,
     blockedReasons,
     warnings,
     workerReportPending,
@@ -2207,7 +2600,7 @@ export async function getTaskStatus(client: OrcaClient, input: TaskStatusInput):
     // 可能性がある。E2E で `orca skills get …` の承認待ち Commander が running のまま止まった。
     attentionRequired:
       workers.some((row) => row["requiresAttention"] === true) ||
-      blockedReasons.some((reason) => reason["kind"] === "agent_prompt"),
+      blockedReasons.some((reason) => reason["kind"] === "agent_prompt" || reason["kind"] === "ask_undelivered"),
     attentionNotes: workers
       .filter((row) => row["requiresAttention"] === true)
       .map(
@@ -2492,6 +2885,7 @@ export async function cancelTask(client: OrcaClient, input: CancelTaskInput): Pr
       handles,
       taskCreatedAt: task["created_at"] ?? task["createdAt"],
       enabled: true,
+      callerTaskId: input.taskId,
     });
     subCapture = {
       ...capture,
@@ -2524,7 +2918,13 @@ export async function cancelTask(client: OrcaClient, input: CancelTaskInput): Pr
       .filter((row) => row["cancelEligible"] === true && typeof row["runId"] === "string")
       .map((row) => row["runId"] as string),
   );
-  const unverifiedRuns = subCapture.subRuns.filter((row) => row["cancelEligible"] !== true);
+  // task が無い sub-run は止める対象が無いので拒否の理由にしない(停止後に task を問わず読み直す)。
+  const emptyRunIds = new Set(
+    subCapture.subRuns
+      .filter((row) => row["empty"] === true && typeof row["runId"] === "string")
+      .map((row) => row["runId"] as string),
+  );
+  const unverifiedRuns = subCapture.subRuns.filter((row) => row["cancelEligible"] !== true && row["empty"] !== true);
   if (unverifiedRuns.length > 0) {
     throw new JobError(
       "cancel_ownership_unverified",
@@ -2598,6 +2998,8 @@ export async function cancelTask(client: OrcaClient, input: CancelTaskInput): Pr
   const workers: JsonObject[] = [];
   const tasks: JsonObject[] = [];
   let fenceFailures = 0;
+  /** Commander のタスクが cancel の確定前に自分で終わっていたら、その状態(上書きしない)。 */
+  let rootSettled: { state: JobState; rawStatus: string | null } | undefined;
   // 同一 dispatch を 2 回叩かない(sub-run 集約と task ツリーが同じ dispatch を重ねて持つことがある)。
   const fencedDispatchIds = new Set<string>();
 
@@ -2668,6 +3070,30 @@ export async function cancelTask(client: OrcaClient, input: CancelTaskInput): Pr
     // sub-run 側のタスクは sub-run 名義で叩く(task-update の Run スコープは
     // バインドで決まるので、runMutation が consumer_fenced 時にその run へ切り替える)。
     const targetRun = typeof target["__runId"] === "string" ? (target["__runId"] as string) : (runId ?? undefined);
+    // fence の直前に自分で終わったタスクを cancelled で上書きしない(2026-11-08 E2E 実測: Commander が 14:22:11 に
+    // worker_done で完了 → 4 秒後の cancel の worker-stop は resultState: succeeded / processAction: none の空振り、
+    // 続く task-update が completed の task を failed / "cancelled: …" に書き換えた)。preflight の task-list は
+    // fence より前の状態なので、確定の直前に読み直す。読めなければ従来どおり確定する。
+    if (typeof targetRun === "string") {
+      const current = await readTaskState(client, targetRun, targetId);
+      if (current !== undefined && TERMINAL_STATES.includes(current.state)) {
+        tasks.push({
+          taskId: targetId,
+          state: current.state,
+          rawStatus: current.rawStatus,
+          settledBeforeCancel: true,
+          fenced,
+          runId: targetRun,
+        });
+        warnings.push(
+          `タスク ${targetId} は cancel の確定前に ${current.state} で終わっていたので、cancelled で上書きしていません`,
+        );
+        if (targetId === input.taskId) {
+          rootSettled = current;
+        }
+        continue;
+      }
+    }
     try {
       await runMutation(client, targetRun, () =>
         client.taskUpdate({
@@ -2706,12 +3132,17 @@ export async function cancelTask(client: OrcaClient, input: CancelTaskInput): Pr
   // P5(review9 §6): 停止後に worker を読み直し、残っている worker を正直に出す。
   // 探索を打ち切った(scanComplete: false / subRunsTruncated)場合は「全部止めた」と宣言しない。
   const cancelledTaskIds = new Set(tasks.map((row) => row["taskId"]).filter((id): id is string => typeof id === "string"));
-  const residualRuns = [runId, ...eligibleRunIds];
+  const residualRuns = [runId, ...eligibleRunIds, ...emptyRunIds];
   // 読み直せる Run が 1 つも無い = 残存 worker を検証できない(review11 §4 の安全側)。
   const residualUnverifiable = !residualRuns.some((run) => typeof run === "string" && run.length > 0);
   const scanIncomplete =
     !subCapture.scanComplete || subCapture.subRunsTruncated || !subCapture.workerScanComplete || residualUnverifiable;
-  const residual = await residualLiveWorkers(client, residualRuns, cancelledTaskIds);
+  const residual = await residualLiveWorkers(client, residualRuns, cancelledTaskIds, emptyRunIds);
+  if (emptyRunIds.size > 0) {
+    warnings.push(
+      `task がまだ無い sub-run ${emptyRunIds.size} 件(${[...emptyRunIds].join(", ")})は止める対象が無いので触っていません。停止後にその worker-list を読み直し、競合で起動した worker があれば residualWorkers に出します`,
+    );
+  }
   if (scanIncomplete) {
     warnings.push(
       residualUnverifiable
@@ -2721,6 +3152,34 @@ export async function cancelTask(client: OrcaClient, input: CancelTaskInput): Pr
   }
   if (residual.length > 0) {
     warnings.push(`停止後に読み直したところ ${residual.length} 個の worker が生存しています(pane を確認してください)`);
+  }
+
+  if (rootSettled !== undefined) {
+    // ジョブ自体は cancel より先に終わっていた。cancel したとは言わず、実際の状態を返す。
+    return {
+      taskId: input.taskId,
+      state: rootSettled.state,
+      rawStatus: rootSettled.rawStatus,
+      cancelled: false,
+      settledBeforeCancel: true,
+      fullyStopped: fenceFailures === 0 && !scanIncomplete && residual.length === 0,
+      cascade,
+      taskCount: tasks.length,
+      runId,
+      subRunsDiscovered: subCapture.subRuns.length,
+      subRuns: subCapture.subRuns,
+      subRunScanComplete: subCapture.scanComplete,
+      subRunsTruncated: subCapture.subRunsTruncated,
+      subRunOwnershipComplete: subCapture.ownershipComplete,
+      subRunWorkerScanComplete: subCapture.workerScanComplete,
+      residualWorkers: residual,
+      mode,
+      reason,
+      tasks,
+      workers,
+      warnings,
+      note: `ジョブは cancel の確定前に ${rootSettled.state} で終わっていたので、Commander のタスクは更新していません(子孫の停止・確定は上の tasks のとおり)。結果は orca_get_task_result で読めます`,
+    };
   }
 
   return {
@@ -2755,6 +3214,8 @@ async function residualLiveWorkers(
   client: OrcaClient,
   runs: Array<string | null>,
   taskIds: Set<string>,
+  /** task を問わず生存 worker を残存とみなす Run(preflight 時点で空だった sub-run)。 */
+  anyTaskRuns: ReadonlySet<string> = new Set(),
 ): Promise<JsonObject[]> {
   const LIVE = new Set(["running", "blocked", "queued", "unknown"]);
   const residual: JsonObject[] = [];
@@ -2779,11 +3240,11 @@ async function residualLiveWorkers(
       for (const row of scan.rows.map(toWorkerRow)) {
         const taskId = row["taskId"];
         const status = row["status"];
-        if (typeof taskId !== "string" || !taskIds.has(taskId)) {
+        if (!anyTaskRuns.has(run) && (typeof taskId !== "string" || !taskIds.has(taskId))) {
           continue;
         }
         if (typeof status === "string" && LIVE.has(status)) {
-          residual.push({ taskId, dispatchId: row["dispatchId"] ?? null, runId: run, status });
+          residual.push({ taskId: taskId ?? null, dispatchId: row["dispatchId"] ?? null, runId: run, status });
         }
       }
     } catch (error) {
@@ -2803,6 +3264,18 @@ export interface ReleaseTaskInput {
   /** 既定 true: verified な sub-run の worker も対象にする。 */
   includeSubRuns?: boolean;
 }
+
+/**
+ * retain されていても worker-release で閉じてよい `retainedReason`。
+ *
+ * `user_requested` は worker-keep-open の印で、1.4.250 は **新しい worktree(new-child / new-top-level)で起動した
+ * worker を既定でこれにする**(worker-start help: "a worker started in a new worktree … is kept open, so release it
+ * when no one will use its chat"。worker-release help: "call it … to clear a worker-keep-open")。orca-mcp の Commander は
+ * new-child で起動するので、完了後は必ず `user_requested` で残る(2026-11-08 E2E 実測: 4 ジョブすべて)。
+ * Orca 本体も `user_requested` は release を進め、UI の Keep open(`user_kept`)と引き取り(`user_takeover`)だけを
+ * retained で拒否する(`worker-terminal-ownership.ts` / `worker-terminal-release.ts`)。
+ */
+const RELEASABLE_RETAINED_REASONS: ReadonlySet<string> = new Set(["user_requested"]);
 
 /** 1 回の release で閉じる terminal 数の上限(cancel の 12 タスク × 3 dispatch に揃える)。 */
 const MAX_RELEASES = MAX_CASCADE_TASKS * MAX_FENCE_PER_TASK;
@@ -2837,7 +3310,8 @@ export async function releaseTask(client: OrcaClient, input: ReleaseTaskInput): 
   const list = await client.taskList({ run: input.run, brief: false });
   const task = findTaskById(list, input.taskId);
   const rawStatus = pickString(task, ["status", "state", "taskStatus"]);
-  const state = mapTaskState(rawStatus);
+  // cancel 済み(failed + "cancelled: …")は poll / result と同じく cancelled で返す(2026-11-08 E2E: release だけ failed だった)。
+  const state = taskRowState(task);
   const runId = pickString(task, ["run_id", "runId"]) ?? input.run ?? null;
   const cascade = input.cascade ?? true;
 
@@ -2891,6 +3365,7 @@ export async function releaseTask(client: OrcaClient, input: ReleaseTaskInput): 
       handles,
       taskCreatedAt: task["created_at"] ?? task["createdAt"],
       enabled: true,
+      callerTaskId: input.taskId,
     });
     warnings.push(...subCapture.warnings);
     if (subCapture.scanFailed || !subCapture.scanComplete || subCapture.subRunsTruncated) {
@@ -2898,8 +3373,9 @@ export async function releaseTask(client: OrcaClient, input: ReleaseTaskInput): 
     }
   }
   // 閉じるのは verified な sub-run だけ(cancel と同じ境界)。それ以外は報告して触らない。
+  // task が無い sub-run は閉じる worker も無いので skipped に数えない。
   const skippedSubRuns = subCapture.subRuns
-    .filter((row) => row["cancelEligible"] !== true)
+    .filter((row) => row["cancelEligible"] !== true && row["empty"] !== true)
     .map((row) => ({
       runId: row["runId"] ?? null,
       ownership: row["ownership"] ?? null,
@@ -2952,8 +3428,9 @@ export async function releaseTask(client: OrcaClient, input: ReleaseTaskInput): 
       } else if (row["status"] !== "completed" && row["status"] !== "failed") {
         // help: worker-release は settled(succeeded / failed)な worker の後片付け専用
         skipped.push({ ...base, reason: "not_settled", status: row["status"] ?? null });
-      } else if (retainedReason !== undefined) {
-        // worker-retain はユーザーの明示的な例外。worker-release はそれを解除してしまうので触らない
+      } else if (retainedReason !== undefined && !RELEASABLE_RETAINED_REASONS.has(retainedReason)) {
+        // user_kept(UI の Keep open)/ user_takeover(pane での引き取り)などはユーザーの意図か Orca が閉じない理由。
+        // `user_requested` は keep-open で、新しい worktree の worker は既定でこれになる(下の定数)ので閉じてよい。
         skipped.push({ ...base, reason: "user_retained", retainedReason });
       } else if (row["status"] === "failed" && isLiveVerdict(row["liveness"])) {
         reportSuspects.push(base);
@@ -3245,6 +3722,14 @@ export async function replyMessage(client: OrcaClient, input: ReplyMessageInput)
   );
   const replyRow = isJsonObject(replied["message"]) ? (replied["message"] as JsonObject) : replied;
 
+  // reply 自体は成功している。ここからは読み取りだけの事後確認で、失敗しても reply の結果は変えない。
+  const warnings: string[] = [];
+  const delivery = await inspectAskerDelivery(client, askRow, warnings);
+  const recovery =
+    delivery["wakeLikelyBlocked"] === true
+      ? `asker(Commander)の pane で人間が「orca orchestration ask --resume ${input.messageId} --json を実行して回答を受け取り、続けてください」と入力して送る。orca_reply_message はもう一度呼ばない(届かない原因は回答ではなく配達)`
+      : null;
+
   return {
     ok: true,
     messageId: input.messageId,
@@ -3255,9 +3740,84 @@ export async function replyMessage(client: OrcaClient, input: ReplyMessageInput)
     taskId: askTaskId,
     runId: input.run,
     body: input.body,
-    warnings: [],
-    note: "reply を実行しました。asker の ask は回答を受け取りブロックが解けます(タイムアウト済みなら ask --resume で受け取れます)",
+    delivery,
+    warnings,
+    note:
+      "reply を実行しました。回答は Orca に記録済みです。asker が ask --wait / --resume でブロック中ならすぐ受け取ります。" +
+      "ターンを終えて wake を待っている asker には届かないことがあるので、poll で ask_undelivered が出ないか確認してください",
+    ...(recovery !== null ? { nextAction: recovery } : {}),
   };
+}
+
+/**
+ * reply の事後確認: asker の terminal が Run の coordinator を兼ねているか(読み取りのみ)。
+ *
+ * Orca 1.4.250〜1.4.253 の配達先判定(mailbox-owner.ts の resolve)は、terminal が Run を
+ * coordinate していると `run:` 受信箱しか見ず、`dispatch:` 宛ての回答を配達しない。
+ * orca-mcp の Commander は子 Run を作るので該当する(2026-11-07 / 11-08 実測で 2 件)。
+ * asker の handle は dispatch-show の assignee_handle、Run は run-list の coordinator_handle で照合する
+ * (sub-run 探索と同じ照合キー)。読めなければ wakeLikelyBlocked: null で warnings に残す。
+ */
+async function inspectAskerDelivery(
+  client: OrcaClient,
+  askRow: JsonObject,
+  warnings: string[],
+): Promise<JsonObject> {
+  const delivery: JsonObject = {
+    askerMailbox: askerMailboxOf(askRow),
+    askerHandle: null,
+    askerCoordinatedRuns: [],
+    wakeLikelyBlocked: null,
+  };
+  const askerTaskId = typeof askRow["taskId"] === "string" ? (askRow["taskId"] as string) : null;
+  const capable = client as { dispatchShow?: unknown; runList?: unknown };
+  if (askerTaskId === null || typeof capable.dispatchShow !== "function" || typeof capable.runList !== "function") {
+    warnings.push(
+      "asker への配達経路を確認できませんでした(asker task または読み取りコマンドが無い)。poll で ask_undelivered が出ないか確認してください",
+    );
+    return delivery;
+  }
+  let handle: string | undefined;
+  try {
+    const shown = unwrapResult(await client.dispatchShow(askerTaskId));
+    handle = pickString(isJsonObject(shown["dispatch"]) ? (shown["dispatch"] as JsonObject) : shown, [
+      "assignee_handle",
+      "assigneeHandle",
+    ]);
+  } catch (error) {
+    warnings.push(`asker の terminal を確認できませんでした(dispatch-show 失敗): ${failureLine(error)}`);
+    return delivery;
+  }
+  if (handle === undefined) {
+    warnings.push("asker の terminal handle が dispatch-show に無く、配達経路を確認できませんでした");
+    return delivery;
+  }
+  delivery["askerHandle"] = handle;
+  let scan: PagedScan;
+  try {
+    scan = await scanRunRows(client);
+  } catch (error) {
+    warnings.push(`asker が coordinate する Run を確認できませんでした(run-list 失敗): ${failureLine(error)}`);
+    return delivery;
+  }
+  const coordinated = scan.rows
+    .filter((run) => pickString(run, COORDINATOR_HANDLE_KEYS) === handle)
+    .map((run) => pickString(run, RUN_ID_KEYS))
+    .filter((id): id is string => id !== undefined);
+  delivery["askerCoordinatedRuns"] = coordinated;
+  if (coordinated.length > 0) {
+    delivery["wakeLikelyBlocked"] = true;
+    warnings.push(
+      `asker の terminal ${handle} は Run ${coordinated.join(", ")} の coordinator を兼ねています。Orca(1.4.250〜1.4.253)はこの terminal に回答(dispatch 宛てのメール)を配達しないので、asker が ask --wait / --resume でブロック中でなければ回答は読まれません`,
+    );
+  } else if (scan.complete) {
+    delivery["wakeLikelyBlocked"] = false;
+  } else {
+    warnings.push(
+      `run-list を最後まで読めなかったため(${SCAN_STOP_TEXT[scan.stopReason]})、asker が Run を coordinate しているかは未確定です`,
+    );
+  }
+  return delivery;
 }
 
 /** includeChildren で読む子タスク数の上限。 */
@@ -3283,7 +3843,7 @@ export async function getTaskResult(client: OrcaClient, input: TaskResultInput):
   const list = await client.taskList({ run: input.run, brief: false });
   const task = findTaskById(list, input.taskId);
   const rawStatus = pickString(task, ["status", "state", "taskStatus"]);
-  const state = mapTaskState(rawStatus);
+  const state = taskRowState(task);
   const runId = pickString(task, ["run_id", "runId"]) ?? input.run ?? null;
 
   const dispatchIds = await dispatchIdsOf(client, task, input.taskId);
@@ -3323,6 +3883,7 @@ export async function getTaskResult(client: OrcaClient, input: TaskResultInput):
       handles: await commanderHandlesWithDispatch(client, task, input.taskId),
       taskCreatedAt: task["created_at"] ?? task["createdAt"],
       enabled: input.includeSubRuns !== false,
+      callerTaskId: input.taskId,
     });
     const subDispatchByTask = new Map<string, string[]>();
     for (const worker of subCapture.workers) {
@@ -3375,7 +3936,7 @@ export async function getTaskResult(client: OrcaClient, input: TaskResultInput):
       children.push({
         taskId: childId,
         title: pickString(child, TITLE_KEYS) ?? null,
-        state: mapTaskState(pickString(child, ["status", "state", "taskStatus"])),
+        state: taskRowState(child),
         result: child["result"] ?? null,
         resultPreview: preview(child["result"], 500),
         sourceRunId: child["__runId"] ?? null,

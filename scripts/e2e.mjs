@@ -43,13 +43,16 @@ const options = {
     "goal",
     "README.md の末尾に「E2E ask 承認検証」セクションを 1 つ追記する(実施日と、実行した MCP ツール名を 3〜5 行の箇条書き)。" +
       "追記後に npm test を実行して結果を報告する。変更は README.md のみに限定する。" +
-      "完了前に、親 Run へ orca orchestration ask --to run:<親RunId> --options approve,redo --timeout-ms 600000 " +
-      "で人間の承認を 1 回求め、回答が返るまで ask --resume <messageId> で待つ。" +
+      "完了前に、親 Run へ orca orchestration ask --to run:<親RunId> --options approve,redo --wait --timeout-ms 540000 " +
+      "で人間の承認を 1 回求め、回答が返るまで ask --resume <messageId> --timeout-ms 540000 で待つ(ターンを終えて wake を待たない)。" +
       "redo の場合は追記を差し戻してから完了報告する。",
   ),
   cancelGoal: readFlag(
     "cancel-goal",
-    "新規ファイル e2e-cancel-note.md を作り、その中に E2E-CANCEL という 1 行だけ書く。",
+    // cancel の検証用: 子 Run + worker まで進んだジョブを止める(sub-run の cascade cancel を通す)。
+    // 小さい goal は Commander が自分で済ませて cancel 前に完了してしまう(2026-11-08 実測)ので、委譲を必須にする。
+    "cancel 経路の E2E 検証用ジョブ。自分では作業せず、必ず子 Run を作って supervised worker 1 名に委譲すること。" +
+      "worker への指示: まず 120 秒待ってから、新規ファイル e2e-cancel-note.md を作り、その中に E2E-CANCEL という 1 行だけ書く。",
   ),
 };
 
@@ -318,7 +321,8 @@ const main = async () => {
   let cancelView = null;
   let cancelledSummary = {};
   if (typeof cancelTaskId === "string") {
-    for (let index = 0; index < 6; index += 1) {
+    // 子タスク(sub-run の worker)が見えるまで待つ。workers には Commander 自身が入るので条件にしない。
+    for (let index = 0; index < 12; index += 1) {
       const status = await call("orca_get_task_status", { taskId: cancelTaskId, run: cancelRunId });
       cancelView = status.parsed;
       log(
@@ -326,10 +330,10 @@ const main = async () => {
           ` workers=${(cancelView?.workers ?? []).length}` +
           ` subRuns=${cancelView?.subRunsDiscovered ?? 0}`,
       );
-      if ((cancelView?.childCount ?? 0) > 0 || (cancelView?.workers ?? []).length > 0) {
+      if ((cancelView?.childCount ?? 0) > 0 || ["completed", "failed", "cancelled"].includes(cancelView?.state)) {
         break;
       }
-      await sleep(20_000);
+      await sleep(15_000);
     }
 
     const cancelled = await call("orca_cancel_task", { taskId: cancelTaskId, run: cancelRunId, reason: "E2E cancel 検証" });
@@ -338,7 +342,9 @@ const main = async () => {
         ` fullyStopped=${cancelled.parsed?.fullyStopped} taskCount=${cancelled.parsed?.taskCount}` +
         ` subRunsDiscovered=${cancelled.parsed?.subRunsDiscovered ?? 0}` +
         ` residual=${(cancelled.parsed?.residualWorkers ?? []).length}` +
-        ` scanComplete=${cancelled.parsed?.subRunScanComplete}`,
+        ` scanComplete=${cancelled.parsed?.subRunScanComplete}` +
+        ` settledBeforeCancel=${cancelled.parsed?.settledBeforeCancel ?? false}` +
+        ` subRuns=${JSON.stringify((cancelled.parsed?.subRuns ?? []).map((row) => `${row.runId}:${row.ownership}${row.empty ? "(empty)" : ""}`))}`,
     );
     record("cancel", cancelled.parsed);
     cancelledSummary = cancelled.parsed ?? {};
@@ -347,11 +353,26 @@ const main = async () => {
     }
 
     const after = await call("orca_get_task_status", { taskId: cancelTaskId, run: cancelRunId });
-    log(`cancel 後 state=${after.parsed?.state} children=${after.parsed?.childCount ?? 0}`);
+    // cancel で Commander の terminal が閉じると Orca は子 Run の coordinator_handle を null にする(2026-11-08 実測)。
+    // それでも子 Run がマーカー + dispatch 記録の来歴で verified のまま見えることを確かめる。
+    log(
+      `cancel 後 state=${after.parsed?.state} children=${after.parsed?.childCount ?? 0}` +
+        ` subRuns=${JSON.stringify((after.parsed?.subRuns ?? []).map((row) => `${row.runId}:${row.ownership}:handle=${row.coordinatorHandle ?? "null"}`))}`,
+    );
     record("cancel_after", {
       state: after.parsed?.state,
       children: (after.parsed?.children ?? []).map((child) => ({ taskId: child.taskId, state: child.state })),
+      subRuns: after.parsed?.subRuns ?? [],
     });
+
+    // 後片付け: cancel 後(Commander の terminal が閉じた後)の release が子 Run の worker まで閉じるか。
+    const released = await call("orca_release_task", { taskId: cancelTaskId, run: cancelRunId });
+    log(
+      `cancel 後 release isError=${released.isError} released=${released.parsed?.releasedCount}` +
+        ` already=${(released.parsed?.alreadyReleased ?? []).length} fullyReleased=${released.parsed?.fullyReleased}` +
+        ` skippedSubRuns=${(released.parsed?.skippedSubRuns ?? []).length} subRunsDiscovered=${released.parsed?.subRunsDiscovered ?? 0}`,
+    );
+    record("cancel_release", released.parsed);
   }
 
   // ---------------------------------------------------------------- 7. 後片付け

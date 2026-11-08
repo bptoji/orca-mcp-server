@@ -49,7 +49,9 @@ MCP クライアント(Claude Code / Claude Desktop / dsh など)から使えま
 ### 必要環境
 
 - Node.js **>= 20**(開発は v24 で検証)
-- PATH 上に `orca` CLI(または `ORCA_BIN` 環境変数でバイナリパスを指定)
+- PATH 上に `orca` CLI **1.4.246 以上**(または `ORCA_BIN` 環境変数でバイナリパスを指定)。
+  orchestration コマンドには常に `--full` を付けて従来の完全な出力を読みます(1.4.246 から既定の出力は
+  項目の欠けた簡易表示になったため。`--full` が無い 1.4.245 以前は未知のフラグとして拒否されます)
 - 大半の操作は起動中の Orca ランタイムが必要(未起動なら `orca open`)
 - **MCP サーバー専用の Orca ターミナル**: orchestration コマンド(`run-create` など)は送信元ターミナルを要求する。
   Orca アプリ上で専用ターミナルを 1 つ立て、**その pane 内で MCP サーバーを起動する**(pane が持つ
@@ -190,6 +192,8 @@ providers 列挙にそのエージェント名は出ない)。`orca_delegate_tas
 5. `state: "blocked"` / `phase: "decision_gate"` になったら `blockedReasons` と `asks` / `gates` を読む:
    - **ask**(新契約の承認、`asks[]` に出る)→ `orca_reply_message({ messageId, body, run })` で答える(`body` は ask の `--options` で出した選択肢の値。`approve` / `reject` など)
    - ゲート(旧契約のジョブ、`gates[]` に出る)→ `orca_resolve_gate({ gateId, resolution, run })`
+   - **`kind: ask_undelivered`**(`undeliveredAsks[]` に出る。回答済みなのに Commander が読んでいない)→ **もう一度 reply しない**。
+     Commander の pane で人間が `orca orchestration ask --resume <messageId> --json` を実行させる(下の「ask の回答が届かない」)
 6. 取り消すときだけ `orca_cancel_task({ taskId, reason })`(既定で子孫 worker も子から順に止める。**sub-run の worker も Commander より先に止める**)
 7. `state: "completed"` になったら `orca_get_task_result({ taskId })`。ワーカー個々の成果まで欲しければ `includeChildren: true`
    - 読み終わったら `orca_release_task({ taskId, run })` で worker の terminal を閉じる(完了しても terminal は `retained` のまま残る)
@@ -275,9 +279,11 @@ orca_get_task_result({ taskId: "task_abc123", includeChildren: true })
   旧契約のジョブ(sub-run 内の承認用子タスクのゲート)との互換用で、新契約では空配列に寄ります。
 - **`asks[]` は呼び出し Run の受信箱に届いている pending の ask**(`type: question`、`--peek` で unread のみ)。
   行は `messageId`(= CLI の `thread_id`)/ `question` / `options` / `taskId` / `dispatchId` /
-  `fromHandle` / `createdAt`。Commander が ask した(= `ask --resume` で答えを待っている)間は
-  `phase: decision_gate` に寄ります。答えるには `orca_reply_message({ messageId, body, run })`
-  (タイムアウト後も asker は `--resume` で待つので、遅れて届いて構いません)。
+  `fromHandle` / `createdAt`。Commander が ask した(= `ask --wait` / `--resume` で答えを待っている)間は
+  `phase: decision_gate` に寄ります。答えるには `orca_reply_message({ messageId, body, run })`。
+  **poll は asker の dispatch 受信箱(`inbox --terminal dispatch:<id> --full`)も読み、回答の配達を確かめます**:
+  回答済みで asker が受け取っていれば `asks[]` から外し(`warnings` に記録)、回答済みなのに未読なら
+  `asks[]` から外して `undeliveredAsks[]` / `kind: ask_undelivered` に回します(`phase` は `decision_gate` にしない)。
   **asker task がすでに終端(`completed` / `failed` / `cancelled`)の ask は `asks[]` から外します**
   (実測 2026-10-22: reply の後も ask 行はしばらく受信箱に残るため、外さないと poll ループが
   同じ ask に 2 回目の返信を送ってしまいます。外した行は `warnings` に記録します。sub-run 由来の ask は
@@ -286,6 +292,7 @@ orca_get_task_result({ taskId: "task_abc123", includeChildren: true })
   `child`(直接の子タスク)で、どちらが止まっているかを示します。`kind` は
   `gate`(質問文 + `detail.gateId` / `detail.runId` / `detail.options`)/
   `ask`(pending の ask。`detail` に `messageId` / `question` / `options`。**新契約では承認は ask なのでこちらが主役**)/
+  `ask_undelivered`(回答済みだが asker が読んでいない ask。`detail` に `messageId` / `recoveryCommand`)/
   `task_report`(Commander・子タスクの blocked 報告 `result`)/
   `agent_prompt`(入力待ちの worker。`detail` に `outputTail` / `outputHash` / `looksLikePrompt` / `observedAt` / `activity`、Orca が判定したときは `agentWait`(`source: hook / prompt-text / title`、`reason` / `since`)。
   MCP からは解除不可。`looksLikePrompt` は文言からの推定。`outputHash` は呼び出し側が前回値と比べて動作中かを判定する。
@@ -308,15 +315,17 @@ orca_get_task_result({ taskId: "task_abc123", includeChildren: true })
 
   | `ownership` | 意味 | `cancelEligible` |
   | --- | --- | --- |
-  | `verified` | handle + `created_by_pane_key`(tabId:leafId)+ `created_by_process_incarnation`(ptyId:incarnationId)が terminal list と一致し矛盾なし | `true` |
+  | `verified` | handle + `created_by_pane_key`(tabId:leafId)+ `created_by_process_incarnation`(ptyId:incarnationId)が terminal list と一致し矛盾なし(root が複数なら全 root で一致)。Commander の terminal が閉じた後は Commander の dispatch 記録(`assignee_pane_key` / `process_incarnation`)と照合する | `true` |
   | `probable` | handle 一致のみ(来歴の確認が取れない) | `false` |
-  | `unverified` | handle 一致なし / root が特定できない | `false` |
-  | `conflicting` | 来歴が矛盾する、または objective のマーカーが別の Run を指す | `false` |
+  | `unverified` | handle 一致なし / Commander が作った root が無い | `false` |
+  | `conflicting` | 来歴が矛盾する、または objective のマーカーが別の Run / 別の task を指す | `false` |
 
 - 根拠は `verificationReasons[]`、発見の経路は `discoverySource`(`explicit` / `provenance` / `handle`)。
   objective の `orca-mcp-parent: run=<caller runId> task=<your task id>` マーカーは**発見の候補**に使い、
   これだけで `verified` にはしません(誰でも書けるため)。新契約の依頼文はこのマーカーを objective の
   先頭に置く子 Run を Commander に必ず作らせるので、通常はマーカー付き sub-run がこの発見経路で拾われます。
+  Commander の terminal が閉じると(cancel / release の後)Orca は sub-run の `coordinator_handle` を `null` にするので、
+  そのときはマーカーが呼び出し元の run と task の両方を指す Run だけを候補にし、来歴(dispatch 記録)で所有を確かめます。
 - スキャンの正直さも応答に出します: `subRunScanComplete`(ページ上限で打ち切ったら false)/
   `subRunsTruncated`(照合が `MAX_SUB_RUNS` 超で打ち切られた)/ `subRunScanPageCount` / `subRunScanRunCount` /
   `subRunOwnershipComplete`(全 sub-run が verified か)/ `subRunWorkerScanComplete`(sub-run 側の worker-list を
@@ -406,7 +415,7 @@ orca_release_task({ taskId: "task_abc123", run: "run_…" })   // ジョブが�
 
 `orca_release_task` が触るのは **settled(succeeded / failed)な worker だけ**です。走っている worker(`skipped` の
 `not_settled`)、launch token 無しで dispatch だけ失敗し pane がまだ動いている worker(`report_pending` — 後から
-`task-update` で報告が届き得る)、ユーザーが `worker-retain` した / 引き取った worker(`user_retained` — pane で承認に答えただけでも引き取り扱いになる。
+`task-update` で報告が届き得る)、ユーザーが UI で Keep open した / 引き取った worker(`user_retained` — pane で承認に答えただけでも引き取り扱いになる。新しい worktree の worker に Orca が既定で付ける keep-open(`user_requested`)は閉じます。
 件数は `retainedByUserCount` で、`fullyReleased` は落とさない)、所有確認が verified でない sub-run
 (`skippedSubRuns`)には触りません。`worker-release` は閉じる前に出力を archive するので、閉じた後も
 `orca_get_task_result` で worker 出力を読めます(すでに止まっていた worker は archive が取れないことがあります —
@@ -415,8 +424,8 @@ orca_release_task({ taskId: "task_abc123", run: "run_…" })   // ジョブが�
 閉じたと数えるのは receipt が `released` / `already_released` のものだけです(`releasedCount`)。`release_pending` は
 `pendingCount`、`retained` は `notClosedCount`、`release_unknown` などは `failedCount` に分け、閉じていない行には
 Orca の `lastError` / `recovery` を添えます。pane がすでに消えた worker は Orca が「プロセスが消えたと証明できない」として
-`release_unknown` を返すので(実測)、古いジョブの後片付けは `fullyReleased: false` になります。Commander の terminal を閉じると
-sub-run の所有確認(terminal list の来歴)が取れなくなるため、sub-run を含む後片付けは 1 回の呼び出しで済ませてください。
+`release_unknown` を返すので(実測)、古いジョブの後片付けは `fullyReleased: false` になります。Commander の terminal が
+閉じた後(cancel 後など)も、sub-run は objective マーカーで見つけ、所有は Commander の dispatch 記録の来歴で確かめます。
 
 - `type` は CLI が受け付ける種別のみ(`status / dispatch / worker_done / merge_ready / escalation /
   handoff / decision_gate / question / heartbeat`)。**`worker_done` には `outcome` と `dispatchId` が必須**
@@ -441,6 +450,17 @@ sub-run の所有確認(terminal list の来歴)が取れなくなるため、su
   `ask --to run:<親Run>` で人間の判断を依頼し、ゲートは作りません(`gate-list` に ask は現れません — 実測)。
   受信は poll の `asks[]` / `blockedReasons`(`kind: ask`)、回答は `orca_reply_message`。
   旧契約のジョブ(sub-run 内の承認用子タスクのゲート)は `orca_resolve_gate` のままで解決します
+- **ask の回答が届かない(Orca 1.4.250〜1.4.253 の不具合、2026-11-07 / 11-08 実測)**: Orca は Run の
+  coordinator を兼ねる terminal に `dispatch:` 宛てのメール(= ask の回答)を配達しません
+  (`mailbox-owner.ts` の `resolve()`)。Commander は子 Run の coordinator なので、ターンを終えて wake を待つと
+  回答は永久に届きません(1.4.250 の ask は Dispatch からだと即座に返り "End your turn; Orca wakes you" と案内する)。
+  そこで `COMMANDER_PROMPT` は ask を**必ず `--wait --timeout-ms 540000`**(シェルツールのタイムアウトはそれより長く)で
+  ブロックさせ、タイムアウト・中断は `ask --resume <messageId>` を繰り返させます。
+  それでも届かなかった(古いジョブ・指示違反)場合は poll が `ask_undelivered` を出し、`orca_reply_message` も
+  asker の terminal が Run を coordinate していれば `delivery.wakeLikelyBlocked: true` + `warnings` + `nextAction` で
+  知らせます。回復は Commander の pane に「`orca orchestration ask --resume <messageId> --json` を実行して回答を受け取り、
+  続けてください」と打って送るだけです(回答は記録済みなのですぐ返ります)。**同じ ask にもう一度 reply しない**
+  (同じ本文は `duplicate: true`、違う本文は `answer_conflict` で、どちらも届きません)
 - **`orca_reply_message` の `run` は必須**(`check` / `reply` も Run バインドスコープ)。
   点検は `check --all` で行い、受信箱に見つからなければ `ask_not_found` で**何も変更せずに**拒否します。
   **同じ ask への返信には冪等性がありません**(実測 2026-10-22: 同じ ask に 2 回返信しても、
@@ -662,6 +682,7 @@ poll を打ち切る前に数回待ってください。**launcher 運用では�
 | `running` のまま progress が止まる | エージェントの**ツール承認プロンプト**で worker が停止 | `attentionNotes` をたどって pane を確認。codex は `--approve-for-me`、claude は `agentDefaultArgs.claude` の `--permission-mode acceptEdits --allowedTools Bash …` |
 | claude の worker が `dispatched` のまま動かない、pane に `Not logged in` | claude の auth 切れ(権限設定ではない) | Orca 側のアカウント紐づけ / pane で `/login` |
 | `blocked` / `phase: "decision_gate"` | 承認待ち(新契約は **ask**、旧契約はゲート) | `asks[]` に ask が出ていれば `orca_reply_message({ messageId, body, run })` で答える(`body` は `--options` の選択肢。`approve` / `reject` など)。旧契約のゲートは `blockedReasons` の `question` / `options` を読み、`orca_resolve_gate({ gateId, resolution, run })` で進める(`run` には `gates[].runId` を使う) |
+| `kind: ask_undelivered`(reply したのに Commander が進まない) | Orca が Run の coordinator を兼ねる Commander に ask の回答を配達しない(1.4.250〜1.4.253) | reply し直さない。Commander の pane で `orca orchestration ask --resume <messageId> --json` を実行させる(`detail.recoveryCommand`) |
 | `blocked` / `phase: "blocked"`(`gates` も `asks` も空) | ゲート / ask 以外の停止(Commander の blocked 報告、承認プロンプトなど) | `blockedReasons` の `kind` を確認(`task_report` は `orca_send_message` / cancel、`agent_prompt` は pane で人間が答える) |
 | `consumer_fenced` | 呼び出し元の Run バインドが対象と違う | 介入ツールは自動で `run-use` して 1 回だけ再試行します。worker 側なら自分の terminal を 1 回バインド |
 | poll の `childCount: 0` のまま Commander が進み、cancel でも worker が止まらない | Commander が自分の terminal で `run-create` を作り、仕事が **別の sub-run** に移った(`task-list` は Run スコープ) | 既定の sub-run 集約で拾います(`subRunsDiscovered` / `children[].sourceRunId`)。`orca_list_runs` で Run を直接見る。Commander Prompt に「既存 Run を使う / 深さ・circuit-break 回避の run-create は作らない / 作ったならマーカーと報告」を書き込んでいます |
