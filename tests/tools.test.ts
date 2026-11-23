@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { McpServer } from "@modelcontextprotocol/server";
 import { createServer, SERVER_NAME, SERVER_VERSION } from "../src/index.js";
@@ -153,6 +154,13 @@ describe("createServer", () => {
   it("サーバー名とバージョン", () => {
     expect(SERVER_NAME).toBe("orca-mcp");
     expect(SERVER_VERSION).toMatch(/^\d+\.\d+\.\d+$/);
+  });
+
+  it("サーバーのバージョンは package.json の version と一致する(正本は package.json)", () => {
+    const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {
+      version: string;
+    };
+    expect(SERVER_VERSION).toBe(pkg.version);
   });
 });
 

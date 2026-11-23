@@ -17,6 +17,17 @@ TypeScript (ESM) + `@modelcontextprotocol/server` (SDK v2) + zod v4 + vitest で
 | 開発実行(ビルド不要) | `npm run dev` |
 | 本番実行 | `npm start`(先に `npm run build` が必要) |
 
+## バージョンとリリース
+
+- 番号は SemVer。正本は `package.json` の `version` だけ(`SERVER_VERSION` は起動時に読む。テストで一致を固定)。
+  上げ方の基準は `CHANGELOG.md` の冒頭。
+- 機能・修正の PR では `CHANGELOG.md` の「未リリース」に 1 行足す。
+- リリース: ブランチで `npm version <patch|minor|major> --no-git-tag-version` → CHANGELOG の「未リリース」を
+  `[x.y.z] - 日付` に移し比較リンクを足す → PR をマージ → master で
+  `gh release create vX.Y.Z --target master --title vX.Y.Z --notes-file <その版の節>`(タグは GitHub 側で作る)。
+- 個人リポジトリなので、コミットのアドレスは `bptoji@mac.com`(リポジトリ単位の git 設定)。マージは `gh pr merge` を使わず
+  ブラウザで行う(API のマージはアカウントのプライマリアドレスになる)。
+
 ## フォルダ構成と役割
 
 ```

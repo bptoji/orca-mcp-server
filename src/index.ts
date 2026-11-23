@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { readFileSync } from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { McpServer } from "@modelcontextprotocol/server";
@@ -21,7 +22,12 @@ import { startHttpServer } from "./server/http.js";
 // 未登録の足場(低レベルすぎる API を外部に出さない): tools/delegate.ts / tools/message.ts
 
 export const SERVER_NAME = "orca-mcp";
-export const SERVER_VERSION = "1.0.0";
+/**
+ * バージョンの正本は package.json(`npm version` で上げる)。src/ からも dist/ からも 1 つ上にある。
+ */
+export const SERVER_VERSION: string = (
+  JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string }
+).version;
 
 /** 登録済みツールを備えた McpServer を生成する(テスト・インポート利用時もここを使う)。 */
 export function createServer(client: OrcaClient = new OrcaClient()): McpServer {
