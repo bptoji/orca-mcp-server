@@ -2,6 +2,9 @@
 
 [Orca](https://github.com/stablyai/orca) の CLI(`orca`)を MCP 経由で操作するための MCP サーバーです。
 
+> **非公式プロジェクトです。** Orca の開発元とは関係がなく、Orca 本体の機能でもありません。
+> Orca CLI の出力形式に依存しているので、Orca の更新で動かなくなることがあります(前提バージョンは[必要環境](#必要環境))。
+
 **「この機能を作って」と頼んだら、Orca の中でエージェントが仕事をして、その進捗と結果を受け取れる**
 ゲートウェイです。あなたが渡すのは「作ってほしいもの」と「守ってほしい制約」だけ。
 読み取り・実装・テストは Commander と呼ばれるエージェントが受け持ち、必要なら複数のワーカー
@@ -62,6 +65,8 @@ MCP クライアント(Claude Code / Claude Desktop / dsh など)から使えま
 ### インストール
 
 ```bash
+git clone https://github.com/bptoji/orca-mcp-server.git
+cd orca-mcp-server
 npm install
 npm run build     # src → dist
 npm test          # vitest(orca ランタイム不要の単体テスト)
@@ -76,13 +81,13 @@ npm test          # vitest(orca ランタイム不要の単体テスト)
   "mcpServers": {
     "orca": {
       "command": "node",
-      "args": ["C:\\Users\\<your-user>\\<repo-dir>\\orca-mcp\\dist\\index.js"]
+      "args": ["C:\\Users\\<your-user>\\<repo-dir>\\orca-mcp-server\\dist\\index.js"]
     }
   }
 }
 ```
 
-macOS / Linux では `"args": ["/home/<your-user>/<repo-dir>/orca-mcp/dist/index.js"]` のように絶対パスで指定します。
+macOS / Linux では `"args": ["/home/<your-user>/<repo-dir>/orca-mcp-server/dist/index.js"]` のように絶対パスで指定します。
 ビルドに依存したくない開発中は `"command": "npx"` + `"args": ["tsx", "src/index.ts"]` でも動きます。
 
 ### 別 PC から使う(HTTP トランスポート)
@@ -739,7 +744,7 @@ poll を打ち切る前に数回待ってください。**launcher 運用では�
 ### 構成
 
 ```
-orca-mcp/
+orca-mcp-server/
 ├─ src/
 │  ├─ index.ts          # エントリ(createServer + stdio / http の分岐)
 │  ├─ orca/
@@ -775,7 +780,9 @@ orca-mcp/
 │  ├─ design/sub-run-observability.md           # sub-run の観測・取消(§7 に実測での是正記録)
 │  └─ design/run-seat-ownership.md              # 座分離契約 + ask 承認の設計(§12 に実装記録)
 ├─ tests/               # orca ランタイム不要の単体テスト(job.test.ts は偽 client)
+├─ .github/workflows/ci.yml  # CI(typecheck / test / build + コミットのアドレス点検)
 ├─ AGENTS.md            # エージェント向け開発規約
+├─ CONTRIBUTING.md / SECURITY.md / LICENSE
 ├─ package.json
 └─ tsconfig.json        # 開発用(noEmit) / tsconfig.build.json: ビルド用
 ```
@@ -791,3 +798,12 @@ orca-mcp/
 - リポジトリの文章は日本語で書く(README・AGENTS.md・ツールの title/description・テスト名)
 
 開発規約全体は [AGENTS.md](./AGENTS.md) にあります。
+
+## コントリビューション・セキュリティ
+
+- Issue・PR の出し方は [CONTRIBUTING.md](./CONTRIBUTING.md)
+- 脆弱性は公開の Issue に書かず、[SECURITY.md](./SECURITY.md) の手順で非公開に知らせてください
+
+## ライセンス
+
+[MIT License](./LICENSE)

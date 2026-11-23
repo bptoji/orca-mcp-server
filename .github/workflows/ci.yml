@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            node: 22
+          - os: ubuntu-latest
+            node: 24
+          - os: windows-latest
+            node: 24
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
+  commit-emails:
+    # コミットの作者・コミッターのアドレスを点検する。
+    # 照合パターンはリポジトリの secret(FORBIDDEN_EMAIL_PATTERN、grep -E の正規表現)に置き、
+    # ワークフローにもログにも値を出さない(一致したコミットのハッシュだけを出す)。
+    # secret が無い実行(fork からの PR など)は点検を飛ばす。
+    name: commit emails
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check commit emails
+        env:
+          PATTERN: ${{ secrets.FORBIDDEN_EMAIL_PATTERN }}
+        run: |
+          if [ -z "$PATTERN" ]; then
+            echo "::notice::FORBIDDEN_EMAIL_PATTERN が無いので点検を飛ばします"
+            exit 0
+          fi
+          hits=$(git log --all --format='%H %ae %ce' | grep -iE -- "$PATTERN" | cut -d' ' -f1 || true)
+          if [ -n "$hits" ]; then
+            echo "::error::禁止したアドレスのコミットがあります:"
+            echo "$hits"
+            exit 1
+          fi
+          echo "OK"
