@@ -6,7 +6,12 @@ import {
   buildWorktreeName,
   cancelTask,
   classifySubRunOwnership,
+  classifyTurnUnobserved,
   collectDescendants,
+  detectAuthFailure,
+  isTurnUnobservedWorker,
+  looksLikeWorking,
+  splitComposer,
   commanderSpec,
   estimatePhase,
   extractApprovalPrompt,
@@ -653,6 +658,19 @@ describe("delegateTask(submit / Commander API)", () => {
     expect((result["warnings"] as string[])[0]).toContain("outcome_unknown");
     expect(result["nextAction"] as string).toContain("delegate し直さない");
     expect(calls.filter((call) => call.startsWith("workerStart:")).length).toBe(1);
+  });
+
+  it("outcome_unknown の stage が turn_start_unobserved なら、pane で Enter を押す案内を warnings に足す", async () => {
+    // 2026-11-23 実測: Codex を同時に起動すると receipt が outcome_unknown / turn_start_unobserved で返り、pane の Enter で始まった
+    const { client } = createFakeClient({
+      workerStartReceipt: { dispatchId: "ctx_turn", state: "outcome_unknown", stage: "turn_start_unobserved" },
+    });
+    const result = await delegateTask(client, { spec: "a", commanderAgent: "codex" });
+    expect(result["state"]).toBe("queued");
+    expect(result["startOutcome"]).toBe("unknown");
+    const warnings = result["warnings"] as string[];
+    expect(warnings).toContainEqual(expect.stringContaining("turn_unobserved"));
+    expect(warnings).toContainEqual(expect.stringContaining("Enter"));
   });
 
   it("worker-start が consumer_fenced なら run-use で切り替えて 1 回だけ再試行する", async () => {
@@ -1480,6 +1498,196 @@ describe("getTaskStatus(poll) — Commander の配下", () => {
     expect((view["warnings"] as string[] | undefined) ?? []).not.toContainEqual(
       expect.stringContaining("出力取得に失敗"),
     );
+  });
+});
+
+describe("指示文が送信されない worker(turn_unobserved)と認証切れ(agent_auth)", () => {
+  // 2026-11-23 実測の画面(Codex 0.166.0 を同時に 3 体起動して止まった 2 体。入力欄は空で placeholder も無い)
+  const stuckCodexScreen = [
+    "  >_ OpenAI Codex (v0.166.0)",
+    "     ~\\orca\\orca-mcp",
+    "  permissions: YOLO mode",
+    "›",
+    "  GPT-6.1-Sol default · ~\\orca\\orca-mcp",
+  ].join("\n");
+  // 同日実測: Enter の後に作業を始めた画面
+  const workingCodexScreen = [
+    "• I’m using the orchestration skill to report completion.",
+    "• Working (14s • esc to interrupt)",
+    "› Ask Codex to do anything",
+    "  GPT-6.1-Sol default · ~\\orca\\orca-mcp · Follow Orca worker instructions",
+    "  ? for shortcuts",
+  ].join("\n");
+  const idleCodexScreen = [
+    "• OK",
+    "  Worked for 28s • 11:30",
+    "› Ask Codex to do anything",
+    "  GPT-6.1-Sol default · ~\\orca\\orca-mcp",
+    "  ? for shortcuts",
+  ].join("\n");
+
+  /** worker-list の実測の形(start_unknown / turn_start_unobserved / activity: done / outcome: in_progress)。 */
+  const stuckWorker = (overrides: { activity?: string; provider?: string; requiresAction?: boolean } = {}) => ({
+    dispatchId: "disp_1",
+    taskId: "task_cmd",
+    workerState: "start_unknown",
+    dispatchStatus: "pending",
+    agentTerminalHandle: "term_stuck",
+    projection: {
+      provider: { id: overrides.provider ?? "codex", model: null },
+      stage: {
+        worker: "start_unknown",
+        dispatch: "pending",
+        detail: "turn_start_unobserved",
+        activity: overrides.activity ?? "done",
+      },
+      outcome: "in_progress",
+      liveness: { verdict: "live" },
+      attention: { categories: [], requiresAction: overrides.requiresAction ?? false },
+    },
+  });
+
+  const pollWith = async (worker: JsonObject, text: string) => {
+    const { client, calls } = createFakeClient({
+      taskList: { ok: true, result: { tasks: [{ id: "task_cmd", status: "dispatched" }] } },
+      dispatchShow: { ok: true, result: { dispatches: [{ dispatchId: "disp_1" }] } },
+      workerList: { ok: true, result: { workers: [worker] } },
+      workerRead: { ok: true, result: { terminal: { tail: text.split("\n"), source: "screen" } } },
+    });
+    const view = await getTaskStatus(client, { taskId: "task_cmd" });
+    return { view, calls, reasons: view["blockedReasons"] as JsonObject[] };
+  };
+
+  it("toWorkerRow は projection.stage.detail を stageDetail に載せる", () => {
+    const row = toWorkerRow(stuckWorker());
+    expect(row["stageDetail"]).toBe("turn_start_unobserved");
+    expect(row["status"]).toBe("running"); // outcome: in_progress なので running に見える(だから別の判定が要る)
+    expect(isTurnUnobservedWorker(row)).toBe(true);
+    expect(isTurnUnobservedWorker(toWorkerRow(stuckWorker({ activity: "working" })))).toBe(false);
+  });
+
+  it("止まった Codex(入力欄が空で placeholder も無い)は submit_missing として Enter を促し、phase は blocked", async () => {
+    const { view, reasons } = await pollWith(stuckWorker(), stuckCodexScreen);
+    expect(reasons.map((reason) => reason["kind"])).toEqual(["turn_unobserved"]);
+    expect(reasons[0]?.["detail"]).toMatchObject({
+      dispatchId: "disp_1",
+      agent: "codex",
+      terminalHandle: "term_stuck",
+      stage: "turn_start_unobserved",
+      suspectedCause: "submit_missing",
+    });
+    expect(String(reasons[0]?.["summary"])).toContain("Enter");
+    expect(view["phase"]).toBe("blocked");
+    expect(view["attentionRequired"]).toBe(true);
+    expect(view["nextAction"]).toContain("Enter を 1 回押す");
+  });
+
+  it("Enter の後(activity: working)は stage が turn_start_unobserved のままでも何も出さず、出力も読まない", async () => {
+    const { view, calls } = await pollWith(stuckWorker({ activity: "working" }), workingCodexScreen);
+    expect(view["blockedReasons"]).toEqual([]);
+    expect(view["attentionRequired"]).toBe(false);
+    expect(calls.some((call) => call.startsWith("workerRead:"))).toBe(false);
+  });
+
+  it("activity が古くても、画面が作業中(esc to interrupt)なら何も出さない", async () => {
+    const { view } = await pollWith(stuckWorker(), workingCodexScreen);
+    expect(view["blockedReasons"]).toEqual([]);
+  });
+
+  it("入力欄に placeholder が出ている画面は原因を断定せず unknown にする", async () => {
+    const { reasons } = await pollWith(stuckWorker(), idleCodexScreen);
+    expect(reasons.map((reason) => reason["kind"])).toEqual(["turn_unobserved"]);
+    expect((reasons[0]?.["detail"] as JsonObject)["suspectedCause"]).toBe("unknown");
+  });
+
+  it("出力が読めなくても turn_unobserved は出す(原因は unknown、失敗は warnings)", async () => {
+    const { client } = createFakeClient({
+      taskList: { ok: true, result: { tasks: [{ id: "task_cmd", status: "dispatched" }] } },
+      dispatchShow: { ok: true, result: { dispatches: [{ dispatchId: "disp_1" }] } },
+      workerList: { ok: true, result: { workers: [stuckWorker()] } },
+    });
+    client.workerRead = (async () => {
+      throw new Error("terminal_unavailable");
+    }) as unknown as typeof client.workerRead;
+    const view = await getTaskStatus(client, { taskId: "task_cmd" });
+    const reasons = view["blockedReasons"] as JsonObject[];
+    expect(reasons.map((reason) => reason["kind"])).toEqual(["turn_unobserved"]);
+    expect((reasons[0]?.["detail"] as JsonObject)["suspectedCause"]).toBe("unknown");
+    expect(view["warnings"] as string[]).toContainEqual(expect.stringContaining("turn_unobserved の原因推定"));
+  });
+
+  it("起動直後に認証エラーの画面なら、Enter ではなく agent_auth を出す(claude の実測文言)", async () => {
+    const screen = ["Welcome to Claude Code", "Not logged in · Please run /login", "> "].join("\n");
+    const { view, reasons } = await pollWith(stuckWorker({ provider: "claude" }), screen);
+    expect(reasons.map((reason) => reason["kind"])).toEqual(["agent_auth"]);
+    expect(reasons[0]?.["detail"]).toMatchObject({ agent: "claude", turnUnobserved: true, terminalHandle: "term_stuck" });
+    expect(String((reasons[0]?.["detail"] as JsonObject)["matchedPattern"])).toMatch(/not logged in/i);
+    expect(view["phase"]).toBe("blocked");
+    expect(view["attentionRequired"]).toBe(true);
+    expect(view["nextAction"]).toContain("ログイン");
+  });
+
+  it("入力欄に残った指示文の中の 401 / login では agent_auth にしない(submit_missing のまま)", async () => {
+    const screen = [
+      "  >_ OpenAI Codex (v0.166.0)",
+      "› You are working inside Orca … fix the 401 Unauthorized handling; Not signed in users see codex login",
+      "  GPT-6.1-Sol default · ~\\orca\\orca-mcp",
+    ].join("\n");
+    const { reasons } = await pollWith(stuckWorker(), screen);
+    expect(reasons.map((reason) => reason["kind"])).toEqual(["turn_unobserved"]);
+    expect((reasons[0]?.["detail"] as JsonObject)["suspectedCause"]).toBe("submit_missing");
+  });
+
+  it("作業途中の認証切れ(attention あり)は agent_prompt より先に agent_auth で出す", async () => {
+    const worker = {
+      dispatchId: "disp_1",
+      taskId: "task_cmd",
+      workerState: "running",
+      projection: {
+        provider: { id: "claude" },
+        stage: { activity: "waiting" },
+        attention: { requiresAction: true, categories: ["input"] },
+      },
+    };
+    const { reasons } = await pollWith(worker, "API Error: Login expired · Please run /login");
+    expect(reasons.map((reason) => reason["kind"])).toEqual(["agent_auth"]);
+    expect((reasons[0]?.["detail"] as JsonObject)["turnUnobserved"]).toBe(false);
+  });
+
+  describe("判定の部品", () => {
+    it("splitComposer は Codex の最下部の › を入力欄として切り分け、ほかのエージェントは切り分けない", () => {
+      expect(splitComposer(stuckCodexScreen, "codex").composer).toBe("");
+      expect(splitComposer(idleCodexScreen, "codex").composer).toBe("Ask Codex to do anything");
+      expect(splitComposer(idleCodexScreen, "codex").body).toContain("Worked for");
+      expect(splitComposer(idleCodexScreen, "claude").composer).toBeNull();
+    });
+
+    it("classifyTurnUnobserved は空の入力欄・指示文・貼り付けの畳み表示を submit_missing にする", () => {
+      expect(classifyTurnUnobserved(stuckCodexScreen, "codex")).toBe("submit_missing");
+      expect(classifyTurnUnobserved("› You are working inside Orca, a multi-agent IDE.", "codex")).toBe("submit_missing");
+      expect(classifyTurnUnobserved("› [Pasted Content 4120 chars]", "codex")).toBe("submit_missing");
+      expect(classifyTurnUnobserved(idleCodexScreen, "codex")).toBe("unknown");
+      expect(classifyTurnUnobserved(stuckCodexScreen, "claude")).toBe("unknown");
+      expect(classifyTurnUnobserved(null, "codex")).toBe("unknown");
+    });
+
+    it("detectAuthFailure の共通文言は入力欄を切り分けられたときだけ使う", () => {
+      const output = "Error: 401 Unauthorized\n› \n  footer";
+      expect(detectAuthFailure(output, "codex")?.pattern).toMatch(/401 Unauthorized/i);
+      expect(detectAuthFailure(output, "claude")).toBeNull();
+      expect(detectAuthFailure("Error: No API key for provider local", "dsh")?.pattern).toMatch(/no api key/i);
+      expect(detectAuthFailure("all good", "claude")).toBeNull();
+    });
+
+    it("detectAuthFailure は出力の最下部だけを見る", () => {
+      const old = ["Not logged in", ...Array.from({ length: 12 }, (_, i) => `line ${i}`)].join("\n");
+      expect(detectAuthFailure(old, "claude")).toBeNull();
+    });
+
+    it("looksLikeWorking は esc to interrupt を作業中とみなす", () => {
+      expect(looksLikeWorking(workingCodexScreen)).toBe(true);
+      expect(looksLikeWorking(stuckCodexScreen)).toBe(false);
+    });
   });
 });
 

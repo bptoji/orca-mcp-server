@@ -307,7 +307,12 @@ export function toWorkerRow(worker: JsonObject): JsonObject {
     pickString(projection, ["outcome"]);
   const outcome = pickString(projection, ["outcome"]);
   const row: JsonObject = {
-    agent: pickString(worker, AGENT_KEYS) ?? pickString(projection, AGENT_KEYS) ?? null,
+    // 1.4.268 の projection.provider は { id, model } のオブジェクト(2026-11-23 実測)
+    agent:
+      pickString(worker, AGENT_KEYS) ??
+      pickString(projection, AGENT_KEYS) ??
+      (isJsonObject(projection["provider"]) ? pickString(projection["provider"] as JsonObject, ["id"]) : undefined) ??
+      null,
     status: mapWorkerStatus(outcome ?? rawStatus),
     rawStatus: rawStatus ?? null,
     outcome: outcome ?? null,
@@ -319,6 +324,9 @@ export function toWorkerRow(worker: JsonObject): JsonObject {
       null,
     worktreeId: pickString(worker, ["worktreeId", "worktree_id"]) ?? null,
     activity: pickString(stage, ["activity"]) ?? null,
+    // 起動の段階(例: turn_start_unobserved = 指示文は書き込んだがターン開始を観測できていない)。
+    // worker-show の effects[] と違い、worker-list のこの値は今の状態(完了すると settled に変わる。2026-11-23 実測)。
+    stageDetail: pickString(stage, ["detail"]) ?? null,
     liveness: pickString(liveness, ["verdict"]) ?? null,
     observedAt: observedAtIso(isJsonObject(projection["evidence"]) ? projection["evidence"]["lastObservedAt"] : undefined),
   };
@@ -380,7 +388,15 @@ export function estimatePhase(
   return "starting";
 }
 
-export type BlockedKind = "gate" | "ask" | "ask_undelivered" | "task_report" | "agent_prompt" | "unknown";
+export type BlockedKind =
+  | "gate"
+  | "ask"
+  | "ask_undelivered"
+  | "task_report"
+  | "agent_auth"
+  | "agent_prompt"
+  | "turn_unobserved"
+  | "unknown";
 
 const BLOCKED_HINTS: Record<BlockedKind, string> = {
   gate:
@@ -391,13 +407,28 @@ const BLOCKED_HINTS: Record<BlockedKind, string> = {
     "ask は回答済みだが asker が回答を読んでいない(Orca は子 Run の coordinator を兼ねる asker の pane に回答を配達しない — Orca 1.4.250〜1.4.253 の不具合)。orca_reply_message をもう一度呼ばない(同じ本文は duplicate、違う本文は answer_conflict になるだけで届かない)。asker(Commander)の pane で人間が「orca orchestration ask --resume <blockedReasons[].detail.messageId> --json を実行して回答を受け取り、続けてください」と入力して送る(回答済みなので --resume はすぐ返る)",
   task_report:
     "Commander / 子タスクが blocked を報告している。blockedReasons の内容を読み、orca_send_message で指示するか orca_cancel_task で止める",
+  agent_auth:
+    "エージェントの認証が切れている可能性がある(blockedReasons の detail.matchedPattern / outputTail が根拠。文言からの推定)。detail.agent のログインを直す(claude は Orca 側のアカウント紐づけで解消した実測あり)。直しても worker は自動では再開しないので、pane(detail.terminalHandle)で作業を再開させるか、orca_cancel_task で止めて delegate し直す",
   agent_prompt:
     "エージェントが入力待ち(承認プロンプト、または Commander がターンを終えて待機中)。blockedReasons の detail.outputTail で内容を確認し、承認ならば pane で人間が答える(MCP からは解除できない)。待機中なら orca_send_message で指示するか、不要なら orca_cancel_task で止める",
+  turn_unobserved:
+    "worker が指示文を受け付けたのに作業を始めていない(Orca: turn_start_unobserved。放置しても進まない — 2026-11-23 実測)。detail.suspectedCause が submit_missing なら、Orca で detail.terminalHandle の pane を開いて Enter を 1 回押す(Codex は指示文を画面に出さないまま入力欄に保持していることがあり、Enter で作業を始める — 実測)。承認プロンプトやエラーが出ていたら押さない。unknown なら pane を確認し、起動中なら待つ。MCP からは送らない(orca_send_message はメール経路で、この入力欄には届かない)",
   unknown:
     "blocked の理由が特定できない。orca_get_task_result と terminal の出力を確認する",
 };
 
-const BLOCKED_KIND_ORDER: BlockedKind[] = ["gate", "ask", "ask_undelivered", "task_report", "agent_prompt", "unknown"];
+const BLOCKED_KIND_ORDER: BlockedKind[] = [
+  "gate",
+  "ask",
+  "ask_undelivered",
+  "task_report",
+  "agent_auth",
+  "agent_prompt",
+  "turn_unobserved",
+  "unknown",
+];
+/** 人間が pane で手を打たないと進まない kind(phase を blocked に寄せ、attentionRequired を立てる)。 */
+export const PANE_ACTION_KINDS: BlockedKind[] = ["ask_undelivered", "agent_auth", "agent_prompt", "turn_unobserved"];
 const MAX_REASON_TEXT = 2000;
 const MAX_ATTENTION_READS = 2;
 const ATTENTION_READ_LINES = 30;
@@ -453,6 +484,125 @@ async function probeAgentWaits(
     }),
   );
   return waits;
+}
+
+/**
+ * worker-start が指示文(text + Enter)を書き込んだが、ターン開始を観測できていない段階
+ * (worker-list の `projection.stage.detail`。そのとき `workerState: start_unknown` / `activity: done`)。
+ * 2026-11-23 実測(Orca 1.4.268 / Codex 0.166.0): Codex を同時に 3 体起動すると 2 体がこの状態で止まり、
+ * 5 分以上放置しても進まなかった。画面は起動バナーと空の入力欄(`›` だけ。待機中なら出るはずの
+ * "Ask Codex to do anything" も出ない)で、pane に Enter を 1 回送ると指示文どおりに作業を始めた。
+ * 作業を始めた後も workerState / stage.detail は完了まで変わらず、activity だけが working になる。
+ */
+export const TURN_START_UNOBSERVED = "turn_start_unobserved";
+/** poll 1 回で turn_unobserved の候補の出力末尾を読む worker 数(agent_prompt の枠とは別。止まった worker にだけ使う)。 */
+const MAX_TURN_READS = 2;
+/** 認証エラーの文言を探す範囲(出力の最下部、入力欄の直前の行数)。 */
+const AUTH_SCAN_LINES = 8;
+
+/** 作業中の表示(Codex / Claude Code とも、ターン実行中は "esc to interrupt" を出す)。 */
+const WORKING_PATTERN = /esc to interrupt/i;
+
+/**
+ * エージェント別の認証エラーの文言。claude と dsh は実測、ほかは推測(誤検知を避けるためエージェント固有の文言だけ)。
+ * 実機で認証切れの画面を見たら、ここを更新して docs/design/blocked-reasons.md の表も直す。
+ */
+const AGENT_AUTH_PATTERNS: Record<string, RegExp[]> = {
+  // 2026-10-08 実測(AGENTS.md: claude の `Login expired` / `Not logged in`)
+  claude: [/login expired/i, /not logged in/i, /please run \/login/i],
+  // 未確認(推測)
+  codex: [/codex login/i, /not signed in/i, /sign in again/i],
+  // 未確認(推測)
+  copilot: [/gh auth login/i, /not authenticated/i],
+  // 実測(pi-ai の `No API key for provider`)
+  dsh: [/no api key for provider/i],
+};
+/**
+ * エージェントを問わない文言(未確認)。入力欄を切り分けられる画面(Codex)だけで使う —
+ * 切り分けられないと、入力欄に残った指示文やツール出力に含まれる 401 などで誤検知する。
+ */
+const COMMON_AUTH_PATTERNS: RegExp[] = [/401 Unauthorized/i, /authentication_error/i, /invalid api key/i];
+
+/** Codex の入力欄の行(`›` で始まる)。最下部のものが入力欄、それより上は会話の履歴。 */
+const CODEX_COMPOSER_LINE = /^\s*›(.*)$/;
+/** dispatch の指示文(preamble)の書き出し(実測。Orca が全 worker に同じ書き出しで送る)。 */
+const DISPATCH_PREAMBLE_HEAD = "You are working inside Orca";
+
+/**
+ * 出力を「入力欄より上(出力)」と「入力欄」に分ける。今は Codex の画面だけ(書式を実機で確かめたもの)。
+ * 切り分けられないときは composer: null で、body は出力全体。
+ */
+export function splitComposer(output: string, agent: string | null): { body: string; composer: string | null } {
+  if (agent !== "codex") {
+    return { body: output, composer: null };
+  }
+  const lines = output.split(/\r?\n/);
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const match = CODEX_COMPOSER_LINE.exec(lines[index] ?? "");
+    if (match !== null) {
+      return { body: lines.slice(0, index).join("\n"), composer: (match[1] ?? "").trim() };
+    }
+  }
+  return { body: output, composer: null };
+}
+
+/** 最下部にターン実行中の表示があるか(activity が古いだけで動いている worker を除くため)。 */
+export function looksLikeWorking(output: string): boolean {
+  const tail = output.split(/\r?\n/).slice(-AUTH_SCAN_LINES).join("\n");
+  return WORKING_PATTERN.test(tail);
+}
+
+/**
+ * 出力末尾から認証切れを推定する(文言からの推定。確定ではない)。作業中の画面には使わない(呼び出し側で除外)。
+ * 入力欄は見ない(残った指示文の中身で誤検知しないため)。共通の文言は入力欄を切り分けられたときだけ使う。
+ */
+export function detectAuthFailure(output: string, agent: string | null): { pattern: string } | null {
+  const { body, composer } = splitComposer(output, agent);
+  const scan = body.split(/\r?\n/).slice(-AUTH_SCAN_LINES).join("\n");
+  const patterns = [
+    ...(agent !== null ? (AGENT_AUTH_PATTERNS[agent] ?? []) : []),
+    ...(composer !== null ? COMMON_AUTH_PATTERNS : []),
+  ];
+  for (const pattern of patterns) {
+    const match = pattern.exec(scan);
+    if (match !== null) {
+      return { pattern: match[0] };
+    }
+  }
+  return null;
+}
+
+/**
+ * turn_unobserved の原因を出力から推定する。submit_missing = 指示文が送信されずに入力欄に残っている
+ * (Codex: 入力欄が空に見えるのに placeholder も出ていない、または指示文 / 貼り付けの畳み表示が見えている — 実測は前者)。
+ */
+export function classifyTurnUnobserved(output: string | null, agent: string | null): "submit_missing" | "unknown" {
+  if (output === null) {
+    return "unknown";
+  }
+  const { composer } = splitComposer(output, agent);
+  if (composer === null) {
+    return "unknown";
+  }
+  if (composer === "" || composer.startsWith(DISPATCH_PREAMBLE_HEAD) || composer.startsWith("[Pasted Content")) {
+    return "submit_missing";
+  }
+  return "unknown";
+}
+
+/** worker 行(toWorkerRow)が「指示文は書き込まれたがターンが始まっていない」状態か。 */
+export function isTurnUnobservedWorker(worker: JsonObject): boolean {
+  return (
+    worker["stageDetail"] === TURN_START_UNOBSERVED &&
+    worker["activity"] !== "working" &&
+    worker["status"] !== "completed" &&
+    worker["status"] !== "failed" &&
+    worker["liveness"] !== "exited"
+  );
+}
+
+function tailText(output: string): string {
+  return output.length <= ATTENTION_READ_CHARS ? output : output.slice(-ATTENTION_READ_CHARS);
 }
 
 async function readAttentionOutput(client: OrcaClient, dispatchId: string): Promise<JsonObject> {
@@ -807,11 +957,76 @@ export async function collectBlockedReasons(
       worker["liveness"] !== "exited" &&
       !askTaskIds.has(worker["taskId"] as string),
   );
+  // 指示文を受け付けたのにターンが始まっていない worker(turn_start_unobserved)。worker-list の値だけで候補が決まり、
+  // 原因の推定にだけ出力末尾を読む(専用の枠)。attention が立っている worker は下の agent_prompt に任せる。
+  const turnHandled = new Set<string>();
+  let turnReads = 0;
+  for (const worker of live.filter((row) => isTurnUnobservedWorker(row) && row["requiresAttention"] !== true)) {
+    const dispatchId = typeof worker["dispatchId"] === "string" ? (worker["dispatchId"] as string) : undefined;
+    const agent = typeof worker["agent"] === "string" ? (worker["agent"] as string) : null;
+    let output: string | null = null;
+    if (dispatchId !== undefined) {
+      turnHandled.add(dispatchId);
+      if (turnReads < MAX_TURN_READS) {
+        turnReads += 1;
+        try {
+          output = extractOutputText(unwrapResult(await readAttentionOutput(client, dispatchId))).text;
+        } catch (error) {
+          warnings.push(`worker ${dispatchId} の出力取得に失敗(turn_unobserved の原因推定): ${failureLine(error)}`);
+        }
+      }
+    }
+    // activity は hooks 由来で遅れることがある。画面が作業中なら動いている(何も出さない)。
+    if (output !== null && looksLikeWorking(output)) {
+      continue;
+    }
+    const base: JsonObject = {
+      dispatchId: dispatchId ?? null,
+      agent,
+      terminalHandle: worker["terminalHandle"] ?? null,
+      stage: TURN_START_UNOBSERVED,
+      activity: worker["activity"] ?? null,
+      observedAt: worker["observedAt"] ?? null,
+      outputTail: output === null ? null : tailText(output),
+      outputHash: output === null ? null : outputHashOf(output),
+    };
+    const auth = output === null ? null : detectAuthFailure(output, agent);
+    if (auth !== null) {
+      // ログインできていなければ Enter を押しても進まないので、submit_missing より先に出す
+      reasons.push({
+        kind: "agent_auth",
+        taskId: worker["taskId"] ?? null,
+        summary: `worker ${dispatchId ?? "?"}(${agent ?? "agent 不明"})の認証が切れている可能性(${auth.pattern})`,
+        detail: { ...base, matchedPattern: auth.pattern, turnUnobserved: true },
+      });
+      continue;
+    }
+    if (output !== null && looksLikeApprovalPrompt(splitComposer(output, agent).body)) {
+      reasons.push({
+        kind: "agent_prompt",
+        taskId: worker["taskId"] ?? null,
+        summary: `worker ${dispatchId ?? "?"} が起動直後に入力待ち(承認・確認の画面)`,
+        detail: { ...base, looksLikePrompt: true, turnUnobserved: true },
+      });
+      continue;
+    }
+    const suspectedCause = classifyTurnUnobserved(output, agent);
+    reasons.push({
+      kind: "turn_unobserved",
+      taskId: worker["taskId"] ?? null,
+      summary:
+        suspectedCause === "submit_missing"
+          ? `worker ${dispatchId ?? "?"}(${agent ?? "agent 不明"})の指示文が送信されていない可能性。pane で Enter を 1 回押す`
+          : `worker ${dispatchId ?? "?"}(${agent ?? "agent 不明"})が指示文を受け付けたが作業を始めていない。pane を確認する`,
+      detail: { ...base, suspectedCause },
+    });
+  }
+
   const isSuspect = (worker: JsonObject): boolean =>
     worker["requiresAttention"] === true || worker["activity"] === "waiting";
   // flagged → waiting → その他の順。agentWait は Orca 自身の判定なので、従来の候補(flagged / waiting)以外の
   // 生存 worker にも問い合わせる(Orca が requiresAction を立てない承認プロンプトを拾うため)。
-  const ordered = [...live].sort(
+  const ordered = live.filter((worker) => !turnHandled.has(worker["dispatchId"] as string)).sort(
     (a, b) =>
       Number(b["requiresAttention"] === true) - Number(a["requiresAttention"] === true) ||
       Number(b["activity"] === "waiting") - Number(a["activity"] === "waiting"),
@@ -844,6 +1059,29 @@ export async function collectBlockedReasons(
             `worker ${dispatchId} の出力取得に失敗: ${error instanceof Error ? error.message : String(error)}`,
           );
         }
+      }
+      // 作業途中の認証切れ(ターン開始は観測済みなので turn_unobserved には当たらない)。作業中の画面には
+      // かけない(ツール出力の 401 などで誤検知するため)。承認プロンプトより先に出す(直さないと進まない)。
+      const agent = typeof worker["agent"] === "string" ? (worker["agent"] as string) : null;
+      const auth = output === null || looksLikeWorking(output) ? null : detectAuthFailure(output, agent);
+      if (auth !== null && output !== null) {
+        reasons.push({
+          kind: "agent_auth",
+          taskId: worker["taskId"] ?? null,
+          summary: `worker ${dispatchId ?? "?"}(${agent ?? "agent 不明"})の認証が切れている可能性(${auth.pattern})`,
+          detail: {
+            dispatchId: dispatchId ?? null,
+            agent,
+            terminalHandle: worker["terminalHandle"] ?? null,
+            matchedPattern: auth.pattern,
+            turnUnobserved: false,
+            outputTail: output,
+            outputHash: outputHashOf(output),
+            observedAt: worker["observedAt"] ?? null,
+            activity: worker["activity"] ?? null,
+          },
+        });
+        continue;
       }
       if (wait === undefined && !flagged && (output === null || !looksLikeApprovalPrompt(output))) {
         continue;
@@ -2274,6 +2512,13 @@ export async function delegateTask(
         `worker-start receipt state=outcome_unknown stage=${stage} — Commander が起動したかを CLI が確定できていません` +
           `(dispatch ${dispatchId ?? "なし"})。再委譲は二重起動になり得るので、先に poll で dispatch / worker の有無を確認してください`,
       );
+      if (stage === TURN_START_UNOBSERVED) {
+        // 2026-11-23 実測: Codex は指示文を送信しないまま入力欄に保持して止まることがあり、pane で Enter を押すと始まる
+        warnings.push(
+          `Commander の pane は指示文を受け付けたが作業を始めていません(${TURN_START_UNOBSERVED})。` +
+            `poll の blockedReasons に turn_unobserved が出たら、その案内に従って pane で Enter を 1 回押してください(delegate し直さない)`,
+        );
+      }
       return {
         taskId,
         state: "queued",
@@ -2533,13 +2778,6 @@ export async function getTaskStatus(client: OrcaClient, input: TaskStatusInput):
         }
       : null;
 
-  const estimatedPhase = estimatePhase(state, [...workers, ...childWorkers], gates, pendingAsks);
-  // 回答が asker に届いていない ask があると Commander は回答待ちのまま進まない(人手で --resume が要る)。
-  // implementation / starting / settling と見せずに blocked に寄せる。
-  const phase: JobPhase =
-    undeliveredAsks.length > 0 && ["implementation", "starting", "settling"].includes(estimatedPhase)
-      ? "blocked"
-      : estimatedPhase;
   const blockedReasons = await collectBlockedReasons(
     client,
     {
@@ -2554,6 +2792,15 @@ export async function getTaskStatus(client: OrcaClient, input: TaskStatusInput):
     warnings,
   );
   const blockedKind = primaryBlockedKind(blockedReasons);
+  const estimatedPhase = estimatePhase(state, [...workers, ...childWorkers], gates, pendingAsks);
+  // 人間が pane で手を打たないと進まない停止がある(回答が asker に届いていない ask、認証切れ、
+  // 指示文が送信されていない worker)。implementation / starting / settling と見せずに blocked に寄せる。
+  // turn_unobserved の worker は projection.outcome が in_progress なので running に見える(2026-11-23 実測)。
+  const paneStop =
+    undeliveredAsks.length > 0 ||
+    blockedReasons.some((reason) => reason["kind"] === "agent_auth" || reason["kind"] === "turn_unobserved");
+  const phase: JobPhase =
+    paneStop && ["implementation", "starting", "settling"].includes(estimatedPhase) ? "blocked" : estimatedPhase;
 
   // dsh 型の worker は launch token が記録されず dispatch が agent_readiness で死ぬが、
   // pane は注入された goal を完走し `task-update` で報告する(E2E 実測: failed → completed)。
@@ -2600,7 +2847,7 @@ export async function getTaskStatus(client: OrcaClient, input: TaskStatusInput):
     // 可能性がある。E2E で `orca skills get …` の承認待ち Commander が running のまま止まった。
     attentionRequired:
       workers.some((row) => row["requiresAttention"] === true) ||
-      blockedReasons.some((reason) => reason["kind"] === "agent_prompt" || reason["kind"] === "ask_undelivered"),
+      blockedReasons.some((reason) => PANE_ACTION_KINDS.includes(reason["kind"] as BlockedKind)),
     attentionNotes: workers
       .filter((row) => row["requiresAttention"] === true)
       .map(

@@ -363,13 +363,32 @@ docs/
   Commander Prompt はゲートを作らせない(詳細は下の `blockedReasons[]` の項)。`orca_resolve_gate` は
   旧契約のジョブ(sub-run 内の承認用子 task のゲート)との互換用に残す。
 - poll の `blockedReasons[]`(設計: `docs/design/blocked-reasons.md`): `kind` は `gate / ask / ask_undelivered / task_report /
-  agent_prompt / unknown`。`blocked` でも gate が無いことがある(Commander の blocked 報告 = `task-update` の `result`、
+  agent_auth / agent_prompt / turn_unobserved / unknown`。`blocked` でも gate が無いことがある(Commander の blocked 報告 = `task-update` の `result`、
   エージェントの承認プロンプト)ので、**`blocked` = `decision_gate` と決めつけない**。pending のゲート**か ask**
   があるときだけ phase は `decision_gate`、無ければ `blocked`。gates は `gate-list --run` で全件取り、対象タスク +
   直接の子タスクに絞る。**gate 行には必ず `runId` を載せる**(行の `run_id` を優先、無いときは照合した Run 名義で補う)。
   `gate-resolve` に `--run` が無く `orca_resolve_gate` は `run` 必須なので、呼び出し側が所属 Run を知れていなければ
   解決に使えない(sub-run のゲートは呼び出し元 Run と違う Run にある)。`blockedReasons` の gate `detail` にも
-  `gateId` / `runId` / `options` を入れる。追加の読み取りは `agent_prompt` の `worker-show`(最大 3 worker、並列)と `worker-read`(最大 2 worker)だけで、変更系は呼ばない。
+  `gateId` / `runId` / `options` を入れる。追加の読み取りは `agent_prompt` の `worker-show`(最大 3 worker、並列)と `worker-read`(最大 2 worker)、
+  `turn_unobserved` の候補の `worker-read`(最大 2 worker、別枠)だけで、変更系は呼ばない。
+- **`turn_unobserved` = 指示文を受け付けたのに作業を始めていない worker**(2026-11-23 実測、Orca 1.4.268 / Codex 0.166.0)。
+  Codex を同時に 3 体起動すると 2 体が `worker-start` の receipt `state: outcome_unknown` / `stage: turn_start_unobserved`(exit 1)で返り、
+  5 分以上放置しても進まなかった。画面は起動バナーと空の入力欄(`›` だけで、待機中なら出る "Ask Codex to do anything" も出ない)で、
+  pane に Enter を 1 回送ると指示文どおりに作業を始めた(Codex が指示文を表示しないまま入力欄に保持している)。単体の起動では再現しない。
+  原因は Orca 側(同じ Codex 0.166.0 で 11/09 は正常、11/14 以降に発生。Commander の起動指定は同じ)で、orca-mcp / orca-artifacts は子 worker の入力に関与しない。
+  判定は **worker-list の `projection.stage.detail === "turn_start_unobserved"` かつ `activity !== "working"`**(今の状態。完了すると `settled`、
+  Enter の後は stage がそのままで activity だけ `working` になる)。worker-show の `effects[]` の `dispatch_input: turn_unobserved` は
+  起動時のスナップショットで完了後も残るので**使わない**。止まっている間 `projection.outcome` は `in_progress`(= running に見える)、
+  `agentWait` は `null`、attention は立たない。出力末尾は原因の推定にだけ読む: 作業中の表示(`esc to interrupt`)→ 出さない /
+  認証エラー → `agent_auth` / 承認プロンプト → `agent_prompt` / Codex の入力欄が空・指示文・`[Pasted Content` → `suspectedCause: submit_missing`
+  (pane で Enter を 1 回押す案内)/ それ以外 → `unknown`。phase は `blocked`、`attentionRequired: true`。**MCP から Enter は送らない**
+  (`orca terminal send` の help は「ほかのエージェントの入力欄に打ち込まない」。承認プロンプトに Enter が届く事故も避ける)。
+  Commander 自身が同じ状態で起動したときは `orca_delegate_task` の warnings に同じ案内を足す(`outcome_unknown` は従来どおり再委譲を促さない)。
+- **`agent_auth` = 認証切れの推定**(エージェント共通)。出力末尾を読んだ worker(`turn_unobserved` の候補 + `agent_prompt` の候補)の
+  最下部 8 行をエージェント別の文言表(`AGENT_AUTH_PATTERNS`。claude / dsh は実測、codex / copilot は推測)で照合する。
+  作業中の画面にはかけない(ツール出力の 401 で誤検知する)。Codex は入力欄(最下部の `›`)を切り分け、残った指示文の中身は見ない。
+  エージェント共通の文言(`401 Unauthorized` 等)は入力欄を切り分けられたときだけ使う。承認より先に出す(直さないと進まない)。
+  agent 名は worker-list の `projection.provider.id`(1.4.268 は `{ id, model }` のオブジェクト)から取る。
 - **`agent_prompt` はまず `worker-show` の `observation.agentWait` で判定する**(1.4.245。形は Orca 本体
   `getTerminalInteractiveWait` の実装で確認: `{source:"hook",since}` / `{source:"prompt-text",reason,since?}` /
   `{source:"title"}`)。object なら attention が立っていなくても `agent_prompt` にして `detail.agentWait` に根拠を載せる。
