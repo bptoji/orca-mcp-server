@@ -30,7 +30,9 @@
 | `ask` | 呼び出し Run の受信箱に pending の ask(`type: question`) | 質問文 / `{ messageId, question, options, taskId?, fromHandle, createdAt }` |
 | `ask_undelivered` | ask は回答済みだが asker の dispatch 受信箱で回答が未読(Orca が配達していない) | 説明 / `{ messageId, question, fromHandle, createdAt, recoveryCommand }` |
 | `task_report` | task または子 task が `blocked` で `result` が非空 | `result`(2000 字まで) |
+| `agent_auth` | 出力末尾に認証エラーの文言(下の「認証切れ」) | 説明 / `{ dispatchId, agent, terminalHandle, matchedPattern, outputTail, turnUnobserved }` |
 | `agent_prompt` | worker が `requiresAttention`(終端 / exited の worker は除く。**pending の asker は除外**) | 入力待ちの説明 / `detail.outputTail`(30 行 / 1500 字)、`outputHash`、`looksLikePrompt`、`observedAt`、`activity` |
+| `turn_unobserved` | 指示文を受け付けたのに作業を始めていない worker(下の節) | 説明 / `{ dispatchId, agent, terminalHandle, suspectedCause, outputTail }` |
 | `unknown` | 上のどれにも当たらない | 根拠なし |
 
 - `agent_prompt` の `worker-read` は、`blocked` またはゲート無しの attention のときだけ、最大 2 worker。
@@ -85,6 +87,108 @@
   Run を run-list で探し、あれば `delivery.wakeLikelyBlocked: true` + warnings + `nextAction`(上の --resume 案内)。
   読み取りだけで、失敗しても reply の結果は変えない(`wakeLikelyBlocked: null` + warnings)。
 
+### 指示文が送信されない worker(`turn_unobserved`、2026-11-23 実装済み)
+
+#### 事象と過去の記録
+
+- 子 Run の Codex worker が動き出さず、人間が pane で Enter を押すと動き出す。`worker-show --full` の `worker.effects[]` に
+  `{ kind: "dispatch_input", state: "accepted" }` に続いて `{ kind: "dispatch_input", state: "turn_unobserved" }` が残る。
+- 過去の子 Run の記録:
+
+  | 日付 | agent | `dispatch_input` |
+  | --- | --- | --- |
+  | 11/08 | claude ×6 | `accepted` |
+  | 11/09 | codex ×2 | `accepted` |
+  | 11/14 | claude / copilot | `accepted` |
+  | 11/14 | codex | `accepted` → `turn_unobserved` |
+  | 11/22 | codex ×3 | `accepted` → `turn_unobserved` |
+
+- 11/22 の 3 体は 10:14:12 に起動し、transcript の最初の user メッセージ(指示文の送信)は 10:20:29(手で Enter を押した時刻)。
+  Commander の起動指定(`agent: codex` / `worktree: current` / `timeoutMs: 60000`)は正常な 11/09 と同じで、Codex も 11/04 から
+  0.166.0 のまま。原因は Orca 側(入力の送り方)にある。orca-mcp / orca-artifacts は子 worker の入力に関与しない。
+
+#### 再現(2026-11-23、使い捨て Run `run_4083ade097c4`、Orca 1.4.268 / Codex 0.166.0)
+
+- ルートの terminal から Codex を **1 体** 起動 → 11.5 秒で `ready` / `input_accepted`、そのまま完了(再現しない)。
+- **同時に 3 体** 起動 → 2 体が receipt `state: outcome_unknown` / `stage: turn_start_unobserved`(exit 1)。
+  `lastError`: "Dispatch input (text and Enter) was written, but codex's turn start was not observed (waited up to 30s). …
+  may hold the prompt unsent in its composer: check with `terminal read` before resending."
+- 止まっている間の値:
+  - worker-list: `workerState: start_unknown` / `dispatchStatus: pending` / `projection.stage.detail: turn_start_unobserved` /
+    `activity: done` / `outcome: in_progress`(= 従来の正規化では running)/ `liveness: live` / attention なし。
+  - worker-show: `observation.agentWait: null`(Orca は待ちと判定しない = 既存の `agent_prompt` では拾えない)。
+  - task-list: task の status は `blocked`(従来の poll は `kind: unknown` だけを出していた)。
+  - 画面: 起動バナーと **空の入力欄**(`›` だけ)。待機中の Codex なら出る placeholder "Ask Codex to do anything" も出ない。
+  - `worker-read --source auto` は transcript が無く terminal に落ちる(`fallbackReason: session_not_reported`)。
+- 1 体に `orca terminal send --text "\r"` で Enter を送る → 指示文どおりに作業を始めて完了。もう 1 体は約 4 分放置しても止まったまま
+  (自然には直らない)で、Enter を送ると同じく完了した。指示文は画面に出ないまま Codex 内に保持されている。
+- Enter の後も `workerState: start_unknown` / `stage.detail: turn_start_unobserved` は完了まで変わらず、`activity` だけが `working` になる。
+  完了すると `succeeded` / `settled`。
+
+#### 判定(読み取りのみ。pane へは打ち込まない)
+
+`effects[]` は起動時のスナップショットで完了後も残る(11/22 の 3 体)ので使わない。今の状態を表す worker-list の値で候補を決める。
+
+1. **候補**: `projection.stage.detail === "turn_start_unobserved"` かつ `activity !== "working"`、終端でない、liveness が `exited` でない、
+   pending の asker でない、attention が立っていない(立っていれば既存の `agent_prompt` に任せる)。worker-list だけで決まるので
+   worker-show の 3 件枠には依存しない。
+2. **出力末尾を読む**(候補ごとに `worker-read`、**専用の枠で最大 2 件**。止まった worker にだけ使うので `agent_prompt` の枠と分けた)。
+   読めなくても `turn_unobserved` は出す(原因は `unknown`、失敗は warnings)。
+3. **1 worker 1 判定**(先に当たったものだけ出す):
+   1. 最下部 8 行に作業中の表示(`esc to interrupt`)→ 何も出さない(activity が遅れているだけ)。
+   2. 認証エラーの文言 → `agent_auth`(`turnUnobserved: true`)。ログインできていなければ Enter を押しても進まない。
+   3. 入力欄より上が承認プロンプトらしい → `agent_prompt`(`turnUnobserved: true`)。
+   4. Codex の入力欄(最下部の `›` の行)が空 / preamble の書き出し(`You are working inside Orca`)/ `[Pasted Content` →
+      `turn_unobserved`(`suspectedCause: "submit_missing"`)。実測は「空」。
+   5. それ以外 → `turn_unobserved`(`suspectedCause: "unknown"`)。
+4. **出力**: `detail` は `{ dispatchId, agent, terminalHandle, stage, activity, observedAt, outputTail, outputHash, suspectedCause }`。
+   phase は `blocked`(`implementation` / `starting` / `settling` から寄せる)、`attentionRequired: true`。
+   優先順は `agent_prompt` の次、`unknown` の前。
+5. **Commander の起動**で receipt が `outcome_unknown` / `turn_start_unobserved` なら、`orca_delegate_task` の warnings に
+   「poll の turn_unobserved に従って pane で Enter」を足す(従来どおり再委譲は促さない)。
+
+| suspectedCause | 案内(nextAction) |
+| --- | --- |
+| `submit_missing` | Orca で `detail.terminalHandle` の pane を開いて Enter を 1 回押す。承認プロンプトやエラーが出ていたら押さない |
+| `unknown` | pane を確認し、起動中なら待つ |
+
+MCP から Enter は送らない(`orca terminal send` の help は「ほかのエージェントの入力欄に打ち込まない」。承認プロンプトに
+Enter が届く事故も避ける。`orca_send_message` はメール経路でこの入力欄には届かない)。
+
+#### 認証切れ(`agent_auth`、エージェント共通)
+
+認証切れは Codex に限らず、作業の途中でも起きる(途中ならターン開始は観測済みで `turn_unobserved` は付かない)ので独立の kind にする。
+
+- **対象**: 出力末尾を読んだ worker(`turn_unobserved` の候補と `agent_prompt` の候補 = flagged / waiting / agentWait あり)。
+  候補に入らない worker(attention も waiting も無いまま止まった worker)は拾えない。必要なら `outputHash` が変わらない worker を
+  呼び出し側が報告する運用で補う。
+- **判定**: 作業中の画面(`esc to interrupt`)にはかけない(ツール出力の 401 で誤検知する)。出力の最下部 8 行(Codex は入力欄より上)を
+  文言表で照合する。agent は worker-list の `projection.provider.id`(1.4.268 は `{ id, model }` のオブジェクト)。
+
+  | agent | 文言 | 根拠 |
+  | --- | --- | --- |
+  | claude | `Login expired` / `Not logged in` / `Please run /login` | 2026-10-08 実測(AGENTS.md) |
+  | dsh | `No API key for provider` | 実測(pi-ai) |
+  | codex | `codex login` / `Not signed in` / `sign in again` | 未確認(推測) |
+  | copilot | `gh auth login` / `not authenticated` | 未確認(推測) |
+  | 共通 | `401 Unauthorized` / `authentication_error` / `invalid api key` | 未確認。入力欄を切り分けられる画面(Codex)だけで使う |
+
+  文言は大小文字を区別しない。一致した文言は `detail.matchedPattern` に載せる(推定であることを示す)。
+- **入力欄の切り分け**: Codex は最下部の `›` の行を入力欄とし、残った指示文の中身は判定に使わない(spec に `401` / `login` が
+  含まれても `submit_missing` のまま。単体テストで固定)。claude / copilot の入力欄の書式は未確認なので切り分けず、
+  共通の文言を使わない。
+- **出力**: `detail` は `{ dispatchId, agent, terminalHandle, matchedPattern, outputTail, outputHash, turnUnobserved, … }`。
+  優先順は `agent_prompt` の前、phase は `blocked`、`attentionRequired: true`。
+- **案内**: ログインを直す(claude は Orca 側のアカウント紐づけで解消した実測あり)。直しても worker は自動では再開しないので、
+  pane で再開させるか `orca_cancel_task` で止めて delegate し直す。
+
+#### 残っている未確認
+
+- claude / dsh 以外の認証切れの画面(文言表の推測部分)。出会ったら `worker-read --source terminal --json --full` を保存して更新する。
+- claude / copilot が同じ止まり方をしたときの画面(今は `suspectedCause: unknown` になる)。
+- 同時起動で止まる原因そのもの(Orca 本体の入力の送り方)。Orca 側への報告材料: Codex 0.166.0 のまま 11/09 は正常、11/14 以降に発生、
+  同時 3 体の起動で 2 体が再現。
+
 ### phase
 
 - pending のゲート**か ask** があるときだけ `decision_gate`。
@@ -99,6 +203,8 @@
 | `ask_undelivered` | `orca_reply_message` をもう一度呼ばない。asker の pane で `ask --resume <messageId>` を実行させる |
 | `task_report` | 報告を読み、`orca_send_message` で指示するか `orca_cancel_task` |
 | `agent_prompt` | エージェントが入力待ち(承認プロンプトまたは Commander の待機)。MCP からは解除できない。`detail.outputTail` と `looksLikePrompt` で見極める。待機中なら `orca_send_message` / cancel |
+| `agent_auth` | ログインを直す。worker は自動で再開しないので pane で再開させるか cancel → delegate し直す |
+| `turn_unobserved` | `submit_missing` なら pane で Enter を 1 回押す(承認プロンプトやエラーなら押さない)。`unknown` なら pane を確認 |
 | `unknown` | `orca_get_task_result` と terminal を確認 |
 
 ### 入力待ちの見分け方(`agent_prompt`)

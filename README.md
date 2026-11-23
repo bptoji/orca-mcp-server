@@ -194,6 +194,9 @@ providers 列挙にそのエージェント名は出ない)。`orca_delegate_tas
    - ゲート(旧契約のジョブ、`gates[]` に出る)→ `orca_resolve_gate({ gateId, resolution, run })`
    - **`kind: ask_undelivered`**(`undeliveredAsks[]` に出る。回答済みなのに Commander が読んでいない)→ **もう一度 reply しない**。
      Commander の pane で人間が `orca orchestration ask --resume <messageId> --json` を実行させる(下の「ask の回答が届かない」)
+   - **`kind: turn_unobserved`**(worker が指示文を受け付けたのに作業を始めていない)→ `detail.suspectedCause` が `submit_missing` なら、
+     Orca で `detail.terminalHandle` の pane を開いて **Enter を 1 回押す**(承認プロンプトやエラーが出ていたら押さない)
+   - **`kind: agent_auth`**(エージェントの認証切れの推定)→ ログインを直してから pane で再開させるか、cancel して委譲し直す
 6. 取り消すときだけ `orca_cancel_task({ taskId, reason })`(既定で子孫 worker も子から順に止める。**sub-run の worker も Commander より先に止める**)
 7. `state: "completed"` になったら `orca_get_task_result({ taskId })`。ワーカー個々の成果まで欲しければ `includeChildren: true`
    - 読み終わったら `orca_release_task({ taskId, run })` で worker の terminal を閉じる(完了しても terminal は `retained` のまま残る)
@@ -297,6 +300,10 @@ orca_get_task_result({ taskId: "task_abc123", includeChildren: true })
   `agent_prompt`(入力待ちの worker。`detail` に `outputTail` / `outputHash` / `looksLikePrompt` / `observedAt` / `activity`、Orca が判定したときは `agentWait`(`source: hook / prompt-text / title`、`reason` / `since`)。
   MCP からは解除不可。`looksLikePrompt` は文言からの推定。`outputHash` は呼び出し側が前回値と比べて動作中かを判定する。
   **pending の asker は `agent_prompt` に出さない**(asker は ask の回答待ちで、二重掲載を避けるため)/
+  `agent_auth`(認証切れの推定。`detail` に `agent` / `terminalHandle` / `matchedPattern` / `outputTail` / `turnUnobserved`。文言からの推定)/
+  `turn_unobserved`(指示文を受け付けたのに作業を始めていない worker。`detail` に `agent` / `terminalHandle` / `suspectedCause`
+  (`submit_missing` = 指示文が送信されずに入力欄に残っている → pane で Enter を 1 回押す / `unknown`)/ `outputTail`。
+  判定は worker-list の `projection.stage.detail: turn_start_unobserved` + `activity` が `working` でないこと。候補の出力末尾を最大 2 件読む)/
   `unknown`(根拠なし)。`nextAction` は最優先の kind に合わせて案内します。
   `agent_prompt` の判定(`worker-show` 最大 3 件 + `worker-read` 最大 2 件)だけが追加の読み取りで、失敗しても `warnings` に残して poll は返ります。
   判定はまず `worker-show` の `observation.agentWait`(Orca 1.4.245 が「人間にしか答えられない待ち」を根拠付きで返す)を使い、
@@ -680,7 +687,8 @@ poll を打ち切る前に数回待ってください。**launcher 運用では�
 | `lastError=Agent startup blocked: agent-trust-workspace` | copilot が **folder trust** の確認を求めて起動が止まっている | `agentCmdOverrides.copilot = node` + launcher(launcher が `COPILOT_ALLOW_ALL=true` を設定して起動する)。`--add-dir` / `--allow-all-paths` では消えない |
 | `nested_worker_depth_exceeded`(子 worker が起動しない) | Orca の **Nested worker depth** が既定 1。MCP が起動する Commander は既に depth 1 なので、その子は depth 2 で拒否される | Orca の Settings → Orchestration → "Nested worker depth" を 2 にする(既定 1 / 1 以上の整数)。`depth 2, max 1` がそのまま応答に出る |
 | `running` のまま progress が止まる | エージェントの**ツール承認プロンプト**で worker が停止 | `attentionNotes` をたどって pane を確認。codex は `--approve-for-me`、claude は `agentDefaultArgs.claude` の `--permission-mode acceptEdits --allowedTools Bash …` |
-| claude の worker が `dispatched` のまま動かない、pane に `Not logged in` | claude の auth 切れ(権限設定ではない) | Orca 側のアカウント紐づけ / pane で `/login` |
+| claude の worker が `dispatched` のまま動かない、pane に `Not logged in` | claude の auth 切れ(権限設定ではない) | Orca 側のアカウント紐づけ / pane で `/login`(poll は `kind: agent_auth` を出す) |
+| `kind: turn_unobserved`(Codex の worker が動き出さない。pane は起動バナーと空の入力欄) | Orca が書き込んだ指示文を Codex が送信しないまま入力欄に保持している(同時起動で発生。2026-11-23 実測、Orca 1.4.268 / Codex 0.166.0) | pane(`detail.terminalHandle`)で Enter を 1 回押すと始まる。放置しても進まない。MCP からは送らない |
 | `blocked` / `phase: "decision_gate"` | 承認待ち(新契約は **ask**、旧契約はゲート) | `asks[]` に ask が出ていれば `orca_reply_message({ messageId, body, run })` で答える(`body` は `--options` の選択肢。`approve` / `reject` など)。旧契約のゲートは `blockedReasons` の `question` / `options` を読み、`orca_resolve_gate({ gateId, resolution, run })` で進める(`run` には `gates[].runId` を使う) |
 | `kind: ask_undelivered`(reply したのに Commander が進まない) | Orca が Run の coordinator を兼ねる Commander に ask の回答を配達しない(1.4.250〜1.4.253) | reply し直さない。Commander の pane で `orca orchestration ask --resume <messageId> --json` を実行させる(`detail.recoveryCommand`) |
 | `blocked` / `phase: "blocked"`(`gates` も `asks` も空) | ゲート / ask 以外の停止(Commander の blocked 報告、承認プロンプトなど) | `blockedReasons` の `kind` を確認(`task_report` は `orca_send_message` / cancel、`agent_prompt` は pane で人間が答える) |
